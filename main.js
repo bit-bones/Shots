@@ -1219,6 +1219,9 @@ const NET = {
     SNAPSHOT_HZ: 15,
     remoteInput: { up:false,down:false,left:false,right:false,shoot:false,dash:false,aimX:0,aimY:0,seq:0 },
     shootLatch: false, // joiner-side edge trigger to avoid hold-to-shoot
+    // Host latches for joiner one-shot actions so they fire when off cooldown
+    remoteShootQueued: false,
+    remoteDashQueued: false,
     bulletCounter: 1,
     setRole(role) { this.role = role; },
     setConnected(c) { this.connected = !!c; },
@@ -1428,6 +1431,16 @@ function positionPlayersSafely() {
         }
     }
     if (NET.connected || !enemyDisabled) { enemy.x = ePos.x; enemy.y = ePos.y; }
+    // After both players exist, enforce color mapping by role
+    if (NET.connected) {
+        if (NET.role === 'host') {
+            if (player) player.color = '#65c6ff';
+            if (enemy) enemy.color = '#ff5a5a';
+        } else if (NET.role === 'joiner') {
+            if (player) player.color = '#ff5a5a';
+            if (enemy) enemy.color = '#65c6ff';
+        }
+    }
 }
 function rectsOverlap(a, b) {
     return !(a.x + a.w < b.x || b.x + b.w < a.x ||
@@ -1802,7 +1815,7 @@ function update(dt) {
             player.dashCooldown = Math.max(0, player.dashCooldown - dt);
         }
     }
-    if (simulateLocally && !enemyDisabled && enemy.dash) {
+    if (simulateLocally && !enemyDisabled && enemy.dash && !NET.connected) {
         if (!enemy.dashActive && Math.random() < 0.003 && enemy.dashCooldown <= 0) {
             let dx = enemy.x - player.x, dy = enemy.y - player.y;
             let norm = Math.hypot(dx, dy);
@@ -1935,8 +1948,8 @@ function update(dt) {
                 }
             }
         }
-        // Remote shoot/dash intents
-        if (ri.dash && enemy.dash && !enemy.dashActive && enemy.dashCooldown <= 0) {
+        // Remote dash intent (queued so it isn't lost while on cooldown)
+        if (NET.remoteDashQueued && enemy.dash && !enemy.dashActive && enemy.dashCooldown <= 0) {
             // trigger dash in the same way as AI, using direction toward aim
             let dx = (ri.aimX||player.x) - enemy.x;
             let dy = (ri.aimY||player.y) - enemy.y;
@@ -1947,10 +1960,12 @@ function update(dt) {
             enemy.deflectRemaining = (enemy.deflectStacks || 0);
             if ((enemy.bigShotStacks||0) > 0) enemy.bigShotPending = true;
             try { playDashWoosh(enemy.dashTime, dashSet.speedMult); } catch (e) {}
+            NET.remoteDashQueued = false;
         }
-        if (ri.shoot) {
-            enemy.timeSinceShot += dt; // ensure timer progresses
-            if (enemy.timeSinceShot >= enemy.shootInterval) {
+        // Always tick enemy shoot timer on host
+        enemy.timeSinceShot += dt;
+        // Remote shoot intent (queued) fires once when off cooldown
+        if (NET.remoteShootQueued && enemy.timeSinceShot >= enemy.shootInterval) {
                 let target = { x: player.x, y: player.y };
                 enemy.shootToward(target, bullets);
                 // tag bullets with ids (host)
@@ -1958,10 +1973,10 @@ function update(dt) {
                     if (bullets[i].owner === enemy && !bullets[i].id) NET.tagBullet(bullets[i]);
                 }
                 enemy.timeSinceShot = 0;
-            }
+                NET.remoteShootQueued = false;
         }
-        // Consume shoot intent once per input message
-        NET.remoteInput.shoot = false;
+        // Clear transient flags so future presses can re-queue
+        NET.remoteInput.shoot = false; NET.remoteInput.dash = false;
     } else {
         // Joiner: suppress local enemy AI entirely; enemy state comes from snapshots
         // No movement/AI here
@@ -1978,7 +1993,8 @@ function update(dt) {
         player.timeSinceShot = 0;
         player.shootQueued = false;
     }
-    if (simulateLocally && !enemyDisabled) {
+    // Disable enemy AI entirely when multiplayer is active; only run in solo
+    if (simulateLocally && !enemyDisabled && !NET.connected) {
     enemy.timeSinceShot += dt;
     let distToPlayer = dist(enemy.x, enemy.y, player.x, player.y);
     let canSeePlayer = hasLineOfSight(enemy.x, enemy.y, player.x, player.y, obstacles);
@@ -2867,6 +2883,9 @@ function setupOverlayInit() {
                 const data = msg.data;
                 if (data && data.type === 'input' && NET.role === 'host') {
                     NET.remoteInput = { ...(data.input||{}), seq: data.seq };
+                    // Queue one-shot actions so they trigger as soon as possible
+                    if (data.input && data.input.shoot) NET.remoteShootQueued = true;
+                    if (data.input && data.input.dash) NET.remoteDashQueued = true;
                 } else if (data && data.type === 'snapshot' && NET.role === 'joiner') {
                     NET.applySnapshot(data.snap);
                 } else if (data && data.type === 'setup' && NET.role === 'joiner') {
