@@ -1238,8 +1238,6 @@ const NET = {
         this.inputSeq++;
         const payload = { type: 'input', seq: this.inputSeq, input };
         window.ws.send(JSON.stringify({ type: 'relay', data: payload }));
-        // prevent sticky shoot: clear flag after sending
-        if (input.shoot && player) player.shootQueued = false;
     },
     // HOST: send snapshot to joiner
     sendSnapshot() {
@@ -1333,7 +1331,9 @@ const NET = {
     // Read local input (joiner). We map to existing variables.
     collectLocalInput() {
         // Edge trigger for shoot: true exactly once when space is pressed
-        const shootNow = !!player.shootQueued && !this.shootLatch;
+        // Use keyboard state or legacy player.shootQueued as a fallback so the latch is robust
+        const spacePressed = !!keys[' '] || !!keys['space'] || !!player.shootQueued;
+        const shootNow = spacePressed && !this.shootLatch;
         const out = {
             up: !!keys['w'],
             down: !!keys['s'],
@@ -1345,7 +1345,7 @@ const NET = {
             aimY: mouse.y
         };
         // Update latch state
-        if (!!player.shootQueued) this.shootLatch = true; else this.shootLatch = false;
+        this.shootLatch = !!spacePressed;
         return out;
     },
     handleDisconnect(reason) {
@@ -3326,7 +3326,9 @@ window.addEventListener('keydown', e => {
     if (document.activeElement === devInput) return;
     keys[e.key.toLowerCase()] = true;
     if (e.key === ' ' || e.code === 'Space') {
-        if (!player.shootQueued) player.shootQueued = true;
+        // mark keyboard state; collectLocalInput reads keys[] and player.shootQueued may be used as fallback
+        // keep player.shootQueued for legacy code paths
+        player.shootQueued = true;
     }
 });
 window.addEventListener('keyup', e => {
@@ -3334,6 +3336,10 @@ window.addEventListener('keyup', e => {
     const devInput = document.getElementById('dev-console-input');
     if (document.activeElement === devInput) return;
     keys[e.key.toLowerCase()] = false;
+    if (e.key === ' ' || e.code === 'Space') {
+        // clear shoot queued to avoid sticky state
+        if (player) player.shootQueued = false;
+    }
     if (e.key.toLowerCase() === 'r') {
         restartGame();
     }
