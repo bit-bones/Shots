@@ -21,7 +21,7 @@ function showWorldModifierCards() {
         card.style.top = '50%';
         card.style.width = cardWidth + 'px';
         card.style.height = cardHeight + 'px';
-        card.style.transform = 'translate(-50%ss -50%)';
+    card.style.transform = 'translate(-50%, -50%)';
         card.onclick = () => {
             Array.from(div.children).forEach(c => c.classList.remove('selected', 'centered'));
             card.classList.add('selected', 'centered');
@@ -69,10 +69,7 @@ function showWorldModifierCards() {
 // --- Restart Game ---
 function restartGame() {
     // Reset scores
-        if (typeof player !== 'undefined' && player) {
-            player.resetStats();
-            player.reset(); // Reset player position and state
-        }
+    if (typeof player !== 'undefined' && player) player.resetStats();
     if (typeof enemy !== 'undefined' && enemy) enemy.resetStats();
     updateCardsUI();
     // Show setup overlay
@@ -118,7 +115,7 @@ function playGunShot() {
 function playExplosion() {
     const o = audioCtx.createOscillator();
     const g = audioCtx.createGain();
-        o.type = 'sine'; // Change to sine wave for a different explosion sound
+    o.type = 'triangle';
     o.frequency.value = 80;
     g.gain.value = 0.40 * masterVolume * sfxVolume * explosionVolume;
     o.connect(g).connect(audioCtx.destination);
@@ -253,6 +250,36 @@ const WORLD_MODIFIERS = [
     }
     // Add more world modifiers here
 ];
+// Apply a world modifier by name with proper first/second-pick semantics
+function applyWorldModifierByName(name) {
+    const mod = WORLD_MODIFIERS.find(m => m.name === name);
+    if (!mod) return;
+    if (usedWorldModifiers[name]) {
+        // Second pick: either disable or apply special logic
+        if (name === 'Dynamic') {
+            // Dynamic toggles back to previous settings via effect()
+            if (typeof mod.effect === 'function') mod.effect();
+        } else {
+            // For other modifiers, disable them (turn off flags and remove from active)
+            if (name === 'Infestation') {
+                infestationActive = false;
+            } else if (name === 'Spontaneous') {
+                spontaneousActive = false;
+            } else if (name === 'Firestorm') {
+                firestormActive = false;
+                firestormInstance = null;
+                firestormTimer = 0;
+            }
+            activeWorldModifiers = activeWorldModifiers.filter(m => m !== name);
+            usedWorldModifiers[name] = false;
+        }
+    } else {
+        // First pick: apply effect and mark as used
+        if (typeof mod.effect === 'function') mod.effect();
+        usedWorldModifiers[name] = true;
+        if (!activeWorldModifiers.includes(name)) activeWorldModifiers.push(name);
+    }
+}
 // --- Firestorm State ---
 let firestormActive = false;
 let firestormTimer = 0;
@@ -1293,6 +1320,13 @@ const NET = {
     }
 };
 
+// Map a role label ('host'|'joiner') to the correct local entity
+function getEntityForRole(role) {
+    if (NET.role === 'host') return role === 'host' ? player : enemy;
+    if (NET.role === 'joiner') return role === 'host' ? enemy : player;
+    return player;
+}
+
 // --- Procedural Obstacle Generation ---
 function generateObstacles() {
     obstacles = [];
@@ -1934,8 +1968,9 @@ function update(dt) {
         player.shootQueued = false;
     }
     if (!enemyDisabled && !(NET.role === 'host' && NET.connected)) {
-        enemy.timeSinceShot += dt;
-        let canSeePlayer = hasLineOfSight(enemy.x, enemy.y, player.x, player.y, obstacles);
+    enemy.timeSinceShot += dt;
+    let distToPlayer = dist(enemy.x, enemy.y, player.x, player.y);
+    let canSeePlayer = hasLineOfSight(enemy.x, enemy.y, player.x, player.y, obstacles);
         let canShootDespiteBlock = enemy.pierce || enemy.obliterator;
         if (
             enemy.timeSinceShot >= enemy.shootInterval &&
@@ -2198,18 +2233,20 @@ function update(dt) {
         if (p.healthbarFlash > 0) p.healthbarFlash -= dt;
     });
 
-    // --- Respawn, health reset, card ---
-    if (!waitingForCard) {
+    // --- Respawn, health reset, card (host-authoritative) ---
+    if (!waitingForCard && NET.connected && NET.role === 'host') {
         const participants = [player].concat(enemyDisabled ? [] : [enemy]);
         for (let p of participants) {
             if (p.health <= 0) {
                 waitingForCard = true;
-                let winner = (p === player) ? (enemyDisabled ? player : enemy) : player;
+                const loser = p;
+                const loserRole = (loser === player) ? 'host' : 'joiner';
+                const winner = (loser === player) ? (enemyDisabled ? player : enemy) : player;
                 winner.score++;
                 if (winner.healOnKill) winner.health = Math.min(winner.health + 25, winner.healthMax);
                 bullets = [];
                 explosions = [];
-                // If saved map selection is active, load selected map or random saved map per round
+                // Rebuild map for next round
                 const sel = document.getElementById('saved-maps');
                 if (sel && sel.value) {
                     if (sel.value === '__RANDOM__') {
@@ -2222,19 +2259,38 @@ function update(dt) {
                     generateObstacles();
                 }
                 positionPlayersSafely();
-                // --- Reset health and state for dead player/enemy here ---
-                if (p === player) {
-                    player.reset(player.x, player.y);
-                } else {
-                    enemy.reset(enemy.x, enemy.y);
-                }
-                // --- World Modifier: round tracking ---
+                // Reset dead entity health
+                if (loser === player) player.reset(player.x, player.y); else enemy.reset(enemy.x, enemy.y);
+                // Broadcast round-reset (map + scores + positions)
+                try {
+                    if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+                        window.ws.send(JSON.stringify({ type:'relay', data: {
+                            type:'round-reset',
+                            obstacles: serializeObstacles(),
+                            hostPos: { x: player.x, y: player.y, hp: player.health },
+                            joinerPos: (!enemyDisabled ? { x: enemy.x, y: enemy.y, hp: enemy.health } : {x:0,y:0,hp:0}),
+                            scores: { host: (player.score||0), joiner: (!enemyDisabled ? enemy.score||0 : 0) }
+                        }}));
+                    }
+                } catch (e) {}
+                // Decide what selection to show
                 roundsSinceLastModifier++;
                 if (roundsSinceLastModifier >= worldModifierRoundInterval) {
                     roundsSinceLastModifier = 0;
-                    setTimeout(() => showWorldModifierCards(), 700);
+                    // World modifier offer (3 cards). Chooser: winner by default.
+                    const chooserRole = (winner === player) ? 'host' : 'joiner';
+                    const pool = WORLD_MODIFIERS;
+                    const choices = randomChoice(pool, 3).map(c => c.name);
+                    // Show locally for host
+                    setTimeout(() => netShowWorldModifierCards(choices, chooserRole), 700);
+                    // Broadcast offer
+                    try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-offer', choices, chooserRole } })); } catch (e) {}
                 } else {
-                    setTimeout(() => showPowerupCards(p), 700);
+                    // Powerup offer (5 cards) for the loser
+                    const choices = randomChoice(POWERUPS, 5).map(c => c.name);
+                    const chooserRole = loserRole;
+                    setTimeout(() => netShowPowerupCards(choices, chooserRole), 700);
+                    try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-offer', choices, chooserRole } })); } catch (e) {}
                 }
                 break;
             }
@@ -2598,6 +2654,123 @@ function showPowerupCards(loser) {
     }
 }
 
+// Networked selection helpers (host composes choices and sends; clients display based on chooserRole)
+function netShowPowerupCards(choiceNames, chooserRole) {
+    // chooserRole: 'host' or 'joiner'
+    const isMe = (chooserRole === NET.role);
+    const loser = (chooserRole === 'host') ? player : enemy; // chooser is the loser of the round
+    // Build fake POWERUPS array subset
+    const choices = choiceNames.map(n => getCardByName(n)).filter(Boolean);
+    if (!isMe) {
+        // Show read-only choices (no click), highlight selection will be applied when host broadcasts pick
+        cardState.active = true;
+        const div = document.getElementById('card-choices');
+        div.innerHTML = '';
+        const handRadius = 220, cardWidth = 170, cardHeight = 220;
+        const baseAngle = Math.PI / 2, spread = Math.PI / 1.1;
+        for (let i = 0; i < choices.length; ++i) {
+            const opt = choices[i];
+            const card = document.createElement('div');
+            card.className = 'card card-uniform';
+            card.innerHTML = `<b>${opt.name}</b><br><small>${opt.desc}</small>`;
+            const theta = baseAngle - (i - (choices.length-1)/2) * (spread/(choices.length-1));
+            const x = Math.cos(theta) * handRadius;
+            const y = Math.sin(theta) * handRadius;
+            const rot = (Math.PI/2 - theta) * 28;
+            Object.assign(card.style, { position:'absolute', left:`calc(50% + ${x}px)`, bottom:`calc(-10% + ${y}px)`, width:cardWidth+'px', height:cardHeight+'px', transform:`translate(-50%, 0) rotate(${rot}deg)` });
+            div.appendChild(card);
+        }
+        Object.assign(div.style, { display:'flex', position:'absolute', left:'50%', top:'50%', transform:'translate(-50%, -50%)', height:'320px', width:'900px' });
+        div.classList.add('card-bg-visible');
+        return;
+    }
+    // Let the chooser pick and report back to host
+    // Reuse existing showPowerupCards but override choices
+    cardState.active = true;
+    const div = document.getElementById('card-choices');
+    div.innerHTML = '';
+    const handRadius = 220, cardWidth = 170, cardHeight = 220; const baseAngle = Math.PI/2, spread = Math.PI/1.1;
+    for (let i = 0; i < choices.length; ++i) {
+        const opt = choices[i];
+        const card = document.createElement('div');
+        card.className = 'card card-uniform';
+        card.innerHTML = `<b>${opt.name}</b><br><small>${opt.desc}</small>`;
+        const theta = baseAngle - (i - (choices.length-1)/2) * (spread/(choices.length-1));
+        const x = Math.cos(theta) * handRadius;
+        const y = Math.sin(theta) * handRadius;
+        const rot = (Math.PI/2 - theta) * 28;
+        Object.assign(card.style, { position:'absolute', left:`calc(50% + ${x}px)`, bottom:`calc(-10% + ${y}px)`, width:cardWidth+'px', height:cardHeight+'px', transform:`translate(-50%, 0) rotate(${rot}deg)` });
+        card.onclick = () => {
+            if (NET.role === 'host' && chooserRole === 'host') {
+                // Host is chooser: apply immediately and broadcast final apply
+                try { opt.effect(loser); loser.addCard(opt.name); } catch (e) {}
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name } })); } catch (e) {}
+                div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible');
+                cardState.active = false; waitingForCard = false;
+            } else {
+                // Joiner is chooser: send pick to host and wait for card-apply
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-pick', pickerRole: chooserRole, card: opt.name } })); } catch (e) {}
+                // Optional: hide UI while waiting
+                div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible');
+                // keep waitingForCard true until apply arrives
+            }
+        };
+        div.appendChild(card);
+    }
+    Object.assign(div.style, { display:'flex', position:'absolute', left:'50%', top:'50%', transform:'translate(-50%, -50%)', height:'320px', width:'900px' });
+    div.classList.add('card-bg-visible');
+}
+
+function netShowWorldModifierCards(choiceNames, chooserRole) {
+    const isMe = (chooserRole === NET.role);
+    const choices = choiceNames.map(n => WORLD_MODIFIERS.find(m => m.name === n)).filter(Boolean);
+    if (!isMe) {
+        // Read-only preview for the non-chooser
+        const div = document.getElementById('card-choices');
+        div.innerHTML = '';
+        const cardWidth = 220, cardHeight = 260;
+        for (let i = 0; i < choices.length; ++i) {
+            const opt = choices[i];
+            const card = document.createElement('div');
+            card.className = 'card card-uniform world-modifier';
+            card.innerHTML = `<b>${opt.name}</b><br><small>${opt.desc}</small>`;
+            Object.assign(card.style, { position:'absolute', left:`calc(50% + ${(i-1)*cardWidth*1.1}px)`, top:'50%', width: cardWidth+'px', height: cardHeight+'px', transform:'translate(-50%, -50%)' });
+            div.appendChild(card);
+        }
+        Object.assign(div.style, { display:'flex', position:'absolute', left:'50%', top:'50%', transform:'translate(-50%, -50%)', height:'320px', width:'900px' });
+        div.classList.add('card-bg-visible');
+        return;
+    }
+    // Chooser can click; broadcast pick
+    const div = document.getElementById('card-choices');
+    div.innerHTML = '';
+    const cardWidth = 220, cardHeight = 260;
+    for (let i = 0; i < choices.length; ++i) {
+        const opt = choices[i];
+        const card = document.createElement('div');
+        card.className = 'card card-uniform world-modifier';
+        card.innerHTML = `<b>${opt.name}</b><br><small>${opt.desc}</small>`;
+        Object.assign(card.style, { position:'absolute', left:`calc(50% + ${(i-1)*cardWidth*1.1}px)`, top:'50%', width: cardWidth+'px', height: cardHeight+'px', transform:'translate(-50%, -50%)' });
+        card.onclick = () => {
+            if (NET.role === 'host' && chooserRole === 'host') {
+                // Host chooser applies immediately and broadcasts apply
+                try { applyWorldModifierByName(opt.name); } catch (e) {}
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-apply', name: opt.name } })); } catch (e) {}
+                div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible');
+                cardState.active = false; waitingForCard = false;
+            } else {
+                // Joiner chooser sends pick to host and waits for apply
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-pick', name: opt.name } })); } catch (e) {}
+                div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible');
+                // keep waitingForCard until mod-apply arrives
+            }
+        };
+        div.appendChild(card);
+    }
+    Object.assign(div.style, { display:'flex', position:'absolute', left:'50%', top:'50%', transform:'translate(-50%, -50%)', height:'320px', width:'900px' });
+    div.classList.add('card-bg-visible');
+}
+
 // --- Cards UI ---
 function updateCardsUI() {
     let cardsDiv = document.getElementById('cards-ui');
@@ -2695,6 +2868,65 @@ function setupOverlayInit() {
                             deserializeObstacles(data.obstacles||[]);
                         } catch (e) {}
                     }
+                } else if (data && data.type === 'round-reset') {
+                    // Host reset after death: sync map, positions, and scores
+                    try {
+                        if (NET.role === 'joiner') {
+                            deserializeObstacles(data.obstacles||[]);
+                            if (data.hostPos) { enemy.x = data.hostPos.x; enemy.y = data.hostPos.y; enemy.health = data.hostPos.hp; }
+                            if (data.joinerPos) { player.x = data.joinerPos.x; player.y = data.joinerPos.y; player.health = data.joinerPos.hp; }
+                            if (data.scores) {
+                                player.score = data.scores.joiner|0; // on joiner: local player is joiner
+                                if (!enemyDisabled) enemy.score = data.scores.host|0;
+                            }
+                            bullets = []; explosions = []; infestedChunks = [];
+                        } else {
+                            // host already applied locally in update()
+                        }
+                        updateCardsUI();
+                    } catch (e) {}
+                } else if (data && data.type === 'card-offer') {
+                    waitingForCard = true;
+                    setTimeout(() => netShowPowerupCards(data.choices||[], data.chooserRole), 200);
+                } else if (data && data.type === 'mod-offer') {
+                    waitingForCard = true;
+                    setTimeout(() => netShowWorldModifierCards(data.choices||[], data.chooserRole), 200);
+                } else if (data && data.type === 'card-pick') {
+                    // Only host should authoritatively apply then broadcast
+                    if (NET.role === 'host') {
+                        const target = getEntityForRole(data.pickerRole);
+                        const card = getCardByName(data.card);
+                        if (target && card) {
+                            try { card.effect(target); target.addCard(card.name); } catch (e) {}
+                            // Broadcast applied so both sides finalize and close UIs
+                            try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: data.pickerRole, card: card.name } })); } catch (e) {}
+                        }
+                    }
+                } else if (data && data.type === 'card-apply') {
+                    // Apply on non-host clients (host already applied during pick)
+                    if (NET.role !== 'host') {
+                        const target = getEntityForRole(data.pickerRole);
+                        const card = getCardByName(data.card);
+                        if (target && card) {
+                            try { card.effect(target); target.addCard(card.name); } catch (e) {}
+                        }
+                    }
+                    const div = document.getElementById('card-choices');
+                    if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); }
+                    cardState.active = false; waitingForCard = false;
+                } else if (data && data.type === 'mod-pick') {
+                    // Only host should authoritatively apply then broadcast
+                    if (NET.role === 'host') {
+                        const name = data.name;
+                        applyWorldModifierByName(name);
+                        try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-apply', name } })); } catch (e) {}
+                    }
+                } else if (data && data.type === 'mod-apply') {
+                    // Apply on non-host clients (host already applied)
+                    if (NET.role !== 'host') applyWorldModifierByName(data.name);
+                    const div = document.getElementById('card-choices');
+                    if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); }
+                    cardState.active = false; waitingForCard = false;
                 } else {
                     // fallback to previous handler if any simple sync message comes through
                     handleGameMessage(data);
