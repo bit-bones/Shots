@@ -21,7 +21,7 @@ function showWorldModifierCards() {
         card.style.top = '50%';
         card.style.width = cardWidth + 'px';
         card.style.height = cardHeight + 'px';
-        card.style.transform = 'translate(-50%, -50%)';
+        card.style.transform = 'translate(-50%ss -50%)';
         card.onclick = () => {
             Array.from(div.children).forEach(c => c.classList.remove('selected', 'centered'));
             card.classList.add('selected', 'centered');
@@ -617,6 +617,7 @@ class Player {
         if (total <= 1) {
             let b = new Bullet(this, this.x, this.y, angle);
             if (applyBig) { b.radius *= sizeMult; b.speed *= speedMult; }
+            b.justFired = true; // mark for multiplayer sync
             bullets.push(b);
         } else {
             // spread symmetrically around aim angle
@@ -626,6 +627,7 @@ class Player {
                 let a = lerp(-spreadArc/2, spreadArc/2, t);
                 let b = new Bullet(this, this.x, this.y, angle + a);
                 if (applyBig) { b.radius *= sizeMult; b.speed *= speedMult; }
+                b.justFired = true; // mark for multiplayer sync
                 bullets.push(b);
             }
         }
@@ -1376,6 +1378,57 @@ function gameLoop(ts) {
 
 // --- Update Logic ---
 function update(dt) {
+    // --- Multiplayer Sync ---
+    if (window.ws && window.ws.readyState === WebSocket.OPEN && typeof window.wsRole === 'string') {
+        // Only sync if in multiplayer mode
+        let action = {
+            x: player.x,
+            y: player.y,
+            health: player.health,
+            powerups: Array.isArray(player.cards) ? player.cards.slice() : [],
+            shoot: player.shootQueued,
+            dash: player.dashActive,
+            // Send new bullets fired this frame (positions, angles, etc.)
+            bullets: bullets.filter(b => b.owner === player && b.justFired).map(b => ({ x: b.x, y: b.y, angle: b.angle, speed: b.speed, radius: b.radius, damage: b.damage }))
+        };
+        // Only send if changed (basic throttle)
+        if (JSON.stringify(action) !== JSON.stringify(window.lastSentAction)) {
+            if (typeof window.sendAction === 'function') window.sendAction(action);
+            window.lastSentAction = action;
+        }
+        // After sending, clear justFired on all bullets
+        for (const b of bullets) { if (b.justFired) b.justFired = false; }
+        // Apply remote player state to enemy (if joiner, remote is host; if host, remote is joiner)
+        if (!enemyDisabled && window.remotePlayerState) {
+            const rps = window.remotePlayerState;
+            enemy.x = rps.x || enemy.x;
+            enemy.y = rps.y || enemy.y;
+            if (typeof rps.health === 'number') enemy.health = rps.health;
+            if (Array.isArray(rps.powerups)) enemy.cards = rps.powerups.slice();
+            if (rps.shoot) {
+                enemy.shootQueued = true;
+                rps.shoot = false;
+            }
+            if (rps.dash) {
+                enemy.dashActive = true;
+                rps.dash = false;
+            }
+            // Spawn bullets fired by remote player
+            if (Array.isArray(rps.bullets)) {
+                for (const b of rps.bullets) {
+                    // Only add if not already present (basic deduplication)
+                    if (!bullets.some(existing => Math.abs(existing.x - b.x) < 2 && Math.abs(existing.y - b.y) < 2 && Math.abs(existing.angle - b.angle) < 0.01)) {
+                        let newB = new Bullet(enemy, b.x, b.y, b.angle);
+                        newB.speed = b.speed || 420;
+                        newB.radius = b.radius || 7;
+                        newB.damage = b.damage || 18;
+                        newB.justFired = false;
+                        bullets.push(newB);
+                    }
+                }
+            }
+        }
+    }
     // --- Burning Damage Over Time ---
     if (player) player.updateBurning(dt);
     if (!enemyDisabled && enemy) enemy.updateBurning(dt);
@@ -2233,9 +2286,6 @@ function drawPlayer(p) {
     ctx.fillRect(x, y, w * clamp(p.health/p.healthMax, 0, 1), h);
     ctx.strokeStyle = "#000";
     ctx.strokeRect(x, y, w, h);
-    ctx.font = "10px sans-serif";
-    ctx.fillStyle = "#fff";
-    ctx.fillText(Math.round(p.health), x + w/2 - 8, y + h - 1);
     ctx.restore();
     ctx.restore();
 }
@@ -2261,13 +2311,16 @@ function showPowerupCards(loser) {
             let card = document.createElement('div');
             card.className = "card card-uniform";
             card.innerHTML = `<b>${opt.name}</b><br><small>${opt.desc}</small>`;
-            let theta = baseAngle + (i - (cardCount-1)/2) * (spread/(cardCount-1));
+            // Flip the fan direction so cards lay like a hand: invert angle step and rotation, and flip vertical offset
+            let theta = baseAngle - (i - (cardCount-1)/2) * (spread/(cardCount-1));
             let x = Math.cos(theta) * handRadius;
             let y = Math.sin(theta) * handRadius;
-            let rot = (theta-Math.PI/2)*28;
+            let rot = (Math.PI/2 - theta) * 28;
             card.style.position = 'absolute';
             card.style.left = `calc(50% + ${x}px)`;
-            card.style.bottom = `calc(38% - ${y}px)`;
+            // use +y so the cards arc the other way (more like a held hand)
+            // lower the whole fan so it sits further down the screen
+            card.style.bottom = `calc(-10% + ${y}px)`;
             card.style.width = cardWidth + 'px';
             card.style.height = cardHeight + 'px';
             card.style.transform = `translate(-50%, 0) rotate(${rot}deg)`;
@@ -2276,18 +2329,52 @@ function showPowerupCards(loser) {
                 card.classList.add('selected', 'centered');
                 card.style.zIndex = 10;
                 card.style.transform = 'translate(-50%, -60px) scale(1.18) rotate(0deg)';
+                // highlight with loser's color: border, glow, and text
+                try {
+                    card.style.setProperty('border', '3px solid ' + loser.color, 'important');
+                    card.style.setProperty('box-shadow', '0 6px 18px ' + loser.color, 'important');
+                    // override CSS .card.centered !important color
+                    card.style.setProperty('color', loser.color, 'important');
+                    const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loser.color, 'important');
+                    // inject per-card ::after override for the glow
+                    if (!card._accentClass) card._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
+                    if (!card._accentStyle) {
+                        const styleEl = document.createElement('style');
+                        styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loser.color}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loser.color}55 0%, #0000 100%) !important; }`;
+                        document.head.appendChild(styleEl);
+                        card._accentStyle = styleEl;
+                    }
+                    card.classList.add(card._accentClass);
+                } catch (ex) {}
             };
             card.onmouseleave = () => {
                 card.classList.remove('selected', 'centered');
                 card.style.zIndex = 1;
                 card.style.transform = `translate(-50%, 0) rotate(${rot}deg)`;
+                // reset highlight
+                try {
+                    card.style.removeProperty('border');
+                    card.style.removeProperty('box-shadow');
+                    card.style.removeProperty('color');
+                    const sm = card.querySelector('small'); if (sm) sm.style.removeProperty('color');
+                    if (card._accentClass) card.classList.remove(card._accentClass);
+                    if (card._accentStyle) { card._accentStyle.remove(); card._accentStyle = null; }
+                } catch (ex) {}
             };
             card.onclick = () => {
                 Array.from(div.children).forEach(c => c.classList.remove('selected', 'centered'));
                 card.classList.add('selected', 'centered');
+                try {
+                    card.style.setProperty('border', '3px solid ' + loser.color, 'important');
+                    card.style.setProperty('box-shadow', '0 6px 18px ' + loser.color, 'important');
+                    card.style.setProperty('color', loser.color, 'important');
+                    const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loser.color, 'important');
+                } catch (ex) {}
                 setTimeout(() => {
                     opt.effect(loser);
                     loser.addCard(opt.name);
+                    // cleanup accent style if present
+                    try { if (card._accentStyle) { card._accentStyle.remove(); card._accentStyle = null; } } catch (ex) {}
                     div.style.display = "none";
                     div.innerHTML = '';
                     div.removeAttribute('style');
@@ -2318,16 +2405,46 @@ function showPowerupCards(loser) {
             let card = document.createElement('div');
             card.className = "card card-uniform";
             card.innerHTML = `<b>${opt.name}</b><br><small>${opt.desc}</small>`;
-            let theta = baseAngle + (i - (cardCount-1)/2) * (spread/(cardCount-1));
+            // Flip the fan direction so cards lay like a hand: invert angle step and rotation, and flip vertical offset
+            let theta = baseAngle - (i - (cardCount-1)/2) * (spread/(cardCount-1));
             let x = Math.cos(theta) * handRadius;
             let y = Math.sin(theta) * handRadius;
-            let rot = (theta-Math.PI/2)*28;
+            let rot = (Math.PI/2 - theta) * 28;
             card.style.position = 'absolute';
             card.style.left = `calc(50% + ${x}px)`;
-            card.style.bottom = `calc(38% - ${y}px)`;
+            // use +y so the cards arc the other way (more like a held hand)
+            // match player's custom offset (-10%) so enemy cards appear in the same place
+            card.style.bottom = `calc(-10% + ${y}px)`;
             card.style.width = cardWidth + 'px';
             card.style.height = cardHeight + 'px';
             card.style.transform = `translate(-50%, 0) rotate(${rot}deg)`;
+            // add hover highlight so it matches player behavior if visible briefly
+            card.onmouseenter = () => {
+                try {
+                    card.style.setProperty('border', '3px solid ' + loser.color, 'important');
+                    card.style.setProperty('box-shadow', '0 6px 18px ' + loser.color, 'important');
+                    card.style.setProperty('color', loser.color, 'important');
+                    const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loser.color, 'important');
+                    if (!card._accentClass) card._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
+                    if (!card._accentStyle) {
+                        const styleEl = document.createElement('style');
+                        styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loser.color}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loser.color}55 0%, #0000 100%) !important; }`;
+                        document.head.appendChild(styleEl);
+                        card._accentStyle = styleEl;
+                    }
+                    card.classList.add(card._accentClass);
+                } catch (ex) {}
+            };
+            card.onmouseleave = () => {
+                try {
+                    card.style.removeProperty('border');
+                    card.style.removeProperty('box-shadow');
+                    card.style.removeProperty('color');
+                    const sm = card.querySelector('small'); if (sm) sm.style.removeProperty('color');
+                    if (card._accentClass) card.classList.remove(card._accentClass);
+                    if (card._accentStyle) { card._accentStyle.remove(); card._accentStyle = null; }
+                } catch (ex) {}
+            };
             div.appendChild(card);
         }
         div.style.display = "flex";
@@ -2343,6 +2460,21 @@ function showPowerupCards(loser) {
             card.classList.add('selected', 'centered');
             card.style.zIndex = 10;
             card.style.transform = 'translate(-50%, -60px) scale(1.18) rotate(0deg)';
+            // highlight using loser's color (border, glow, text, and ::after)
+            try {
+                card.style.setProperty('border', '3px solid ' + loser.color, 'important');
+                card.style.setProperty('box-shadow', '0 6px 18px ' + loser.color, 'important');
+                card.style.setProperty('color', loser.color, 'important');
+                const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loser.color, 'important');
+                if (!card._accentClass) card._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
+                if (!card._accentStyle) {
+                    const styleEl = document.createElement('style');
+                    styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loser.color}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loser.color}55 0%, #0000 100%) !important; }`;
+                    document.head.appendChild(styleEl);
+                    card._accentStyle = styleEl;
+                }
+                card.classList.add(card._accentClass);
+            } catch (ex) {}
             setTimeout(() => {
                 let pickedCard = choices[idx];
                 pickedCard.effect(loser);
@@ -2389,6 +2521,105 @@ function drawCardsUI() {
 
 // --- Setup Overlay Logic ---
 function setupOverlayInit() {
+    // --- Multiplayer WebSocket logic ---
+    // Make networking vars global so update() can access them reliably
+    window.ws = null;
+    window.wsRole = null; // 'host' or 'joiner'
+    window.wsSession = null;
+    window.remotePlayerState = { x: 0, y: 0, shoot: false, dash: false };
+    window.lastSentAction = {};
+    // Configurable server URL: prefer ?ws=, otherwise try same origin, fallback to localhost
+    const paramWs = new URLSearchParams(window.location.search).get('ws');
+    const defaultWs = (location.protocol === 'https:' ? 'wss://' : 'ws://') + (location.hostname || 'localhost') + ':3001';
+    window.MULTIPLAYER_WS_URL = paramWs || defaultWs;
+
+    window.sendAction = function(action) {
+        if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+            window.ws.send(JSON.stringify({ type: 'relay', data: action }));
+        }
+    };
+
+    function handleGameMessage(data) {
+        // Update remote player state
+        if (typeof data.x === 'number' && typeof data.y === 'number') {
+            remotePlayerState.x = data.x;
+            remotePlayerState.y = data.y;
+        }
+        if (data.shoot) remotePlayerState.shoot = true;
+        if (data.dash) remotePlayerState.dash = true;
+    }
+
+    // Patch ws.onmessage to use handleGameMessage
+    function patchWsOnMessage() {
+        if (!window.ws) return;
+        window.ws.onmessage = function(event) {
+            let msg;
+            try { msg = JSON.parse(event.data); } catch (e) { return; }
+            if (msg.type === 'hosted') {
+                if (mpSessionCode) mpSessionCode.value = msg.code;
+            } else if (msg.type === 'joined') {
+                hideMpModal();
+                alert('Joined session: ' + msg.code);
+            } else if (msg.type === 'peer-joined') {
+                hideMpModal();
+                alert('A player has joined your session!');
+            } else if (msg.type === 'relay') {
+                handleGameMessage(msg.data);
+            }
+        };
+    }
+
+    // Patch after each connect
+    let oldConnectWebSocket = null;
+    if (typeof connectWebSocket === 'function') oldConnectWebSocket = connectWebSocket;
+    // Helper to normalize user input: allow full invite URLs or plain codes
+    function normalizeJoinCode(input) {
+        if (!input) return '';
+        const trimmed = input.trim();
+        try {
+            // If it's a URL, parse the ?join param
+            const url = new URL(trimmed);
+            const fromParam = url.searchParams.get('join');
+            if (fromParam) return fromParam.trim().toUpperCase();
+        } catch (e) { /* not a URL */ }
+        // Otherwise just strip non-alphanumerics and uppercase
+        return trimmed.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    }
+
+    connectWebSocket = function(role, code) {
+        if (oldConnectWebSocket) oldConnectWebSocket(role, code);
+        else {
+            if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.close();
+            window.wsRole = role;
+            window.wsSession = normalizeJoinCode(code);
+            try {
+                window.ws = new WebSocket(window.MULTIPLAYER_WS_URL);
+            } catch (e) {
+                alert('Could not open WebSocket: ' + e.message);
+                return;
+            }
+            window.ws.onopen = function() {
+                if (role === 'host') {
+                    window.ws.send(JSON.stringify({ type: 'host', code: window.wsSession }));
+                } else if (role === 'joiner') {
+                    window.ws.send(JSON.stringify({ type: 'join', code: window.wsSession }));
+                }
+            };
+            patchWsOnMessage();
+            window.ws.onclose = function() {
+                // only show error if we were trying to connect/join
+                if (mpJoinSection && mpJoinSection.style.display !== 'none') {
+                    alert('Disconnected from server. Please verify the host is running and reachable.');
+                }
+            };
+            window.ws.onerror = function() {
+                if (mpJoinSection && mpJoinSection.style.display !== 'none') {
+                    alert('WebSocket error. Is the server URL correct? ' + window.MULTIPLAYER_WS_URL);
+                }
+            };
+        }
+        setTimeout(patchWsOnMessage, 200);
+    };
     const overlay = document.getElementById('setup-overlay');
     const densitySlider = document.getElementById('obstacle-density');
     const densityValue = document.getElementById('density-value');
@@ -2445,6 +2676,93 @@ function setupOverlayInit() {
             }
         }
         startGame();
+    };
+
+    // Multiplayer UI wiring
+    const hostBtn = document.getElementById('host-btn');
+    const joinBtn = document.getElementById('join-btn');
+    const mpModal = document.getElementById('multiplayer-modal');
+    const mpHostSection = document.getElementById('mp-host-section');
+    const mpJoinSection = document.getElementById('mp-join-section');
+    const mpCancel = document.getElementById('mp-cancel');
+    const mpSessionCode = document.getElementById('mp-session-code');
+    const mpCopyLink = document.getElementById('mp-copy-link');
+    const mpJoinCode = document.getElementById('mp-join-code');
+    const mpJoinConfirm = document.getElementById('mp-join-confirm');
+
+    function hideMpModal() {
+        if (mpModal) mpModal.style.display = 'none';
+        if (mpHostSection) mpHostSection.style.display = 'none';
+        if (mpJoinSection) mpJoinSection.style.display = 'none';
+    }
+
+    if (hostBtn) hostBtn.onclick = () => {
+        if (mpModal && mpHostSection) {
+            mpModal.style.display = 'flex';
+            mpHostSection.style.display = 'flex';
+            mpJoinSection.style.display = 'none';
+            // Generate a session code (simple random 6-char alphanumeric)
+            const code = Math.random().toString(36).substr(2, 6).toUpperCase();
+            if (mpSessionCode) mpSessionCode.value = code;
+            connectWebSocket('host', code);
+        }
+    };
+    if (joinBtn) joinBtn.onclick = () => {
+        if (mpModal && mpJoinSection) {
+            mpModal.style.display = 'flex';
+            mpHostSection.style.display = 'none';
+            mpJoinSection.style.display = 'flex';
+            if (mpJoinCode) {
+                mpJoinCode.value = '';
+                setTimeout(() => mpJoinCode.focus(), 100);
+            }
+        }
+    };
+    // Allow pressing Enter in join code input
+    if (mpJoinCode) {
+        mpJoinCode.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                if (mpJoinCode.value) {
+                    connectWebSocket('joiner', mpJoinCode.value.trim().toUpperCase());
+                }
+            }
+        });
+    }
+    // Auto-join if ?join=CODE in URL
+    const urlParams = new URLSearchParams(window.location.search);
+    const joinCodeFromUrl = urlParams.get('join');
+    if (joinCodeFromUrl) {
+        if (mpModal && mpJoinSection) {
+            mpModal.style.display = 'flex';
+            mpHostSection.style.display = 'none';
+            mpJoinSection.style.display = 'flex';
+            if (mpJoinCode) {
+                mpJoinCode.value = joinCodeFromUrl.trim().toUpperCase();
+                setTimeout(() => mpJoinCode.focus(), 100);
+            }
+        }
+    }
+    if (mpCancel) mpCancel.onclick = hideMpModal;
+    // Escape key closes modal
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && mpModal && mpModal.style.display !== 'none') {
+            hideMpModal();
+        }
+    });
+    // Copy link button
+    if (mpCopyLink) mpCopyLink.onclick = function() {
+        if (mpSessionCode) {
+            const url = window.location.origin + window.location.pathname + '?join=' + mpSessionCode.value;
+            navigator.clipboard.writeText(url);
+            mpCopyLink.innerText = 'Copied!';
+            setTimeout(() => { mpCopyLink.innerText = 'Copy Link'; }, 1200);
+        }
+    };
+    // Join confirm button (placeholder, to be wired to WebSocket logic)
+    if (mpJoinConfirm) mpJoinConfirm.onclick = function() {
+        if (mpJoinCode && mpJoinCode.value) {
+            connectWebSocket('joiner', mpJoinCode.value);
+        }
     };
 }
 
@@ -2869,7 +3187,6 @@ if (deleteSavedBtn) {
 }
 
 
-// --- Dev Console (fixed, always visible) ---
 
 // --- Dev Console (fixed, always visible, global references) ---
 const devLog = document.getElementById('dev-console-log');
@@ -2886,13 +3203,25 @@ if (devConsoleFixed) {
         s.innerText = '#dev-console-fixed.hidden { display: none !important; }';
         document.head.appendChild(s);
     }
+    // Start hidden by default
+    if (!devConsoleFixed.classList.contains('hidden')) devConsoleFixed.classList.add('hidden');
 }
 
 // Key handler: toggle console with '/' unless the input is focused
 window.addEventListener('keydown', (e) => {
     // Ignore when modifier keys are used (so Ctrl+/ etc don't conflict)
     if (e.ctrlKey || e.altKey || e.metaKey) return;
-    // If the dev input exists and is focused, do nothing
+    // Always allow Escape to close the console even if the input is focused
+    if (e.key === 'Escape' || e.key === 'Esc') {
+        if (devConsoleFixed && !devConsoleFixed.classList.contains('hidden')) {
+            devConsoleFixed.classList.add('hidden');
+            try { if (devInput && document.activeElement === devInput) devInput.blur(); } catch (ex) {}
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+        }
+    }
+    // If the dev input exists and is focused, do nothing for other keys
     if (devInput && document.activeElement === devInput) return;
     // Check for '/' key (both main slash and numpad)
     if (e.key === '/' || e.key === 'Slash') {
@@ -2904,6 +3233,15 @@ window.addEventListener('keydown', (e) => {
         // If showing the console, focus the input
         if (!devConsoleFixed.classList.contains('hidden')) {
             if (devInput) devInput.focus();
+        }
+    }
+    // Close console on Escape key from anywhere
+    if (e.key === 'Escape' || e.key === 'Esc') {
+        if (!devConsoleFixed) return;
+        if (!devConsoleFixed.classList.contains('hidden')) {
+            devConsoleFixed.classList.add('hidden');
+            // if the input had focus, blur it so game keys resume
+            try { if (devInput && document.activeElement === devInput) devInput.blur(); } catch (ex) {}
         }
     }
 });
@@ -2996,13 +3334,13 @@ devForm.addEventListener('submit', function(e) {
         }
         logDev(`Card or world modifier not found: "${name}"`);
     } else {
-        logDev('Unknown command. Use //Card Name, //ModName, or //mods');
+        logDev('Unknown command.');
     }
     devInput.value = '';
     return false;
 });
 // Initial log message
-logDev('Dev console ready. Type //Card Name or //Card Name/xN to grant cards.');
+logDev('Dev console ready. //cards //mods //ref');
 
 // Also handle Enter directly on the input to be extra-reliable
 devInput.addEventListener('keydown', function(e) {

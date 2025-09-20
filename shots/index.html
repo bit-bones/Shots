@@ -312,9 +312,32 @@
                 <span id="world-modifier-value" class="slider-value">3</span>
             </div>
         </div>
-        <div style="display:flex; gap:10px;">
+        <div style="display:flex; gap:10px; margin-bottom:10px;">
             <button id="start-btn">Start Game</button>
             <button id="open-options-btn">Options</button>
+        </div>
+        <div style="display:flex; gap:10px;">
+            <button id="host-btn">Host / Invite</button>
+            <button id="join-btn">Join Game</button>
+        </div>
+        <!-- Multiplayer Modal -->
+        <div id="multiplayer-modal" style="display:none; position:fixed; left:0; top:0; right:0; bottom:0; z-index:3000; background:rgba(0,0,0,0.55); align-items:center; justify-content:center;">
+            <div style="background:#232832; border-radius:14px; padding:32px 32px 24px 32px; min-width:340px; max-width:90vw; margin:auto; box-shadow:0 8px 40px #000a; color:#fff; display:flex; flex-direction:column; align-items:center;">
+                <div id="mp-host-section" style="display:none; flex-direction:column; align-items:center;">
+                    <h3 style="color:#65c6ff; margin-bottom:10px;">Invite a Friend</h3>
+                    <div style="margin-bottom:10px;">Share this code or link:</div>
+                    <input id="mp-session-code" readonly style="font-size:1.2em; text-align:center; margin-bottom:10px; width:180px; background:#181c23; color:#65c6ff; border:1.5px solid #65c6ff; border-radius:7px; padding:6px 10px;" />
+                    <button id="mp-copy-link" style="margin-bottom:10px;">Copy Link</button>
+                    <div style="font-size:0.98em; color:#b7e6ff; margin-bottom:10px;">Waiting for player to join...</div>
+                </div>
+                <div id="mp-join-section" style="display:none; flex-direction:column; align-items:center;">
+                    <h3 style="color:#65c6ff; margin-bottom:10px;">Join a Game</h3>
+                    <div style="margin-bottom:10px;">Enter code or paste invite link:</div>
+                    <input id="mp-join-code" style="font-size:1.2em; text-align:center; margin-bottom:10px; width:180px; background:#181c23; color:#65c6ff; border:1.5px solid #65c6ff; border-radius:7px; padding:6px 10px;" />
+                    <button id="mp-join-confirm" style="margin-bottom:10px;">Join</button>
+                </div>
+                <button id="mp-cancel" style="margin-top:8px; background:#3d4351; color:#fff;">Cancel</button>
+            </div>
         </div>
     </div>
     <div id="cards-ui"></div>
