@@ -1359,7 +1359,8 @@ const NET = {
         if (enemy) enemy.color = '#ff5a5a';
         // Stop current game loop and show setup so both players are forced back to lobby
         try { stopGame(); } catch (e) {}
-        try { showSetupOverlay(); } catch (e) {}
+        // Show reconnect button to allow the user to attempt to reconnect to the same session
+        try { showReconnectButton(); } catch (e) {}
         // Inform the user unobtrusively
         try { console.warn('Multiplayer disconnected:', reason); } catch (e) {}
     }
@@ -1999,9 +2000,12 @@ function update(dt) {
         // Always tick enemy shoot timer on host
         enemy.timeSinceShot += dt;
         // Remote shoot intent (queued) fires once when off cooldown
-        if (NET.remoteShootQueued && enemy.timeSinceShot >= enemy.shootInterval) {
-                let target = { x: player.x, y: player.y };
-                enemy.shootToward(target, bullets);
+    if (NET.remoteShootQueued && enemy.timeSinceShot >= enemy.shootInterval) {
+        // Use joiner's aim coordinates (from remote input) if available
+        let aimX = (ri && typeof ri.aimX === 'number') ? ri.aimX : player.x;
+        let aimY = (ri && typeof ri.aimY === 'number') ? ri.aimY : player.y;
+        let target = { x: aimX, y: aimY };
+        enemy.shootToward(target, bullets);
                 // tag bullets with ids (host)
                 for (let i = bullets.length-1; i >= 0; i--) {
                     if (bullets[i].owner === enemy && !bullets[i].id) NET.tagBullet(bullets[i]);
@@ -3015,6 +3019,44 @@ function setupOverlayInit() {
         };
     }
 
+    // Reconnect button helper: create DOM element if missing and show/hide
+    function ensureReconnectButton() {
+        let btn = document.getElementById('mp-reconnect-btn');
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.id = 'mp-reconnect-btn';
+            btn.innerText = 'Reconnect';
+            btn.style.position = 'fixed';
+            btn.style.right = '18px';
+            btn.style.bottom = '18px';
+            btn.style.zIndex = 9999;
+            btn.style.padding = '10px 14px';
+            btn.style.background = '#2f8bff';
+            btn.style.color = '#fff';
+            btn.style.border = 'none';
+            btn.style.borderRadius = '8px';
+            btn.style.boxShadow = '0 4px 12px rgba(0,0,0,0.35)';
+            btn.style.display = 'none';
+            btn.onclick = function() {
+                // Try reconnect using previously selected session/role
+                if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+                    btn.style.display = 'none';
+                    return;
+                }
+                const role = window.wsRole || NET.role || 'host';
+                const code = window.wsSession || (document.getElementById('mp-session-code') ? document.getElementById('mp-session-code').value : '') || '';
+                connectWebSocket(role, code);
+                btn.innerText = 'Reconnecting...';
+                setTimeout(() => { btn.innerText = 'Reconnect'; }, 4000);
+            };
+            document.body.appendChild(btn);
+        }
+        return btn;
+    }
+
+    function showReconnectButton() { const b = ensureReconnectButton(); b.style.display = 'block'; }
+    function hideReconnectButton() { const b = ensureReconnectButton(); b.style.display = 'none'; b.innerText = 'Reconnect'; }
+
     // Patch after each connect
     let oldConnectWebSocket = null;
     if (typeof connectWebSocket === 'function') oldConnectWebSocket = connectWebSocket;
@@ -3053,6 +3095,7 @@ function setupOverlayInit() {
                 // Set NET role and mark connected; enforce consistent colors (host=blue, joiner=red)
                 NET.setRole(role);
                 NET.setConnected(true);
+                try { hideReconnectButton(); } catch (e) {}
                 if (role === 'host') {
                     if (player) player.color = '#65c6ff';
                     if (enemy) enemy.color = '#ff5a5a';
