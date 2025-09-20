@@ -1198,9 +1198,9 @@ class Firestorm {
 let canvas, ctx;
 let mouse = { x: CANVAS_W/2, y: CANVAS_H/2 };
 let keys = {};
-let player1, player2, bullets, obstacles;
+let player, enemy, bullets, obstacles;
 let enemyCount = 1;
-// enemyDisabled is now only for AI slots, not for player2
+let enemyDisabled = false; // when true, enemy exists but AI/draw are disabled (for 0 enemies option; ignored in MP)
 let explosions = [];
 let lastTimestamp = 0;
 let cardState = { active: false, player: null, callback: null };
@@ -1255,8 +1255,8 @@ const NET = {
         const snap = {
             t: this.now(),
             players: [
-                { x: player1.x, y: player1.y, hp: player1.health },
-                { x: player2.x, y: player2.y, hp: player2.health }
+                { x: player.x, y: player.y, hp: player.health },
+                (!enemyDisabled ? { x: enemy.x, y: enemy.y, hp: enemy.health } : { x: 0, y: 0, hp: 0 })
             ],
             bullets: bullets.map(b => ({ id: b.id, x: b.x, y: b.y, angle: b.angle, speed: b.speed, r: b.radius, dmg: b.damage, bnc: b.bouncesLeft, obl: !!b.obliterator, ex: !!b.explosive }))
         };
@@ -1268,12 +1268,14 @@ const NET = {
         try {
             const p0 = snap.players[0]; // host
             const p1 = snap.players[1]; // joiner
-            if (NET.role === 'host') {
-                if (p0) { player1.x = p0.x; player1.y = p0.y; player1.health = p0.hp; }
-                if (p1) { player2.x = p1.x; player2.y = p1.y; player2.health = p1.hp; }
-            } else if (NET.role === 'joiner') {
-                if (p0) { player1.x = p0.x; player1.y = p0.y; player1.health = p0.hp; }
-                if (p1) { player2.x = p1.x; player2.y = p1.y; player2.health = p1.hp; }
+            if (NET.role === 'joiner') {
+                // On joiner: P1 (host) -> enemy; P2 (joiner) -> player
+                if (p0) { enemy.x = p0.x; enemy.y = p0.y; enemy.health = p0.hp; }
+                if (p1) { player.x = p1.x; player.y = p1.y; player.health = p1.hp; }
+            } else {
+                // Fallback mapping (not used on host normally)
+                if (p0) { player.x = p0.x; player.y = p0.y; player.health = p0.hp; }
+                if (p1) { enemy.x = p1.x; enemy.y = p1.y; enemy.health = p1.hp; }
             }
             // bullets: upsert by id, remove missing
             const incoming = new Map();
@@ -1323,8 +1325,9 @@ const NET = {
 
 // Map a role label ('host'|'joiner') to the correct local entity
 function getEntityForRole(role) {
-    // host is always player1, joiner is always player2
-    return role === 'host' ? player1 : player2;
+    if (NET.role === 'host') return role === 'host' ? player : enemy;
+    if (NET.role === 'joiner') return role === 'host' ? enemy : player;
+    return player;
 }
 
 // --- Procedural Obstacle Generation ---
@@ -1399,25 +1402,27 @@ function findNearestClearPosition(x0, y0, cr, opts = {}) {
 
 function positionPlayersSafely() {
     const MIN_SEP = 140;
-    let p1Start = { x: CANVAS_W/3, y: CANVAS_H/2 };
-    let p2Start = { x: 2*CANVAS_W/3, y: CANVAS_H/2 };
-    if (!player1) player1 = new Player(true, "#65c6ff", p1Start.x, p1Start.y);
-    if (!player2) player2 = new Player(false, "#ff5a5a", p2Start.x, p2Start.y);
-    let p1Pos = findNearestClearPosition(p1Start.x, p1Start.y, player1.radius);
-    player1.x = p1Pos.x; player1.y = p1Pos.y;
-    let p2Pos = findNearestClearPosition(p2Start.x, p2Start.y, player2.radius);
-    if (dist(p2Pos.x, p2Pos.y, player1.x, player1.y) < MIN_SEP) {
+    let pStart = { x: CANVAS_W/3, y: CANVAS_H/2 };
+    let eStart = { x: 2*CANVAS_W/3, y: CANVAS_H/2 };
+    if (!player) player = new Player(true, "#65c6ff", pStart.x, pStart.y);
+    if (!enemy) enemy = new Player(false, "#ff5a5a", eStart.x, eStart.y);
+    // If enemyDisabled, mark enemy to skip AI/draw but keep object for compatibility
+    if (enemyDisabled) enemy.disabled = true; else enemy.disabled = false;
+    let pPos = findNearestClearPosition(pStart.x, pStart.y, player.radius);
+    player.x = pPos.x; player.y = pPos.y;
+    let ePos = findNearestClearPosition(eStart.x, eStart.y, enemy.radius);
+    if (!enemyDisabled && dist(ePos.x, ePos.y, player.x, player.y) < MIN_SEP) {
         let found = false;
         for (let r = 140; r <= 420 && !found; r += 40) {
             for (let a = 0; a < Math.PI*2 && !found; a += 0.5) {
-                let nx = p2Start.x + Math.cos(a) * r;
-                let ny = p2Start.y + Math.sin(a) * r;
-                if (!isCircleClear(nx, ny, player2.radius)) continue;
-                if (dist(nx, ny, player1.x, player1.y) >= MIN_SEP) { p2Pos = {x: nx, y: ny}; found = true; break; }
+                let nx = eStart.x + Math.cos(a) * r;
+                let ny = eStart.y + Math.sin(a) * r;
+                if (!isCircleClear(nx, ny, enemy.radius)) continue;
+                if (dist(nx, ny, player.x, player.y) >= MIN_SEP) { ePos = {x: nx, y: ny}; found = true; break; }
             }
         }
     }
-    player2.x = p2Pos.x; player2.y = p2Pos.y;
+    if (NET.connected || !enemyDisabled) { enemy.x = ePos.x; enemy.y = ePos.y; }
 }
 function rectsOverlap(a, b) {
     return !(a.x + a.w < b.x || b.x + b.w < a.x ||
@@ -2236,13 +2241,13 @@ function update(dt) {
 
     // --- Respawn, health reset, card (host-authoritative) ---
     if (!waitingForCard && NET.connected && NET.role === 'host') {
-        const participants = [player].concat(enemyDisabled ? [] : [enemy]);
+        const participants = [player, enemy];
         for (let p of participants) {
             if (p.health <= 0) {
                 waitingForCard = true;
                 const loser = p;
                 const loserRole = (loser === player) ? 'host' : 'joiner';
-                const winner = (loser === player) ? (enemyDisabled ? player : enemy) : player;
+                const winner = (loser === player) ? enemy : player;
                 winner.score++;
                 if (winner.healOnKill) winner.health = Math.min(winner.health + 25, winner.healthMax);
                 bullets = [];
@@ -2269,8 +2274,8 @@ function update(dt) {
                             type:'round-reset',
                             obstacles: serializeObstacles(),
                             hostPos: { x: player.x, y: player.y, hp: player.health },
-                            joinerPos: (!enemyDisabled ? { x: enemy.x, y: enemy.y, hp: enemy.health } : {x:0,y:0,hp:0}),
-                            scores: { host: (player.score||0), joiner: (!enemyDisabled ? enemy.score||0 : 0) }
+                            joinerPos: { x: enemy.x, y: enemy.y, hp: enemy.health },
+                            scores: { host: (player.score||0), joiner: (enemy.score||0) }
                         }}));
                     }
                 } catch (e) {}
@@ -2363,16 +2368,17 @@ function draw() {
         firestormInstance.draw(ctx);
     }
     if (typeof player !== 'undefined' && player) drawPlayer(player);
-    if (!enemyDisabled && typeof enemy !== 'undefined' && enemy) drawPlayer(enemy);
+    if ((NET.connected || !enemyDisabled) && typeof enemy !== 'undefined' && enemy) drawPlayer(enemy);
 
     ctx.save();
     ctx.font = "bold 22px sans-serif";
+    // Player 1 / Player 2 labels: host is P1, joiner is P2
+    const P1 = (NET.role === 'joiner') ? enemy : player;
+    const P2 = (NET.role === 'joiner') ? player : enemy;
     ctx.fillStyle = "#65c6ff";
-    ctx.fillText("Player: " + ((player && typeof player.score === 'number') ? player.score : '0'), 24, 34);
-    if (!enemyDisabled) {
-        ctx.fillStyle = "#ff5a5a";
-        ctx.fillText("Enemy: " + ((enemy && typeof enemy.score === 'number') ? enemy.score : '0'), CANVAS_W - 120, 34);
-    }
+    ctx.fillText("Player 1: " + ((P1 && typeof P1.score === 'number') ? P1.score : '0'), 24, 34);
+    ctx.fillStyle = "#ff5a5a";
+    if (P2) ctx.fillText("Player 2: " + ((P2 && typeof P2.score === 'number') ? P2.score : '0'), CANVAS_W - 160, 34);
     ctx.restore();
 
     drawCardsUI();
@@ -2792,11 +2798,13 @@ function updateCardsUI() {
         return out.join('');
     }
 
-    const playerCardList = (typeof player !== 'undefined' && player && Array.isArray(player.cards)) ? player.cards : [];
-    const enemyCardList = (!enemyDisabled && typeof enemy !== 'undefined' && enemy && Array.isArray(enemy.cards)) ? enemy.cards : [];
+    const P1 = (NET.role === 'joiner') ? enemy : player;
+    const P2 = (NET.role === 'joiner') ? player : enemy;
+    const p1Cards = (P1 && Array.isArray(P1.cards)) ? P1.cards : [];
+    const p2Cards = (P2 && Array.isArray(P2.cards)) ? P2.cards : [];
     cardsDiv.innerHTML =
-        `<div class="cards-list"><span style="color:#65c6ff;font-weight:bold;">Player Cards:</span> ${buildHtmlForList(playerCardList)}</div>` +
-        `<div class="cards-list" style="margin-top:7px;"><span style="color:#ff5a5a;font-weight:bold;">Enemy Cards:</span> ${buildHtmlForList(enemyCardList)}</div>`;
+        `<div class="cards-list"><span style="color:#65c6ff;font-weight:bold;">Player 1 Cards:</span> ${buildHtmlForList(p1Cards)}</div>` +
+        `<div class="cards-list" style="margin-top:7px;"><span style="color:#ff5a5a;font-weight:bold;">Player 2 Cards:</span> ${buildHtmlForList(p2Cards)}</div>`;
 }
 function drawCardsUI() {
     updateCardsUI();
@@ -2881,8 +2889,9 @@ function setupOverlayInit() {
                             if (data.hostPos) { enemy.x = data.hostPos.x; enemy.y = data.hostPos.y; enemy.health = data.hostPos.hp; }
                             if (data.joinerPos) { player.x = data.joinerPos.x; player.y = data.joinerPos.y; player.health = data.joinerPos.hp; }
                             if (data.scores) {
-                                player.score = data.scores.joiner|0; // on joiner: local player is joiner
-                                if (!enemyDisabled) enemy.score = data.scores.host|0;
+                                // P1 (host) shows on joiner as enemy; P2 (joiner) shows as player
+                                enemy.score = data.scores.host|0;
+                                player.score = data.scores.joiner|0;
                             }
                             bullets = []; explosions = []; infestedChunks = [];
                         } else {
@@ -2984,10 +2993,10 @@ function setupOverlayInit() {
                 NET.setConnected(true);
                 if (role === 'host') {
                     if (player) player.color = '#65c6ff';
-                    if (!enemyDisabled && enemy) enemy.color = '#ff5a5a';
+                    if (enemy) enemy.color = '#ff5a5a';
                 } else {
                     if (player) player.color = '#ff5a5a';
-                    if (!enemyDisabled && enemy) enemy.color = '#65c6ff';
+                    if (enemy) enemy.color = '#65c6ff';
                 }
             };
             patchWsOnMessage();
