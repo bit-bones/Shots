@@ -1218,6 +1218,7 @@ const NET = {
     INPUT_HZ: 30,
     SNAPSHOT_HZ: 15,
     remoteInput: { up:false,down:false,left:false,right:false,shoot:false,dash:false,aimX:0,aimY:0,seq:0 },
+    shootLatch: false, // joiner-side edge trigger to avoid hold-to-shoot
     bulletCounter: 1,
     setRole(role) { this.role = role; },
     setConnected(c) { this.connected = !!c; },
@@ -1256,7 +1257,7 @@ const NET = {
             t: this.now(),
             players: [
                 { x: player.x, y: player.y, hp: player.health },
-                (!enemyDisabled ? { x: enemy.x, y: enemy.y, hp: enemy.health } : { x: 0, y: 0, hp: 0 })
+                { x: enemy.x, y: enemy.y, hp: enemy.health }
             ],
             bullets: bullets.map(b => ({ id: b.id, x: b.x, y: b.y, angle: b.angle, speed: b.speed, r: b.radius, dmg: b.damage, bnc: b.bouncesLeft, obl: !!b.obliterator, ex: !!b.explosive }))
         };
@@ -1269,7 +1270,7 @@ const NET = {
             const p0 = snap.players[0]; // host
             const p1 = snap.players[1]; // joiner
             if (NET.role === 'joiner') {
-                // On joiner: P1 (host) -> enemy; P2 (joiner) -> player
+                // On joiner: P1 (host) -> enemy (blue), P2 (joiner) -> player (red)
                 if (p0) { enemy.x = p0.x; enemy.y = p0.y; enemy.health = p0.hp; }
                 if (p1) { player.x = p1.x; player.y = p1.y; player.health = p1.hp; }
             } else {
@@ -1309,16 +1310,20 @@ const NET = {
     },
     // Read local input (joiner). We map to existing variables.
     collectLocalInput() {
+        // Edge trigger for shoot: true exactly once when space is pressed
+        const shootNow = !!player.shootQueued && !this.shootLatch;
         const out = {
             up: !!keys['w'],
             down: !!keys['s'],
             left: !!keys['a'],
             right: !!keys['d'],
-            shoot: !!player.shootQueued,
+            shoot: shootNow,
             dash: !!(player.dash && keys['shift']),
             aimX: mouse.x,
             aimY: mouse.y
         };
+        // Update latch state
+        if (!!player.shootQueued) this.shootLatch = true; else this.shootLatch = false;
         return out;
     }
 };
@@ -1955,6 +1960,8 @@ function update(dt) {
                 enemy.timeSinceShot = 0;
             }
         }
+        // Consume shoot intent once per input message
+        NET.remoteInput.shoot = false;
     } else {
         // Joiner: suppress local enemy AI entirely; enemy state comes from snapshots
         // No movement/AI here
@@ -2412,10 +2419,11 @@ function drawPlayer(p) {
         ctx.save();
         ctx.beginPath();
         ctx.arc(p.x + shakeX, p.y + shakeY, p.radius + 7, -Math.PI/2, -Math.PI/2 + Math.PI*2*cdFrac, false);
-        ctx.strokeStyle = p.isPlayer ? '#65c6ff' : '#ff5a5a';
+    // Use the player's own color for cooldown ring to match role mapping
+    ctx.strokeStyle = p.color;
         ctx.globalAlpha = 0.48;
         ctx.lineWidth = 4.2;
-        ctx.shadowColor = p.isPlayer ? '#65c6ff' : '#ff5a5a';
+    ctx.shadowColor = p.color;
         ctx.shadowBlur = 2;
         ctx.stroke();
         ctx.restore();
