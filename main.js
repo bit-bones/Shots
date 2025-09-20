@@ -1198,9 +1198,9 @@ class Firestorm {
 let canvas, ctx;
 let mouse = { x: CANVAS_W/2, y: CANVAS_H/2 };
 let keys = {};
-let player, enemy, bullets, obstacles;
+let player1, player2, bullets, obstacles;
 let enemyCount = 1;
-let enemyDisabled = false; // when true, enemy exists but AI/draw are disabled (for 0 enemies option)
+// enemyDisabled is now only for AI slots, not for player2
 let explosions = [];
 let lastTimestamp = 0;
 let cardState = { active: false, player: null, callback: null };
@@ -1255,8 +1255,8 @@ const NET = {
         const snap = {
             t: this.now(),
             players: [
-                { x: player.x, y: player.y, hp: player.health },
-                (!enemyDisabled ? { x: enemy.x, y: enemy.y, hp: enemy.health } : { x: 0, y: 0, hp: 0 })
+                { x: player1.x, y: player1.y, hp: player1.health },
+                { x: player2.x, y: player2.y, hp: player2.health }
             ],
             bullets: bullets.map(b => ({ id: b.id, x: b.x, y: b.y, angle: b.angle, speed: b.speed, r: b.radius, dmg: b.damage, bnc: b.bouncesLeft, obl: !!b.obliterator, ex: !!b.explosive }))
         };
@@ -1268,14 +1268,12 @@ const NET = {
         try {
             const p0 = snap.players[0]; // host
             const p1 = snap.players[1]; // joiner
-            if (NET.role === 'joiner') {
-                // On joiner: snapshot[0]=host maps to enemy (blue host), snapshot[1]=joiner maps to player (red joiner)
-                if (p0) { enemy.x = p0.x; enemy.y = p0.y; enemy.health = p0.hp; }
-                if (p1) { player.x = p1.x; player.y = p1.y; player.health = p1.hp; }
-            } else {
-                // Fallback mapping (not used on host normally)
-                if (p0) { player.x = p0.x; player.y = p0.y; player.health = p0.hp; }
-                if (p1) { enemy.x = p1.x; enemy.y = p1.y; enemy.health = p1.hp; }
+            if (NET.role === 'host') {
+                if (p0) { player1.x = p0.x; player1.y = p0.y; player1.health = p0.hp; }
+                if (p1) { player2.x = p1.x; player2.y = p1.y; player2.health = p1.hp; }
+            } else if (NET.role === 'joiner') {
+                if (p0) { player1.x = p0.x; player1.y = p0.y; player1.health = p0.hp; }
+                if (p1) { player2.x = p1.x; player2.y = p1.y; player2.health = p1.hp; }
             }
             // bullets: upsert by id, remove missing
             const incoming = new Map();
@@ -1325,9 +1323,8 @@ const NET = {
 
 // Map a role label ('host'|'joiner') to the correct local entity
 function getEntityForRole(role) {
-    if (NET.role === 'host') return role === 'host' ? player : enemy;
-    if (NET.role === 'joiner') return role === 'host' ? enemy : player;
-    return player;
+    // host is always player1, joiner is always player2
+    return role === 'host' ? player1 : player2;
 }
 
 // --- Procedural Obstacle Generation ---
@@ -1402,27 +1399,25 @@ function findNearestClearPosition(x0, y0, cr, opts = {}) {
 
 function positionPlayersSafely() {
     const MIN_SEP = 140;
-    let pStart = { x: CANVAS_W/3, y: CANVAS_H/2 };
-    let eStart = { x: 2*CANVAS_W/3, y: CANVAS_H/2 };
-    if (!player) player = new Player(true, "#65c6ff", pStart.x, pStart.y);
-    if (!enemy) enemy = new Player(false, "#ff5a5a", eStart.x, eStart.y);
-    // If enemyDisabled, mark enemy to skip AI/draw but keep object for compatibility
-    if (enemyDisabled) enemy.disabled = true; else enemy.disabled = false;
-    let pPos = findNearestClearPosition(pStart.x, pStart.y, player.radius);
-    player.x = pPos.x; player.y = pPos.y;
-    let ePos = findNearestClearPosition(eStart.x, eStart.y, enemy.radius);
-    if (!enemyDisabled && dist(ePos.x, ePos.y, player.x, player.y) < MIN_SEP) {
+    let p1Start = { x: CANVAS_W/3, y: CANVAS_H/2 };
+    let p2Start = { x: 2*CANVAS_W/3, y: CANVAS_H/2 };
+    if (!player1) player1 = new Player(true, "#65c6ff", p1Start.x, p1Start.y);
+    if (!player2) player2 = new Player(false, "#ff5a5a", p2Start.x, p2Start.y);
+    let p1Pos = findNearestClearPosition(p1Start.x, p1Start.y, player1.radius);
+    player1.x = p1Pos.x; player1.y = p1Pos.y;
+    let p2Pos = findNearestClearPosition(p2Start.x, p2Start.y, player2.radius);
+    if (dist(p2Pos.x, p2Pos.y, player1.x, player1.y) < MIN_SEP) {
         let found = false;
         for (let r = 140; r <= 420 && !found; r += 40) {
             for (let a = 0; a < Math.PI*2 && !found; a += 0.5) {
-                let nx = eStart.x + Math.cos(a) * r;
-                let ny = eStart.y + Math.sin(a) * r;
-                if (!isCircleClear(nx, ny, enemy.radius)) continue;
-                if (dist(nx, ny, player.x, player.y) >= MIN_SEP) { ePos = {x: nx, y: ny}; found = true; break; }
+                let nx = p2Start.x + Math.cos(a) * r;
+                let ny = p2Start.y + Math.sin(a) * r;
+                if (!isCircleClear(nx, ny, player2.radius)) continue;
+                if (dist(nx, ny, player1.x, player1.y) >= MIN_SEP) { p2Pos = {x: nx, y: ny}; found = true; break; }
             }
         }
     }
-    if (!enemyDisabled) enemy.x = ePos.x; enemy.y = ePos.y;
+    player2.x = p2Pos.x; player2.y = p2Pos.y;
 }
 function rectsOverlap(a, b) {
     return !(a.x + a.w < b.x || b.x + b.w < a.x ||
