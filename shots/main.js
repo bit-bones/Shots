@@ -937,11 +937,22 @@ class Firestorm {
         this.fadeTime = 1.2; // seconds to fade out
         this.maxLife = 6.5 + Math.random() * 2.5; // how long the firestorm lasts before auto-fading
         this.done = false;
-    // Track what is burning
-    this.burningEntities = new Set();
+        // Track what is burning
+        this.burningEntities = new Set();
+
+        // --- Visuals state from classes.js version ---
+        this.time = 0;
+        this.duration = this.maxLife; // for compatibility with classes.js visuals
+        this.maxRadius = this.radius;
+        this.damageInterval = 0.15; // not used, logic stays in main.js
+        this.damageTimer = 0;
+        this.damage = 5;
+        this.particles = [];
+        this.particleTimer = 0;
     }
     update(dt) {
         this.life += dt;
+        this.time += dt;
         // If fading, count down fade
         if (this.state === 'fading') {
             this.fadeTime -= dt;
@@ -949,7 +960,7 @@ class Firestorm {
         } else if (this.life >= this.maxLife) {
             this.state = 'fading';
         }
-        // Damage and ignite players/enemy
+        // Damage and ignite players/enemy (main.js logic, untouched)
         const participants = [player].concat(enemyDisabled ? [] : [enemy]);
         for (let p of participants) {
             if (p.health > 0 && dist(p.x, p.y, this.x, this.y) < this.radius + p.radius) {
@@ -962,7 +973,7 @@ class Firestorm {
         // Damage and ignite obstacle chunks (limit how many new ignitions per frame)
         if (Array.isArray(obstacles) && obstacles.length > 0) {
             let newIgnitions = 0;
-            const MAX_NEW_IGNITIONS_PER_FRAME = 12; // safety cap to avoid runaway spread/freezes
+            const MAX_NEW_IGNITIONS_PER_FRAME = 12;
             for (let o of obstacles) {
                 if (!o || o.destroyed) continue;
                 for (let c of o.chunks) {
@@ -983,11 +994,10 @@ class Firestorm {
 
         // Spread burning to nearby chunks (simple neighbor spread)
         if (Array.isArray(obstacles) && obstacles.length > 0) {
-            // Cap the amount of neighbor checks/new ignitions per frame
             let spreadChecks = 0;
             let newIgnited = 0;
-            const MAX_SPREAD_CHECKS = 1200; // maximum neighbor checks per frame
-            const MAX_NEW_IGNITED = 10; // maximum new ignitions per frame
+            const MAX_SPREAD_CHECKS = 1200;
+            const MAX_NEW_IGNITED = 10;
             for (let o of obstacles) {
                 if (!o) continue;
                 for (let c of o.chunks) {
@@ -1037,22 +1047,81 @@ class Firestorm {
                 if (playerSpreadChecks > MAX_PLAYER_SPREAD_CHECKS) break;
             }
         }
-    }
-    draw(ctx) {
-        // Draw firestorm visual (flames, glow, etc)
-        ctx.save();
-        
-        // Calculate alpha based on state
-        let alpha = 1.0;
-        if (this.state === 'fading') {
-            alpha = this.fadeTime / 1.2; // fade out based on remaining fade time
+
+        // --- Visuals from classes.js ---
+        this.damageTimer += dt;
+        this.particleTimer += dt;
+        // Generate fire particles
+        if (this.particleTimer > 0.02) {
+            this.particleTimer = 0;
+            for (let i = 0; i < 3; ++i) {
+                let angle = Math.random() * Math.PI * 2;
+                let distance = Math.random() * this.maxRadius * 0.8;
+                let px = this.x + Math.cos(angle) * distance;
+                let py = this.y + Math.sin(angle) * distance;
+                this.particles.push({
+                    x: px,
+                    y: py,
+                    vx: (Math.random() - 0.5) * 40,
+                    vy: -Math.random() * 80 - 20, // upward
+                    life: 0.6 + Math.random() * 0.8,
+                    maxLife: 0.6 + Math.random() * 0.8,
+                    size: 2 + Math.random() * 3
+                });
+            }
         }
-        
-        // Create animated effect based on life time
-        let animTime = this.life * 2; // speed up animation
-        let innerRadius = this.radius * 0.4;
-        let outerRadius = this.radius;
-        
+        // Update particles
+        for (let p of this.particles) {
+            p.x += p.vx * dt;
+            p.y += p.vy * dt;
+            p.vy += 30 * dt; // light gravity
+            p.life -= dt;
+        }
+        this.particles = this.particles.filter(p => p.life > 0);
+
+        // Note: All other logic is untouched from main.js
+
+        // Finish when faded out
+        if (this.state === 'fading' && this.fadeTime <= 0) {
+            this.done = true;
+        }
+    }
+
+    // --- Visuals from classes.js ---
+    draw(ctx) {
+        // Fade-out logic for alpha
+        let t = this.time / this.duration;
+        let alpha = 1;
+        if (this.state === 'fading' || t > 0.8) {
+            alpha = (this.state === 'fading') ?
+                (this.fadeTime / 1.2) :
+                ((1 - t) / 0.2);
+        }
+
+        let animTime = this.time * 2;
+        let outerRadius = this.maxRadius * (0.8 + 0.2 * Math.sin(animTime));
+        let innerRadius = outerRadius * 0.4;
+
+        ctx.save();
+
+        // Draw particles first (background)
+        for (let p of this.particles) {
+            let pa = (p.life / p.maxLife) * alpha * 0.8;
+            ctx.globalAlpha = pa;
+            // Color gradient from yellow to red
+            let lifeRatio = p.life / p.maxLife;
+            if (lifeRatio > 0.6) {
+                ctx.fillStyle = '#ffff66'; // bright yellow
+            } else if (lifeRatio > 0.3) {
+                ctx.fillStyle = '#ffaa00'; // orange
+            } else {
+                ctx.fillStyle = '#ff3300'; // red
+            }
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
         // Draw outer glow
         ctx.globalAlpha = alpha * 0.3;
         let gradient = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, outerRadius * 1.5);
@@ -1063,7 +1132,7 @@ class Firestorm {
         ctx.beginPath();
         ctx.arc(this.x, this.y, outerRadius * 1.5, 0, Math.PI * 2);
         ctx.fill();
-        
+
         // Draw main fire area with animated flicker
         ctx.globalAlpha = alpha * (0.7 + 0.3 * Math.sin(animTime * 4));
         gradient = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, outerRadius);
@@ -1075,7 +1144,7 @@ class Firestorm {
         ctx.beginPath();
         ctx.arc(this.x, this.y, outerRadius, 0, Math.PI * 2);
         ctx.fill();
-        
+
         // Draw hot core
         ctx.globalAlpha = alpha * (0.8 + 0.2 * Math.sin(animTime * 6));
         gradient = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, innerRadius);
@@ -1086,7 +1155,7 @@ class Firestorm {
         ctx.beginPath();
         ctx.arc(this.x, this.y, innerRadius, 0, Math.PI * 2);
         ctx.fill();
-        
+
         ctx.restore();
     }
 }
