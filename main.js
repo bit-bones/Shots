@@ -680,6 +680,8 @@ class Bullet {
         this.explosive = owner.explosive || false;
         this.bouncesLeft = owner.ricochet || 0;
         this.active = true;
+        // Stable ID for host-authoritative snapshots (assigned on host when fired)
+        this.id = null;
     }
     update(dt) {
         this.x += Math.cos(this.angle) * this.speed * dt;
@@ -1176,6 +1178,118 @@ let running = false;
 let animFrameId = null;
 let waitingForCard = false;
 
+// === Host-authoritative networking helpers ===
+const NET = {
+    role: null, // 'host' | 'joiner'
+    connected: false,
+    inputSeq: 0,
+    lastInputSentAt: 0,
+    lastSnapshotSentAt: 0,
+    INPUT_HZ: 30,
+    SNAPSHOT_HZ: 15,
+    remoteInput: { up:false,down:false,left:false,right:false,shoot:false,dash:false,aimX:0,aimY:0,seq:0 },
+    bulletCounter: 1,
+    setRole(role) { this.role = role; },
+    setConnected(c) { this.connected = !!c; },
+    now() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); },
+    // JOINER: package local input and send
+    sendInputs() {
+        if (!window.ws || window.ws.readyState !== WebSocket.OPEN || this.role !== 'joiner') return;
+        const input = this.collectLocalInput();
+        this.inputSeq++;
+        const payload = { type: 'input', seq: this.inputSeq, input };
+        window.ws.send(JSON.stringify({ type: 'relay', data: payload }));
+    },
+    // HOST: send snapshot to joiner
+    sendSnapshot() {
+        if (!window.ws || window.ws.readyState !== WebSocket.OPEN || this.role !== 'host') return;
+        const snap = this.buildSnapshot();
+        const payload = { type: 'snapshot', snap };
+        window.ws.send(JSON.stringify({ type: 'relay', data: payload }));
+    },
+    onFrame(dt) {
+        const now = this.now();
+        if (this.role === 'joiner' && now - this.lastInputSentAt >= (1000/this.INPUT_HZ)) {
+            this.sendInputs();
+            this.lastInputSentAt = now;
+        }
+        if (this.role === 'host' && now - this.lastSnapshotSentAt >= (1000/this.SNAPSHOT_HZ)) {
+            this.sendSnapshot();
+            this.lastSnapshotSentAt = now;
+        }
+    },
+    // Build minimal snapshot from current authoritative state (host only)
+    buildSnapshot() {
+        const snap = {
+            t: this.now(),
+            players: [
+                { x: player.x, y: player.y, hp: player.health },
+                (!enemyDisabled ? { x: enemy.x, y: enemy.y, hp: enemy.health } : { x: 0, y: 0, hp: 0 })
+            ],
+            bullets: bullets.map(b => ({ id: b.id, x: b.x, y: b.y, angle: b.angle, speed: b.speed, r: b.radius, dmg: b.damage, bnc: b.bouncesLeft, obl: !!b.obliterator, ex: !!b.explosive }))
+        };
+        return snap;
+    },
+    // Apply snapshot on joiner
+    applySnapshot(snap) {
+        if (!snap) return;
+        try {
+            const p0 = snap.players[0]; // host
+            const p1 = snap.players[1]; // joiner
+            if (NET.role === 'joiner') {
+                // On joiner: snapshot[0]=host maps to enemy (blue host), snapshot[1]=joiner maps to player (red joiner)
+                if (p0) { enemy.x = p0.x; enemy.y = p0.y; enemy.health = p0.hp; }
+                if (p1) { player.x = p1.x; player.y = p1.y; player.health = p1.hp; }
+            } else {
+                // Fallback mapping (not used on host normally)
+                if (p0) { player.x = p0.x; player.y = p0.y; player.health = p0.hp; }
+                if (p1) { enemy.x = p1.x; enemy.y = p1.y; enemy.health = p1.hp; }
+            }
+            // bullets: upsert by id, remove missing
+            const incoming = new Map();
+            for (const sb of snap.bullets || []) incoming.set(sb.id, sb);
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                const id = bullets[i].id;
+                if (!incoming.has(id)) bullets.splice(i, 1);
+            }
+            const have = new Map(bullets.map(b => [b.id, b]));
+            for (const sb of incoming.values()) {
+                if (have.has(sb.id)) {
+                    const b = have.get(sb.id);
+                    b.x = sb.x; b.y = sb.y; b.angle = sb.angle; b.speed = sb.speed;
+                    b.radius = sb.r; b.damage = sb.dmg; b.bouncesLeft = sb.bnc;
+                    b.obliterator = !!sb.obl; b.explosive = !!sb.ex;
+                    b.active = true;
+                } else {
+                    const owner = player; // visual only; owner doesn’t affect joiner authority
+                    const nb = new Bullet(owner, sb.x, sb.y, sb.angle);
+                    nb.id = sb.id; nb.speed = sb.speed; nb.radius = sb.r; nb.damage = sb.dmg;
+                    nb.bouncesLeft = sb.bnc; nb.obliterator = !!sb.obl; nb.explosive = !!sb.ex;
+                    nb.active = true;
+                    bullets.push(nb);
+                }
+            }
+        } catch (e) { /* ignore snapshot errors to avoid crashing */ }
+    },
+    // Assign an id to a newly created bullet (host only)
+    tagBullet(b) {
+        if (!b.id) b.id = 'b' + (Date.now().toString(36)) + '-' + (this.bulletCounter++);
+    },
+    // Read local input (joiner). We map to existing variables.
+    collectLocalInput() {
+        return {
+            up: !!keys['w'],
+            down: !!keys['s'],
+            left: !!keys['a'],
+            right: !!keys['d'],
+            shoot: !!player.shootQueued,
+            dash: !!(player.dash && keys['shift']),
+            aimX: mouse.x,
+            aimY: mouse.y
+        };
+    }
+};
+
 // --- Procedural Obstacle Generation ---
 function generateObstacles() {
     obstacles = [];
@@ -1204,6 +1318,19 @@ function generateObstacles() {
         if (!obstacles.some(o => rectsOverlap(o, obs))) {
         } else safe = false;
         if (safe) obstacles.push(obs);
+    }
+}
+
+// Serialize/deserialize obstacles for setup sync
+function serializeObstacles() {
+    return (obstacles||[]).map(o => ({ x:o.x, y:o.y, w:o.w, h:o.h, destroyed: !!o.destroyed }));
+}
+function deserializeObstacles(arr) {
+    obstacles = [];
+    for (const s of (arr||[])) {
+        const o = new Obstacle(s.x, s.y, s.w, s.h);
+        o.destroyed = !!s.destroyed;
+        obstacles.push(o);
     }
 }
 
@@ -1378,57 +1505,8 @@ function gameLoop(ts) {
 
 // --- Update Logic ---
 function update(dt) {
-    // --- Multiplayer Sync ---
-    if (window.ws && window.ws.readyState === WebSocket.OPEN && typeof window.wsRole === 'string') {
-        // Only sync if in multiplayer mode
-        let action = {
-            x: player.x,
-            y: player.y,
-            health: player.health,
-            powerups: Array.isArray(player.cards) ? player.cards.slice() : [],
-            shoot: player.shootQueued,
-            dash: player.dashActive,
-            // Send new bullets fired this frame (positions, angles, etc.)
-            bullets: bullets.filter(b => b.owner === player && b.justFired).map(b => ({ x: b.x, y: b.y, angle: b.angle, speed: b.speed, radius: b.radius, damage: b.damage }))
-        };
-        // Only send if changed (basic throttle)
-        if (JSON.stringify(action) !== JSON.stringify(window.lastSentAction)) {
-            if (typeof window.sendAction === 'function') window.sendAction(action);
-            window.lastSentAction = action;
-        }
-        // After sending, clear justFired on all bullets
-        for (const b of bullets) { if (b.justFired) b.justFired = false; }
-        // Apply remote player state to enemy (if joiner, remote is host; if host, remote is joiner)
-        if (!enemyDisabled && window.remotePlayerState) {
-            const rps = window.remotePlayerState;
-            enemy.x = rps.x || enemy.x;
-            enemy.y = rps.y || enemy.y;
-            if (typeof rps.health === 'number') enemy.health = rps.health;
-            if (Array.isArray(rps.powerups)) enemy.cards = rps.powerups.slice();
-            if (rps.shoot) {
-                enemy.shootQueued = true;
-                rps.shoot = false;
-            }
-            if (rps.dash) {
-                enemy.dashActive = true;
-                rps.dash = false;
-            }
-            // Spawn bullets fired by remote player
-            if (Array.isArray(rps.bullets)) {
-                for (const b of rps.bullets) {
-                    // Only add if not already present (basic deduplication)
-                    if (!bullets.some(existing => Math.abs(existing.x - b.x) < 2 && Math.abs(existing.y - b.y) < 2 && Math.abs(existing.angle - b.angle) < 0.01)) {
-                        let newB = new Bullet(enemy, b.x, b.y, b.angle);
-                        newB.speed = b.speed || 420;
-                        newB.radius = b.radius || 7;
-                        newB.damage = b.damage || 18;
-                        newB.justFired = false;
-                        bullets.push(newB);
-                    }
-                }
-            }
-        }
-    }
+    // --- Multiplayer Sync (host-authoritative) ---
+    NET.onFrame(dt);
     // --- Burning Damage Over Time ---
     if (player) player.updateBurning(dt);
     if (!enemyDisabled && enemy) enemy.updateBurning(dt);
@@ -1678,7 +1756,7 @@ function update(dt) {
             player.dashCooldown = Math.max(0, player.dashCooldown - dt);
         }
     }
-    if (!enemyDisabled && enemy.dash) {
+    if (!enemyDisabled && enemy.dash && !(NET.role === 'host' && NET.connected)) {
         if (!enemy.dashActive && Math.random() < 0.003 && enemy.dashCooldown <= 0) {
             let dx = enemy.x - player.x, dy = enemy.y - player.y;
             let norm = Math.hypot(dx, dy);
@@ -1758,6 +1836,10 @@ function update(dt) {
             enemy.dashCooldown = Math.max(0, enemy.dashCooldown - dt);
         }
     }
+    // If joiner, disable local enemy AI and movement (enemy will be driven by snapshots)
+    if (NET.role === 'joiner') {
+        // Joiner still moves their local player; enemy AI disabled below
+    }
     if (!player.dashActive) {
         if (input.x || input.y) {
             let norm = Math.hypot(input.x, input.y);
@@ -1787,44 +1869,68 @@ function update(dt) {
             }
         }
     }
-    let ex = enemy.x, ey = enemy.y;
-    let pv = { x: player.x - ex, y: player.y - ey };
-    let distToPlayer = Math.hypot(pv.x, pv.y);
-    let aiInput = { x: 0, y: 0 };
-    if (distToPlayer < 170) {
-        aiInput.x = -pv.x;
-        aiInput.y = -pv.y;
-    } else if (distToPlayer > 350) {
-        aiInput.x = pv.x;
-        aiInput.y = pv.y;
-    } else {
-        aiInput.x = -pv.y;
-        aiInput.y = pv.x;
-    }
-    if (!enemy.dashActive) {
-        if (aiInput.x || aiInput.y) {
-            let norm = Math.hypot(aiInput.x, aiInput.y);
-            aiInput.x /= norm; aiInput.y /= norm;
-            let speed = enemy.speed;
-            let oldx = enemy.x, oldy = enemy.y;
-            enemy.x += aiInput.x * speed * dt;
-            enemy.y += aiInput.y * speed * dt;
-            enemy.x = clamp(enemy.x, enemy.radius, CANVAS_W-enemy.radius);
-            enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H-enemy.radius);
-            for(let o of obstacles) {
-                if(o.circleCollide(enemy.x, enemy.y, enemy.radius)) {
-                    enemy.x = oldx; enemy.y = oldy;
+    if (NET.role === 'host') {
+        // Host: drive enemy using remote input from joiner
+        let ri = NET.remoteInput || { up:false,down:false,left:false,right:false };
+        let vx = (ri.right?1:0) - (ri.left?1:0);
+        let vy = (ri.down?1:0) - (ri.up?1:0);
+        if (!enemy.dashActive) {
+            if (vx || vy) {
+                let norm = Math.hypot(vx, vy);
+                vx /= norm; vy /= norm;
+                let speed = enemy.speed;
+                let oldx = enemy.x, oldy = enemy.y;
+                enemy.x += vx * speed * dt;
+                enemy.y += vy * speed * dt;
+                enemy.x = clamp(enemy.x, enemy.radius, CANVAS_W-enemy.radius);
+                enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H-enemy.radius);
+                for(let o of obstacles) {
+                    if(o.circleCollide(enemy.x, enemy.y, enemy.radius)) { enemy.x = oldx; enemy.y = oldy; }
                 }
             }
         }
+        // Remote shoot/dash intents
+        if (ri.dash && enemy.dash && !enemy.dashActive && enemy.dashCooldown <= 0) {
+            // trigger dash in the same way as AI, using direction toward aim
+            let dx = (ri.aimX||player.x) - enemy.x;
+            let dy = (ri.aimY||player.y) - enemy.y;
+            let norm = Math.hypot(dx, dy) || 1;
+            let dir = { x: dx/norm, y: dy/norm };
+            let dashSet = getDashSettings(enemy);
+            enemy.dashActive = true; enemy.dashDir = dir; enemy.dashTime = dashSet.duration; enemy.dashCooldown = dashSet.cooldown;
+            enemy.deflectRemaining = (enemy.deflectStacks || 0);
+            if ((enemy.bigShotStacks||0) > 0) enemy.bigShotPending = true;
+            try { playDashWoosh(enemy.dashTime, dashSet.speedMult); } catch (e) {}
+        }
+        if (ri.shoot) {
+            enemy.timeSinceShot += dt; // ensure timer progresses
+            if (enemy.timeSinceShot >= enemy.shootInterval) {
+                let target = { x: player.x, y: player.y };
+                enemy.shootToward(target, bullets);
+                // tag bullets with ids (host)
+                for (let i = bullets.length-1; i >= 0; i--) {
+                    if (bullets[i].owner === enemy && !bullets[i].id) NET.tagBullet(bullets[i]);
+                }
+                enemy.timeSinceShot = 0;
+            }
+        }
+    } else {
+        // Joiner: suppress local enemy AI entirely; enemy state comes from snapshots
+        // No movement/AI here
     }
     player.timeSinceShot += dt;
     if (player.shootQueued && player.timeSinceShot >= player.shootInterval) {
         player.shootToward(mouse, bullets);
+        // Host assigns bullet ids for player's bullets
+        if (NET.role === 'host') {
+            for (let i = bullets.length-1; i >= 0; i--) {
+                if (bullets[i].owner === player && !bullets[i].id) NET.tagBullet(bullets[i]);
+            }
+        }
         player.timeSinceShot = 0;
         player.shootQueued = false;
     }
-    if (!enemyDisabled) {
+    if (!enemyDisabled && !(NET.role === 'host' && NET.connected)) {
         enemy.timeSinceShot += dt;
         let canSeePlayer = hasLineOfSight(enemy.x, enemy.y, player.x, player.y, obstacles);
         let canShootDespiteBlock = enemy.pierce || enemy.obliterator;
@@ -2564,7 +2670,32 @@ function setupOverlayInit() {
                 hideMpModal();
                 alert('A player has joined your session!');
             } else if (msg.type === 'relay') {
-                handleGameMessage(msg.data);
+                // New routing: input from joiner to host, snapshots from host to joiner
+                const data = msg.data;
+                if (data && data.type === 'input' && NET.role === 'host') {
+                    NET.remoteInput = { ...(data.input||{}), seq: data.seq };
+                } else if (data && data.type === 'snapshot' && NET.role === 'joiner') {
+                    NET.applySnapshot(data.snap);
+                } else if (data && data.type === 'setup' && NET.role === 'joiner') {
+                    // Update the joiner's setup UI live
+                    applyIncomingSetup(data.data);
+                } else if (data && data.type === 'round-start') {
+                    // Sync obstacles and critical flags before starting
+                    if (NET.role === 'joiner') {
+                        // apply settings
+                        try {
+                            DYNAMIC_MODE = !!data.dynamic;
+                            DYNAMIC_RATE = parseFloat(data.dynamicRate);
+                            MAP_BORDER = !!data.mapBorder;
+                            worldModifierRoundInterval = parseInt(data.worldModInterval||3);
+                            // build obstacles
+                            deserializeObstacles(data.obstacles||[]);
+                        } catch (e) {}
+                    }
+                } else {
+                    // fallback to previous handler if any simple sync message comes through
+                    handleGameMessage(data);
+                }
             }
         };
     }
@@ -2604,6 +2735,16 @@ function setupOverlayInit() {
                 } else if (role === 'joiner') {
                     window.ws.send(JSON.stringify({ type: 'join', code: window.wsSession }));
                 }
+                // Set NET role and mark connected; enforce consistent colors (host=blue, joiner=red)
+                NET.setRole(role);
+                NET.setConnected(true);
+                if (role === 'host') {
+                    if (player) player.color = '#65c6ff';
+                    if (!enemyDisabled && enemy) enemy.color = '#ff5a5a';
+                } else {
+                    if (player) player.color = '#ff5a5a';
+                    if (!enemyDisabled && enemy) enemy.color = '#65c6ff';
+                }
             };
             patchWsOnMessage();
             window.ws.onclose = function() {
@@ -2611,11 +2752,13 @@ function setupOverlayInit() {
                 if (mpJoinSection && mpJoinSection.style.display !== 'none') {
                     alert('Disconnected from server. Please verify the host is running and reachable.');
                 }
+                NET.setConnected(false);
             };
             window.ws.onerror = function() {
                 if (mpJoinSection && mpJoinSection.style.display !== 'none') {
                     alert('WebSocket error. Is the server URL correct? ' + window.MULTIPLAYER_WS_URL);
                 }
+                NET.setConnected(false);
             };
         }
         setTimeout(patchWsOnMessage, 200);
@@ -2674,6 +2817,21 @@ function setupOverlayInit() {
                 // load the selected key
                 loadSavedMapByKey(sel.value);
             }
+        } else if (NET.role === 'host' && NET.connected) {
+            // Deterministically generate on host only, then broadcast to joiner
+            generateObstacles();
+        }
+        // If host, broadcast round-start with obstacles and flags
+        if (NET.role === 'host' && NET.connected && window.ws && window.ws.readyState === WebSocket.OPEN) {
+            const msg = {
+                type: 'round-start',
+                obstacles: serializeObstacles(),
+                dynamic: DYNAMIC_MODE,
+                dynamicRate: DYNAMIC_RATE,
+                mapBorder: MAP_BORDER,
+                worldModInterval: worldModifierRoundInterval
+            };
+            window.ws.send(JSON.stringify({ type: 'relay', data: msg }));
         }
         startGame();
     };
@@ -2764,6 +2922,39 @@ function setupOverlayInit() {
             connectWebSocket('joiner', mpJoinCode.value);
         }
     };
+
+    // Host broadcasts setup changes (sliders/toggles) to joiner
+    function broadcastSetup() {
+        if (NET.role !== 'host' || !window.ws || window.ws.readyState !== WebSocket.OPEN) return;
+        const setup = {
+            type: 'setup',
+            data: {
+                density: parseInt(densitySlider.value),
+                size: parseInt(sizeSlider.value),
+                dynamic: !!dynamicCheckbox.checked,
+                dynamicRate: parseFloat(dynamicRateSlider.value),
+                mapBorder: !!mapBorderCheckbox.checked,
+                worldModInterval: parseInt(worldModifierSlider.value)
+            }
+        };
+        window.ws.send(JSON.stringify({ type: 'relay', data: setup }));
+    }
+    [densitySlider,sizeSlider,dynamicCheckbox,dynamicRateSlider,mapBorderCheckbox,worldModifierSlider].forEach(el => {
+        if (el) el.addEventListener('input', () => broadcastSetup());
+        if (el) el.addEventListener('change', () => broadcastSetup());
+    });
+
+    // Apply incoming setup and preview UI for the joiner
+    function applyIncomingSetup(s) {
+        try {
+            densitySlider.value = s.density; densityValue.textContent = densitySlider.value;
+            sizeSlider.value = s.size; sizeValue.textContent = sizeSlider.value;
+            dynamicCheckbox.checked = !!s.dynamic; dynamicRateRow.style.display = s.dynamic ? 'flex' : 'none';
+            dynamicRateSlider.value = s.dynamicRate.toFixed(2); dynamicRateValue.textContent = parseFloat(dynamicRateSlider.value).toFixed(2);
+            mapBorderCheckbox.checked = !!s.mapBorder;
+            worldModifierSlider.value = s.worldModInterval; worldModifierValue.textContent = worldModifierSlider.value;
+        } catch (e) {}
+    }
 }
 
 function showSetupOverlay() {
