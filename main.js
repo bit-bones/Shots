@@ -69,7 +69,10 @@ function showWorldModifierCards() {
 // --- Restart Game ---
 function restartGame() {
     // Reset scores
-    if (typeof player !== 'undefined' && player) player.resetStats();
+        if (typeof player !== 'undefined' && player) {
+            player.resetStats();
+            player.reset(); // Reset player position and state
+        }
     if (typeof enemy !== 'undefined' && enemy) enemy.resetStats();
     updateCardsUI();
     // Show setup overlay
@@ -115,7 +118,7 @@ function playGunShot() {
 function playExplosion() {
     const o = audioCtx.createOscillator();
     const g = audioCtx.createGain();
-    o.type = 'triangle';
+        o.type = 'sine'; // Change to sine wave for a different explosion sound
     o.frequency.value = 80;
     g.gain.value = 0.40 * masterVolume * sfxVolume * explosionVolume;
     o.connect(g).connect(audioCtx.destination);
