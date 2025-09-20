@@ -1229,6 +1229,8 @@ const NET = {
         this.inputSeq++;
         const payload = { type: 'input', seq: this.inputSeq, input };
         window.ws.send(JSON.stringify({ type: 'relay', data: payload }));
+        // prevent sticky shoot: clear flag after sending
+        if (input.shoot && player) player.shootQueued = false;
     },
     // HOST: send snapshot to joiner
     sendSnapshot() {
@@ -1307,7 +1309,7 @@ const NET = {
     },
     // Read local input (joiner). We map to existing variables.
     collectLocalInput() {
-        return {
+        const out = {
             up: !!keys['w'],
             down: !!keys['s'],
             left: !!keys['a'],
@@ -1317,6 +1319,7 @@ const NET = {
             aimX: mouse.x,
             aimY: mouse.y
         };
+        return out;
     }
 };
 
@@ -1544,6 +1547,7 @@ function gameLoop(ts) {
 function update(dt) {
     // --- Multiplayer Sync (host-authoritative) ---
     NET.onFrame(dt);
+    const simulateLocally = !NET.connected || NET.role === 'host';
     // --- Burning Damage Over Time ---
     if (player) player.updateBurning(dt);
     if (!enemyDisabled && enemy) enemy.updateBurning(dt);
@@ -1578,7 +1582,7 @@ function update(dt) {
         }
     }
     // --- Firestorm World Modifier Logic ---
-    if (firestormActive) {
+    if (NET.role !== 'joiner' && firestormActive) {
         firestormTimer += dt;
         if (!firestormInstance && firestormTimer >= firestormNextTime) {
             // Spawn a new firestorm
@@ -1600,7 +1604,7 @@ function update(dt) {
     }
 // --- Firestorm Effect Class ---
     // World Modifier: Infestation logic
-    if (infestationActive) {
+    if (NET.role !== 'joiner' && infestationActive) {
         infestationTimer += dt;
         // Random intervals between 1-10 seconds
         let nextInfestationTime = 1 + Math.random() * 9;
@@ -1625,7 +1629,7 @@ function update(dt) {
     }
 
     // World Modifier: Spontaneous explosions
-    if (spontaneousActive) {
+    if (NET.role !== 'joiner' && spontaneousActive) {
         spontaneousTimer += dt;
         // Random intervals between 1-10 seconds
         let nextSpontaneousTime = 1 + Math.random() * 9;
@@ -1677,7 +1681,7 @@ function update(dt) {
         }
     }
     infestedChunks = infestedChunks.filter(ic => ic.active);
-    if (DYNAMIC_MODE) {
+    if (NET.role !== 'joiner' && DYNAMIC_MODE) {
         dynamicTimer += dt;
         if (dynamicTimer >= DYNAMIC_RATE) {
             dynamicTimer = 0;
@@ -1695,7 +1699,7 @@ function update(dt) {
     if (keys['a']) input.x -= 1;
     if (keys['d']) input.x += 1;
     // use top-level getDashSettings(p)
-    if (player.dash) {
+    if (simulateLocally && player.dash) {
         if (keys['shift'] && !player.dashActive && player.dashCooldown <= 0) {
             let dashVec = { x: 0, y: 0 };
             if (input.x || input.y) {
@@ -1793,7 +1797,7 @@ function update(dt) {
             player.dashCooldown = Math.max(0, player.dashCooldown - dt);
         }
     }
-    if (!enemyDisabled && enemy.dash && !(NET.role === 'host' && NET.connected)) {
+    if (simulateLocally && !enemyDisabled && enemy.dash) {
         if (!enemy.dashActive && Math.random() < 0.003 && enemy.dashCooldown <= 0) {
             let dx = enemy.x - player.x, dy = enemy.y - player.y;
             let norm = Math.hypot(dx, dy);
@@ -1877,7 +1881,7 @@ function update(dt) {
     if (NET.role === 'joiner') {
         // Joiner still moves their local player; enemy AI disabled below
     }
-    if (!player.dashActive) {
+    if (simulateLocally && !player.dashActive) {
         if (input.x || input.y) {
             let norm = Math.hypot(input.x, input.y);
             input.x /= norm; input.y /= norm;
@@ -1955,8 +1959,8 @@ function update(dt) {
         // Joiner: suppress local enemy AI entirely; enemy state comes from snapshots
         // No movement/AI here
     }
-    player.timeSinceShot += dt;
-    if (player.shootQueued && player.timeSinceShot >= player.shootInterval) {
+    if (simulateLocally) player.timeSinceShot += dt;
+    if (simulateLocally && player.shootQueued && player.timeSinceShot >= player.shootInterval) {
         player.shootToward(mouse, bullets);
         // Host assigns bullet ids for player's bullets
         if (NET.role === 'host') {
@@ -1967,7 +1971,7 @@ function update(dt) {
         player.timeSinceShot = 0;
         player.shootQueued = false;
     }
-    if (!enemyDisabled && !(NET.role === 'host' && NET.connected)) {
+    if (simulateLocally && !enemyDisabled) {
     enemy.timeSinceShot += dt;
     let distToPlayer = dist(enemy.x, enemy.y, player.x, player.y);
     let canSeePlayer = hasLineOfSight(enemy.x, enemy.y, player.x, player.y, obstacles);
@@ -1984,12 +1988,14 @@ function update(dt) {
     }
     for (let b of bullets) if(b.active) b.update(dt);
     for (let o of obstacles) o.update(dt);
-    for (let e of explosions) if(!e.done) e.update(dt, obstacles, [player].concat(enemyDisabled ? [] : [enemy]));
-    explosions = explosions.filter(e => !e.done);
+    if (simulateLocally) {
+        for (let e of explosions) if(!e.done) e.update(dt, obstacles, [player].concat(enemyDisabled ? [] : [enemy]));
+        explosions = explosions.filter(e => !e.done);
+    }
 
 
-    // Bullet collision and effects
-    for (let b of bullets) {
+    // Bullet collision and effects (host only)
+    if (simulateLocally) for (let b of bullets) {
         if (!b.active) continue;
         let victim = null;
         if (b.owner === player) {
@@ -2867,6 +2873,10 @@ function setupOverlayInit() {
                             // build obstacles
                             deserializeObstacles(data.obstacles||[]);
                         } catch (e) {}
+                        // Close any lingering card UI
+                        const div = document.getElementById('card-choices');
+                        if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); }
+                        cardState.active = false; waitingForCard = false;
                     }
                 } else if (data && data.type === 'round-reset') {
                     // Host reset after death: sync map, positions, and scores
@@ -2884,6 +2894,10 @@ function setupOverlayInit() {
                             // host already applied locally in update()
                         }
                         updateCardsUI();
+                        // Close any lingering card UI
+                        const div = document.getElementById('card-choices');
+                        if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); }
+                        cardState.active = false; waitingForCard = false;
                     } catch (e) {}
                 } else if (data && data.type === 'card-offer') {
                     waitingForCard = true;
