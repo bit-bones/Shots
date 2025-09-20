@@ -1217,6 +1217,11 @@ const NET = {
     lastSnapshotSentAt: 0,
     INPUT_HZ: 30,
     SNAPSHOT_HZ: 15,
+    // Timeouts (ms) to detect dropped connections
+    TIMEOUT_INPUT_MS: 4000,   // host expects joiner inputs at least every 4s
+    TIMEOUT_SNAPSHOT_MS: 5000, // joiner expects host snapshots at least every 5s
+    lastInputAt: 0,     // host: last time an input was received from joiner
+    lastSnapshotAt: 0,  // joiner: last time a snapshot was received from host
     remoteInput: { up:false,down:false,left:false,right:false,shoot:false,dash:false,aimX:0,aimY:0,seq:0 },
     shootLatch: false, // joiner-side edge trigger to avoid hold-to-shoot
     // Host latches for joiner one-shot actions so they fire when off cooldown
@@ -1238,6 +1243,7 @@ const NET = {
     },
     // HOST: send snapshot to joiner
     sendSnapshot() {
+        if (!this.connected) return;
         if (!window.ws || window.ws.readyState !== WebSocket.OPEN || this.role !== 'host') return;
         const snap = this.buildSnapshot();
         const payload = { type: 'snapshot', snap };
@@ -1252,6 +1258,18 @@ const NET = {
         if (this.role === 'host' && now - this.lastSnapshotSentAt >= (1000/this.SNAPSHOT_HZ)) {
             this.sendSnapshot();
             this.lastSnapshotSentAt = now;
+        }
+        // Timeout detection
+        if (this.connected) {
+            if (this.role === 'host') {
+                if (this.lastInputAt && (now - this.lastInputAt) > this.TIMEOUT_INPUT_MS) {
+                    this.handleDisconnect('No input from joiner');
+                }
+            } else if (this.role === 'joiner') {
+                if (this.lastSnapshotAt && (now - this.lastSnapshotAt) > this.TIMEOUT_SNAPSHOT_MS) {
+                    this.handleDisconnect('No snapshots from host');
+                }
+            }
         }
     },
     // Build minimal snapshot from current authoritative state (host only)
@@ -1270,6 +1288,7 @@ const NET = {
     applySnapshot(snap) {
         if (!snap) return;
         try {
+            this.lastSnapshotAt = this.now();
             const p0 = snap.players[0]; // host
             const p1 = snap.players[1]; // joiner
             if (NET.role === 'joiner') {
@@ -1328,6 +1347,21 @@ const NET = {
         // Update latch state
         if (!!player.shootQueued) this.shootLatch = true; else this.shootLatch = false;
         return out;
+    },
+    handleDisconnect(reason) {
+        // Close ws gracefully
+        try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.close(); } catch (e) {}
+        this.setConnected(false);
+        // Reset latches
+        this.remoteShootQueued = false; this.remoteDashQueued = false;
+        // Revert colors to single-player default
+        if (player) player.color = '#65c6ff';
+        if (enemy) enemy.color = '#ff5a5a';
+        // Stop current game loop and show setup so both players are forced back to lobby
+        try { stopGame(); } catch (e) {}
+        try { showSetupOverlay(); } catch (e) {}
+        // Inform the user unobtrusively
+        try { console.warn('Multiplayer disconnected:', reason); } catch (e) {}
     }
 };
 
@@ -2883,6 +2917,7 @@ function setupOverlayInit() {
                 const data = msg.data;
                 if (data && data.type === 'input' && NET.role === 'host') {
                     NET.remoteInput = { ...(data.input||{}), seq: data.seq };
+                    NET.lastInputAt = NET.now();
                     // Queue one-shot actions so they trigger as soon as possible
                     if (data.input && data.input.shoot) NET.remoteShootQueued = true;
                     if (data.input && data.input.dash) NET.remoteDashQueued = true;
@@ -3028,17 +3063,10 @@ function setupOverlayInit() {
             };
             patchWsOnMessage();
             window.ws.onclose = function() {
-                // only show error if we were trying to connect/join
-                if (mpJoinSection && mpJoinSection.style.display !== 'none') {
-                    alert('Disconnected from server. Please verify the host is running and reachable.');
-                }
-                NET.setConnected(false);
+                NET.handleDisconnect('Socket closed');
             };
             window.ws.onerror = function() {
-                if (mpJoinSection && mpJoinSection.style.display !== 'none') {
-                    alert('WebSocket error. Is the server URL correct? ' + window.MULTIPLAYER_WS_URL);
-                }
-                NET.setConnected(false);
+                NET.handleDisconnect('Socket error');
             };
         }
         setTimeout(patchWsOnMessage, 200);
@@ -3302,6 +3330,11 @@ function startGame() {
         }
     }
     positionPlayersSafely();
+    // Ensure colors are right for current mode
+    if (!NET.connected) {
+        if (player) player.color = '#65c6ff';
+        if (enemy) enemy.color = '#ff5a5a';
+    }
     // Ensure enemy existence and disabled flag according to selection
     if (!enemy) enemy = new Player(false, "#ff5a5a", CANVAS_W*0.66, CANVAS_H/2);
     enemyDisabled = (enemyCount <= 0);
