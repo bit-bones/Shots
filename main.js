@@ -1227,6 +1227,11 @@ const NET = {
     // Host latches for joiner one-shot actions so they fire when off cooldown
     remoteShootQueued: false,
     remoteDashQueued: false,
+    // Sequence-tracked remote requests to avoid duplicate processing
+    remoteDashReqSeq: 0,
+    lastProcessedRemoteDashSeq: 0,
+    // Joiner-side dash edge latch (so dash is sent as a single press)
+    dashLatch: false,
     bulletCounter: 1,
     // Joiner-side smoothing targets
     joinerTargets: { p0: null, p1: null },
@@ -1354,18 +1359,22 @@ const NET = {
         // Use keyboard state or legacy player.shootQueued as a fallback so the latch is robust
         const spacePressed = !!keys[' '] || !!keys['space'] || !!player.shootQueued;
         const shootNow = spacePressed && !this.shootLatch;
+        // Dash edge trigger: true exactly once when shift (or mapped right-click) is pressed
+        const dashPressed = !!keys['shift'];
+        const dashNow = dashPressed && !this.dashLatch;
         const out = {
             up: !!keys['w'],
             down: !!keys['s'],
             left: !!keys['a'],
             right: !!keys['d'],
             shoot: shootNow,
-            dash: !!(player.dash && keys['shift']),
+            dash: !!(player.dash && dashNow),
             aimX: mouse.x,
             aimY: mouse.y
         };
         // Update latch state
         this.shootLatch = !!spacePressed;
+        this.dashLatch = !!dashPressed;
         return out;
     },
     handleDisconnect(reason) {
@@ -2091,8 +2100,8 @@ function update(dt) {
             // Cooldown ticks when not dashing
             enemy.dashCooldown = Math.max(0, enemy.dashCooldown - dt);
         }
-        // Remote dash intent (queued so it isn't lost while on cooldown)
-        if (NET.remoteDashQueued && enemy.dash && !enemy.dashActive && enemy.dashCooldown <= 0) {
+        // Remote dash intent processed once per input sequence to avoid double-firing when cooldown finishes
+        if (NET.remoteDashReqSeq && NET.remoteDashReqSeq > NET.lastProcessedRemoteDashSeq && enemy.dash && !enemy.dashActive && enemy.dashCooldown <= 0) {
             // trigger dash in the same way as AI, using direction toward aim
             let dx = (ri.aimX||player.x) - enemy.x;
             let dy = (ri.aimY||player.y) - enemy.y;
@@ -2103,7 +2112,8 @@ function update(dt) {
             enemy.deflectRemaining = (enemy.deflectStacks || 0);
             if ((enemy.bigShotStacks||0) > 0) enemy.bigShotPending = true;
             try { playDashWoosh(enemy.dashTime, dashSet.speedMult); } catch (e) {}
-            NET.remoteDashQueued = false;
+            NET.lastProcessedRemoteDashSeq = NET.remoteDashReqSeq;
+            NET.remoteDashReqSeq = 0;
         }
         // Always tick enemy shoot timer on host
         enemy.timeSinceShot += dt;
@@ -3045,7 +3055,10 @@ function setupOverlayInit() {
                     NET.lastInputAt = NET.now();
                     // Queue one-shot actions so they trigger as soon as possible
                     if (data.input && data.input.shoot) NET.remoteShootQueued = true;
-                    if (data.input && data.input.dash) NET.remoteDashQueued = true;
+                    if (data.input && data.input.dash) {
+                        // track the sequence so repeated inputs don't cause multiple queued dashes
+                        NET.remoteDashReqSeq = data.seq || (NET.remoteDashReqSeq + 1);
+                    }
                 } else if (data && data.type === 'snapshot' && NET.role === 'joiner') {
                     NET.applySnapshot(data.snap);
                 } else if (data && data.type === 'setup' && NET.role === 'joiner') {
@@ -3526,6 +3539,34 @@ function stopGame() {
 canvas = document.getElementById('game');
 ctx = canvas.getContext('2d');
 setupOverlayInit();
+// Prevent default context menu on the game canvas and map right-click to dash
+if (canvas) {
+    // Right mouse down -> treat as Shift pressed (dash)
+    canvas.addEventListener('mousedown', (e) => {
+        if (e.button === 2) {
+            // prevent the browser context menu
+            e.preventDefault();
+            // set shift-like state so collectLocalInput sees dash
+            keys['shift'] = true;
+            // also mark player dash intent for legacy code paths
+            if (player && player.dash) {
+                // emulate pressing shift: if possible, queue dash (will be handled in update)
+                // we don't call dash directly here to preserve host-authoritative behavior
+            }
+        }
+    });
+    // Right mouse up -> clear shift state
+    canvas.addEventListener('mouseup', (e) => {
+        if (e.button === 2) {
+            e.preventDefault();
+            keys['shift'] = false;
+        }
+    });
+    // Prevent context menu from opening on right-click
+    canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); });
+    // Also clear shift when leaving the window to avoid sticky state
+    window.addEventListener('blur', () => { keys['shift'] = false; });
+}
 document.getElementById('card-choices').style.display = 'none';
 updateCardsUI();
 
