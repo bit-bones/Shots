@@ -1216,7 +1216,7 @@ const NET = {
     lastInputSentAt: 0,
     lastSnapshotSentAt: 0,
     INPUT_HZ: 30,
-    SNAPSHOT_HZ: 15,
+    SNAPSHOT_HZ: 30,
     // Timeouts (ms) to detect dropped connections
     TIMEOUT_INPUT_MS: 4000,   // host expects joiner inputs at least every 4s
     TIMEOUT_SNAPSHOT_MS: 5000, // joiner expects host snapshots at least every 5s
@@ -1228,6 +1228,8 @@ const NET = {
     remoteShootQueued: false,
     remoteDashQueued: false,
     bulletCounter: 1,
+    // Joiner-side smoothing targets
+    joinerTargets: { p0: null, p1: null },
     setRole(role) { this.role = role; },
     setConnected(c) { this.connected = !!c; },
     now() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); },
@@ -1249,15 +1251,16 @@ const NET = {
     },
     onFrame(dt) {
         const now = this.now();
-        if (this.role === 'joiner' && now - this.lastInputSentAt >= (1000/this.INPUT_HZ)) {
+        // Rate-limit input and snapshot traffic
+        if (this.role === 'joiner' && now - this.lastInputSentAt >= (1000 / this.INPUT_HZ)) {
             this.sendInputs();
             this.lastInputSentAt = now;
         }
-        if (this.role === 'host' && now - this.lastSnapshotSentAt >= (1000/this.SNAPSHOT_HZ)) {
+        if (this.role === 'host' && now - this.lastSnapshotSentAt >= (1000 / this.SNAPSHOT_HZ)) {
             this.sendSnapshot();
             this.lastSnapshotSentAt = now;
         }
-        // Timeout detection
+        // Timeout checks
         if (this.connected) {
             if (this.role === 'host') {
                 if (this.lastInputAt && (now - this.lastInputAt) > this.TIMEOUT_INPUT_MS) {
@@ -1270,13 +1273,12 @@ const NET = {
             }
         }
     },
-    // Build minimal snapshot from current authoritative state (host only)
+    // Build a host snapshot (includes timers for cooldown ring rendering)
     buildSnapshot() {
         const snap = {
-            t: this.now(),
             players: [
-                { x: player.x, y: player.y, hp: player.health },
-                { x: enemy.x, y: enemy.y, hp: enemy.health }
+                { x: player.x, y: player.y, hp: player.health, ts: player.timeSinceShot, si: player.shootInterval, dc: player.dashCooldown },
+                { x: enemy.x, y: enemy.y, hp: enemy.health, ts: enemy.timeSinceShot, si: enemy.shootInterval, dc: enemy.dashCooldown }
             ],
             bullets: bullets.map(b => ({ id: b.id, x: b.x, y: b.y, angle: b.angle, speed: b.speed, r: b.radius, dmg: b.damage, bnc: b.bouncesLeft, obl: !!b.obliterator, ex: !!b.explosive }))
         };
@@ -1287,12 +1289,27 @@ const NET = {
         if (!snap) return;
         try {
             this.lastSnapshotAt = this.now();
-            const p0 = snap.players[0]; // host
-            const p1 = snap.players[1]; // joiner
+            const p0 = snap.players && snap.players[0]; // host
+            const p1 = snap.players && snap.players[1]; // joiner
             if (NET.role === 'joiner') {
-                // On joiner: P1 (host) -> enemy (blue), P2 (joiner) -> player (red)
-                if (p0) { enemy.x = p0.x; enemy.y = p0.y; enemy.health = p0.hp; }
-                if (p1) { player.x = p1.x; player.y = p1.y; player.health = p1.hp; }
+                // Stash targets for smoothing and update timers so rings display
+                if (p0) {
+                    NET.joinerTargets.p0 = { x: p0.x, y: p0.y };
+                    enemy.health = p0.hp;
+                    if (typeof p0.ts === 'number') enemy.timeSinceShot = p0.ts;
+                    if (typeof p0.si === 'number') enemy.shootInterval = p0.si;
+                    if (typeof p0.dc === 'number') enemy.dashCooldown = p0.dc;
+                }
+                if (p1) {
+                    NET.joinerTargets.p1 = { x: p1.x, y: p1.y };
+                    player.health = p1.hp;
+                    if (typeof p1.ts === 'number') player.timeSinceShot = p1.ts;
+                    if (typeof p1.si === 'number') player.shootInterval = p1.si;
+                    if (typeof p1.dc === 'number') player.dashCooldown = p1.dc;
+                }
+                // On first snapshot or if positions uninitialized, snap directly to avoid lerp jump
+                if (typeof enemy.x !== 'number' || typeof enemy.y !== 'number') { if (p0) { enemy.x = p0.x; enemy.y = p0.y; } }
+                if (typeof player.x !== 'number' || typeof player.y !== 'number') { if (p1) { player.x = p1.x; player.y = p1.y; } }
             } else {
                 // Fallback mapping (not used on host normally)
                 if (p0) { player.x = p0.x; player.y = p0.y; player.health = p0.hp; }
@@ -1300,7 +1317,7 @@ const NET = {
             }
             // bullets: upsert by id, remove missing
             const incoming = new Map();
-            for (const sb of snap.bullets || []) incoming.set(sb.id, sb);
+            for (const sb of (snap.bullets || [])) incoming.set(sb.id, sb);
             for (let i = bullets.length - 1; i >= 0; i--) {
                 const id = bullets[i].id;
                 if (!incoming.has(id)) bullets.splice(i, 1);
@@ -1601,6 +1618,30 @@ function update(dt) {
     // --- Multiplayer Sync (host-authoritative) ---
     NET.onFrame(dt);
     const simulateLocally = !NET.connected || NET.role === 'host';
+    // Joiner: smooth positions toward latest snapshot targets and tick timers locally
+    if (NET.connected && NET.role === 'joiner') {
+        const s = 16; // smoothing rate (higher = snappier)
+        const t = Math.max(0, Math.min(1, s * dt));
+        const tgt0 = NET.joinerTargets && NET.joinerTargets.p0;
+        const tgt1 = NET.joinerTargets && NET.joinerTargets.p1;
+        if (tgt0 && enemy && typeof enemy.x === 'number' && typeof enemy.y === 'number') {
+            enemy.x = lerp(enemy.x, tgt0.x, t);
+            enemy.y = lerp(enemy.y, tgt0.y, t);
+        }
+        if (tgt1 && player && typeof player.x === 'number' && typeof player.y === 'number') {
+            player.x = lerp(player.x, tgt1.x, t);
+            player.y = lerp(player.y, tgt1.y, t);
+        }
+        // Smoothly animate cooldown rings between snapshots
+        if (player) {
+            if (typeof player.timeSinceShot === 'number') player.timeSinceShot += dt;
+            if (typeof player.dashCooldown === 'number') player.dashCooldown = Math.max(0, player.dashCooldown - dt);
+        }
+        if (enemy) {
+            if (typeof enemy.timeSinceShot === 'number') enemy.timeSinceShot += dt;
+            if (typeof enemy.dashCooldown === 'number') enemy.dashCooldown = Math.max(0, enemy.dashCooldown - dt);
+        }
+    }
     // --- Burning Damage Over Time ---
     if (player) player.updateBurning(dt);
     if (!enemyDisabled && enemy) enemy.updateBurning(dt);
