@@ -1275,8 +1275,8 @@ const NET = {
         const snap = {
             t: this.now(),
             players: [
-                { x: player.x, y: player.y, hp: player.health },
-                { x: enemy.x, y: enemy.y, hp: enemy.health }
+                { x: player.x, y: player.y, hp: player.health, dashActive: !!player.dashActive, dashTime: player.dashTime || 0, dashCooldown: player.dashCooldown || 0, dashDir: player.dashDir || {x:0,y:0} },
+                { x: enemy.x, y: enemy.y, hp: enemy.health, dashActive: !!enemy.dashActive, dashTime: enemy.dashTime || 0, dashCooldown: enemy.dashCooldown || 0, dashDir: enemy.dashDir || {x:0,y:0} }
             ],
             bullets: bullets.map(b => ({ id: b.id, x: b.x, y: b.y, angle: b.angle, speed: b.speed, r: b.radius, dmg: b.damage, bnc: b.bouncesLeft, obl: !!b.obliterator, ex: !!b.explosive }))
         };
@@ -1292,7 +1292,14 @@ const NET = {
             if (NET.role === 'joiner') {
                 // On joiner: P1 (host) -> enemy (blue), P2 (joiner) -> player (red)
                 if (p0) { enemy.x = p0.x; enemy.y = p0.y; enemy.health = p0.hp; }
-                if (p1) { player.x = p1.x; player.y = p1.y; player.health = p1.hp; }
+                if (p1) {
+                    player.x = p1.x; player.y = p1.y; player.health = p1.hp;
+                    // Mirror dash state so client visuals and movement gating match host
+                    player.dashActive = !!p1.dashActive;
+                    player.dashTime = p1.dashTime || 0;
+                    player.dashCooldown = p1.dashCooldown || 0;
+                    player.dashDir = p1.dashDir || { x:0, y:0 };
+                }
             } else {
                 // Fallback mapping (not used on host normally)
                 if (p0) { player.x = p0.x; player.y = p0.y; player.health = p0.hp; }
@@ -2443,6 +2450,38 @@ function draw() {
     ctx.restore();
 
     drawCardsUI();
+    // Optional lightweight multiplayer debug overlay (enable by setting window.MP_DEBUG = true)
+    try {
+        if (window.MP_DEBUG) {
+            ctx.save();
+            const pad = 8;
+            const lines = [];
+            const now = (NET && NET.now) ? NET.now() : Date.now();
+            const lastIn = NET && NET.lastInputAt ? ((now - NET.lastInputAt)/1000).toFixed(2) + 's ago' : 'never';
+            const lastSnap = NET && NET.lastSnapshotAt ? ((now - NET.lastSnapshotAt)/1000).toFixed(2) + 's ago' : 'never';
+            lines.push('NET.role=' + (NET.role||'none') + ' connected=' + (!!NET.connected));
+            lines.push('lastInputAt: ' + lastIn + '  lastSnapshotAt: ' + lastSnap);
+            try { lines.push('remoteShootQueued=' + !!NET.remoteShootQueued + ' remoteDashQueued=' + !!NET.remoteDashQueued); } catch(e) { lines.push('remote latches: ?'); }
+            try { lines.push('remoteInput: ' + JSON.stringify({up:NET.remoteInput.up,down:NET.remoteInput.down,left:NET.remoteInput.left,right:NET.remoteInput.right,shoot:NET.remoteInput.shoot,dash:NET.remoteInput.dash,aimX:Math.round((NET.remoteInput.aimX||0)),aimY:Math.round((NET.remoteInput.aimY||0)),seq:NET.remoteInput.seq||0})); } catch(e) { lines.push('remoteInput: ?'); }
+            const spacePressed = !!keys[' '] || !!keys['space'] || !!(player && player.shootQueued);
+            lines.push('local shootLatch=' + !!NET.shootLatch + ' spacePressed=' + !!spacePressed);
+            // background
+            ctx.globalAlpha = 0.78;
+            ctx.fillStyle = '#000000';
+            const bw = 420;
+            const bh = Math.max(28, lines.length * 16 + pad * 2);
+            ctx.fillRect(10, 10, bw, bh);
+            ctx.globalAlpha = 1.0;
+            ctx.fillStyle = '#eafcff';
+            ctx.font = '12px monospace';
+            let y = 10 + pad + 12;
+            for (const L of lines) {
+                ctx.fillText(L, 14, y);
+                y += 16;
+            }
+            ctx.restore();
+        }
+    } catch (e) { /* defensive: never let debug overlay crash render */ }
 }
 
 function drawPlayer(p) {
