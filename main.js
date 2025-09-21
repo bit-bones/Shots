@@ -1275,8 +1275,8 @@ const NET = {
         const snap = {
             t: this.now(),
             players: [
-                { x: player.x, y: player.y, hp: player.health, dashActive: !!player.dashActive, dashTime: player.dashTime || 0, dashCooldown: player.dashCooldown || 0, dashDir: player.dashDir || {x:0,y:0} },
-                { x: enemy.x, y: enemy.y, hp: enemy.health, dashActive: !!enemy.dashActive, dashTime: enemy.dashTime || 0, dashCooldown: enemy.dashCooldown || 0, dashDir: enemy.dashDir || {x:0,y:0} }
+                { x: player.x, y: player.y, hp: player.health },
+                { x: enemy.x, y: enemy.y, hp: enemy.health }
             ],
             bullets: bullets.map(b => ({ id: b.id, x: b.x, y: b.y, angle: b.angle, speed: b.speed, r: b.radius, dmg: b.damage, bnc: b.bouncesLeft, obl: !!b.obliterator, ex: !!b.explosive }))
         };
@@ -1292,14 +1292,7 @@ const NET = {
             if (NET.role === 'joiner') {
                 // On joiner: P1 (host) -> enemy (blue), P2 (joiner) -> player (red)
                 if (p0) { enemy.x = p0.x; enemy.y = p0.y; enemy.health = p0.hp; }
-                if (p1) {
-                    player.x = p1.x; player.y = p1.y; player.health = p1.hp;
-                    // Mirror dash state so client visuals and movement gating match host
-                    player.dashActive = !!p1.dashActive;
-                    player.dashTime = p1.dashTime || 0;
-                    player.dashCooldown = p1.dashCooldown || 0;
-                    player.dashDir = p1.dashDir || { x:0, y:0 };
-                }
+                if (p1) { player.x = p1.x; player.y = p1.y; player.health = p1.hp; }
             } else {
                 // Fallback mapping (not used on host normally)
                 if (p0) { player.x = p0.x; player.y = p0.y; player.health = p0.hp; }
@@ -1990,6 +1983,70 @@ function update(dt) {
                 }
             }
         }
+        // If enemy is currently dashing, move and resolve collisions (host authoritative)
+        if (enemy.dashActive) {
+            let dashSet = getDashSettings(enemy);
+            let dashVx = enemy.dashDir.x * enemy.speed * dashSet.speedMult;
+            let dashVy = enemy.dashDir.y * enemy.speed * dashSet.speedMult;
+            let oldx = enemy.x, oldy = enemy.y;
+            enemy.x += dashVx * dt;
+            enemy.y += dashVy * dt;
+            enemy.x = clamp(enemy.x, enemy.radius, CANVAS_W-enemy.radius);
+            enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H-enemy.radius);
+            let collided = false;
+            // Collision with player (ram)
+            if (enemy.ram && dist(enemy.x, enemy.y, player.x, player.y) < enemy.radius + player.radius) {
+                let dmg = 18 + (enemy.ramStacks || 0) * 6;
+                player.takeDamage(dmg);
+                enemy.x = oldx; enemy.y = oldy;
+                collided = true;
+            }
+            // Collision with infested chunks (ram/obliterator effects)
+            if (!collided && enemy.ram && (enemy.obliterator || (enemy.obliteratorStacks || 0) > 0) && infestedChunks && infestedChunks.length) {
+                for (let ic of infestedChunks) {
+                    if (!ic.active) continue;
+                    let centerX = ic.x + ic.w/2, centerY = ic.y + ic.h/2;
+                    let thresh = Math.max(ic.w, ic.h) * 0.5 + enemy.radius;
+                    if (dist(enemy.x, enemy.y, centerX, centerY) < thresh) {
+                        let ramStacks = enemy.ramStacks || 0;
+                        let oblStacks = enemy.obliteratorStacks || 0;
+                        let radiusMul = 1 + 0.22 * ramStacks;
+                        let powerMul = 1 + 0.45 * oblStacks;
+                        let basePower = 1.6 * (1 + 0.4 * ramStacks);
+                        ic.chipAt(enemy.x, enemy.y, enemy.radius * 1.6 * radiusMul, basePower * powerMul, enemy.obliterator, false);
+                        enemy.x = oldx; enemy.y = oldy;
+                        collided = true;
+                        break;
+                    }
+                }
+            }
+            // Collision with obstacles
+            if (!collided) {
+                for (let o of obstacles) {
+                    if (o.circleCollide(enemy.x, enemy.y, enemy.radius)) {
+                        if (enemy.ram && (enemy.obliterator || (enemy.obliteratorStacks || 0) > 0)) {
+                            let cx = enemy.x, cy = enemy.y;
+                            let ramStacks = enemy.ramStacks || 0;
+                            let oblStacks = enemy.obliteratorStacks || 0;
+                            let radiusMul = 1 + 0.22 * ramStacks;
+                            let powerMul = 1 + 0.45 * oblStacks;
+                            let basePower = 1.6 * (1 + 0.4 * ramStacks);
+                            o.chipChunksAt(cx, cy, enemy.radius * 1.6 * radiusMul, basePower * powerMul, enemy.obliterator, false);
+                        }
+                        enemy.x = oldx; enemy.y = oldy;
+                        collided = true;
+                        break;
+                    }
+                }
+            }
+            enemy.dashTime -= dt;
+            if (enemy.dashTime <= 0 || collided) {
+                enemy.dashActive = false;
+            }
+        } else {
+            // Cooldown ticks when not dashing
+            enemy.dashCooldown = Math.max(0, enemy.dashCooldown - dt);
+        }
         // Remote dash intent (queued so it isn't lost while on cooldown)
         if (NET.remoteDashQueued && enemy.dash && !enemy.dashActive && enemy.dashCooldown <= 0) {
             // trigger dash in the same way as AI, using direction toward aim
@@ -2450,38 +2507,6 @@ function draw() {
     ctx.restore();
 
     drawCardsUI();
-    // Optional lightweight multiplayer debug overlay (enable by setting window.MP_DEBUG = true)
-    try {
-        if (window.MP_DEBUG) {
-            ctx.save();
-            const pad = 8;
-            const lines = [];
-            const now = (NET && NET.now) ? NET.now() : Date.now();
-            const lastIn = NET && NET.lastInputAt ? ((now - NET.lastInputAt)/1000).toFixed(2) + 's ago' : 'never';
-            const lastSnap = NET && NET.lastSnapshotAt ? ((now - NET.lastSnapshotAt)/1000).toFixed(2) + 's ago' : 'never';
-            lines.push('NET.role=' + (NET.role||'none') + ' connected=' + (!!NET.connected));
-            lines.push('lastInputAt: ' + lastIn + '  lastSnapshotAt: ' + lastSnap);
-            try { lines.push('remoteShootQueued=' + !!NET.remoteShootQueued + ' remoteDashQueued=' + !!NET.remoteDashQueued); } catch(e) { lines.push('remote latches: ?'); }
-            try { lines.push('remoteInput: ' + JSON.stringify({up:NET.remoteInput.up,down:NET.remoteInput.down,left:NET.remoteInput.left,right:NET.remoteInput.right,shoot:NET.remoteInput.shoot,dash:NET.remoteInput.dash,aimX:Math.round((NET.remoteInput.aimX||0)),aimY:Math.round((NET.remoteInput.aimY||0)),seq:NET.remoteInput.seq||0})); } catch(e) { lines.push('remoteInput: ?'); }
-            const spacePressed = !!keys[' '] || !!keys['space'] || !!(player && player.shootQueued);
-            lines.push('local shootLatch=' + !!NET.shootLatch + ' spacePressed=' + !!spacePressed);
-            // background
-            ctx.globalAlpha = 0.78;
-            ctx.fillStyle = '#000000';
-            const bw = 420;
-            const bh = Math.max(28, lines.length * 16 + pad * 2);
-            ctx.fillRect(10, 10, bw, bh);
-            ctx.globalAlpha = 1.0;
-            ctx.fillStyle = '#eafcff';
-            ctx.font = '12px monospace';
-            let y = 10 + pad + 12;
-            for (const L of lines) {
-                ctx.fillText(L, 14, y);
-                y += 16;
-            }
-            ctx.restore();
-        }
-    } catch (e) { /* defensive: never let debug overlay crash render */ }
 }
 
 function drawPlayer(p) {
