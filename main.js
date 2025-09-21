@@ -1326,7 +1326,9 @@ const NET = {
             for (const sb of incoming.values()) {
                 if (have.has(sb.id)) {
                     const b = have.get(sb.id);
-                    b.x = sb.x; b.y = sb.y; b.angle = sb.angle; b.speed = sb.speed;
+                    // On joiner, don't snap bullet x/y; set targets for smoothing
+                    b.targetX = sb.x; b.targetY = sb.y;
+                    b.angle = sb.angle; b.speed = sb.speed;
                     b.radius = sb.r; b.damage = sb.dmg; b.bouncesLeft = sb.bnc;
                     b.obliterator = !!sb.obl; b.explosive = !!sb.ex;
                     b.active = true;
@@ -1336,6 +1338,7 @@ const NET = {
                     nb.id = sb.id; nb.speed = sb.speed; nb.radius = sb.r; nb.damage = sb.dmg;
                     nb.bouncesLeft = sb.bnc; nb.obliterator = !!sb.obl; nb.explosive = !!sb.ex;
                     nb.active = true;
+                    nb.targetX = sb.x; nb.targetY = sb.y;
                     bullets.push(nb);
                 }
             }
@@ -2152,7 +2155,20 @@ function update(dt) {
             enemy.timeSinceShot = 0;
         }
     }
-    for (let b of bullets) if(b.active) b.update(dt);
+    // Bullets: on host (or solo), integrate locally; on joiner, lerp toward snapshot targets for smooth visuals
+    if (simulateLocally) {
+        for (let b of bullets) if (b.active) b.update(dt);
+    } else {
+        const s = 24; // bullet smoothing rate (snappier than players)
+        const t = Math.max(0, Math.min(1, s * dt));
+        for (let b of bullets) {
+            if (!b.active) continue;
+            const tx = (typeof b.targetX === 'number') ? b.targetX : b.x;
+            const ty = (typeof b.targetY === 'number') ? b.targetY : b.y;
+            b.x = lerp(b.x, tx, t);
+            b.y = lerp(b.y, ty, t);
+        }
+    }
     for (let o of obstacles) o.update(dt);
     if (simulateLocally) {
         for (let e of explosions) if(!e.done) e.update(dt, obstacles, [player].concat(enemyDisabled ? [] : [enemy]));
