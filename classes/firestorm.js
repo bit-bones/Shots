@@ -44,6 +44,7 @@
                     if (p.health > 0 && dist(p.x, p.y, this.x, this.y) < this.radius + p.radius) {
                         if (!p.burning) {
                             p.burning = { time: 0, duration: 3 + Math.random()*1.5 };
+                            try { playBurning(p.burning.duration); } catch (e) { /* ignore audio errors */ }
                             try { if (NET && NET.role === 'host' && NET.connected) GameEvents.emit('burning-start', { entityId: p.id, duration: p.burning.duration }); } catch (e) {}
                         }
                     }
@@ -67,6 +68,7 @@
                                 if (!c.burning && newIgnitions < MAX_NEW_IGNITIONS_PER_FRAME) {
                                     const duration = 2.5 + Math.random()*1.5;
                                         c.burning = { time: 0, duration };
+                                        try { playBurning(duration); } catch (e) { /* ignore audio errors */ }
                                     newIgnitions++;
                                     // Relay burning state to joiner so visuals match
                                         try { if (NET && NET.role === 'host' && NET.connected) {
@@ -104,7 +106,9 @@
                                     let d = dist(c.x + c.w/2, c.y + c.h/2, c2.x + c2.w/2, c2.y + c2.h/2);
                                     if (d < Math.max(c.w, c.h) * 1.2) {
                                         if (newIgnited < MAX_NEW_IGNITED && Math.random() < 0.08 * dt) {
-                                            c2.burning = { time: 0, duration: 2 + Math.random() * 1.5 };
+                                            const duration = 2 + Math.random() * 1.5;
+                                            c2.burning = { time: 0, duration };
+                                            try { playBurning(duration); } catch (e) { /* ignore audio errors */ }
                                             newIgnited++;
                                         }
                                     }
@@ -131,6 +135,7 @@
                                     if (p.health > 0 && dist(p.x, p.y, c.x + c.w/2, c.y + c.h/2) < 32 + p.radius) {
                                         if (!p.burning) {
                                             p.burning = { time: 0, duration: 2.5 + Math.random()*1.5 };
+                                            try { playBurning(p.burning.duration); } catch (e) { /* ignore audio errors */ }
                                         }
                                     }
                                 }

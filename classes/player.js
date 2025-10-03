@@ -3,6 +3,9 @@
 
     // --- Player Class ---
 	class Player {
+		recalcRadius() {
+			this.radius = PLAYER_RADIUS * (this.healthMax / HEALTH_MAX) ** 0.5;
+		}
 		static nextId = 1;
 
 		constructor(isPlayer, color, x, y) {
@@ -82,6 +85,35 @@
 
 		draw(ctx) {
 			ctx.save();
+			// --- Teledash range indicator (draw beneath the player) ---
+			try {
+				// show indicator only while the teledash is winding up
+				// Only draw the teledash range ring for the local player (not remote/synced entities)
+				const isLocalPlayer = (typeof window !== 'undefined' && window.player === this);
+				if (isLocalPlayer && typeof getDashSettings === 'function' && this.teledash && this.teledashWarmupActive) {
+					// compute the teledash max distance using the same helper as movement
+					const dashSet = getDashSettings(this);
+					const dashR = Math.max(8, dashSet.dist || 0);
+					// draw a subtle ring slightly beneath the player
+					ctx.save();
+					ctx.globalAlpha = 0.12; // very faint
+					ctx.lineWidth = Math.max(1, this.radius * 0.12);
+					ctx.strokeStyle = 'rgba(200,220,255,0.9)';
+					// soft inner glow
+					ctx.beginPath();
+					ctx.arc(this.x, this.y, dashR, 0, Math.PI * 2);
+					ctx.stroke();
+					// a faint outer blur ring using globalCompositeOperation
+					ctx.globalCompositeOperation = 'lighter';
+					ctx.globalAlpha = 0.06;
+					ctx.beginPath();
+					ctx.arc(this.x, this.y, dashR + (2 + this.radius * 0.06), 0, Math.PI * 2);
+					ctx.stroke();
+					ctx.restore();
+				}
+			} catch (e) {
+				// defensive: if global helper not available, silently ignore indicator
+			}
 			let shakeX = 0, shakeY = 0;
 			if (this.shakeTime > 0) {
 				let mag = this.shakeMag * (this.shakeTime / 0.18);
@@ -94,13 +126,43 @@
 			let baseColor = this.color;
 			if (this.damageFlash > 0) {
 				let t = Math.min(1, this.damageFlash / 0.25);
+				// Determine tint based on actual color (blueish vs reddish) rather than isPlayer flag.
+				function _isColorBlueish(col) {
+					if (!col || typeof col !== 'string') return true;
+					col = col.trim().toLowerCase();
+					// hex format
+					if (col[0] === '#') {
+						if (col.length === 4) {
+							// expand #rgb to #rrggbb
+							col = '#' + col[1] + col[1] + col[2] + col[2] + col[3] + col[3];
+						}
+						if (col.length === 7) {
+							const r = parseInt(col.substr(1,2), 16) || 0;
+							const g = parseInt(col.substr(3,2), 16) || 0;
+							const b = parseInt(col.substr(5,2), 16) || 0;
+							return b >= r;
+						}
+					}
+					// rgb(...) format
+					const m = col.match(/rgba?\(([^)]+)\)/);
+					if (m) {
+						const parts = m[1].split(',').map(p => parseFloat(p));
+						if (parts.length >= 3) {
+							const r = parts[0] || 0; const g = parts[1] || 0; const b = parts[2] || 0;
+							return b >= r;
+						}
+					}
+					// default to blueish
+					return true;
+				}
+				const isBlueish = _isColorBlueish(this.color);
 				if (this.burning) {
 					// Fire-damage highlight: warm orange/red tint
-					baseColor = this.isPlayer ? "#ffd9b3" : "#ffd0c0";
+					baseColor = isBlueish ? "#ffd9b3" : "#ffd0c0";
 					ctx.shadowColor = "rgba(255,130,40,0.95)";
 					ctx.shadowBlur = 30 * t;
 				} else {
-					baseColor = this.isPlayer ? "#9af9ff" : "#ffc9c9";
+					baseColor = isBlueish ? "#9af9ff" : "#ffc9c9";
 					ctx.shadowColor = "#fff";
 					ctx.shadowBlur = 30 * t;
 				}
@@ -212,7 +274,10 @@
 				ctx.save();
 				ctx.globalAlpha = 0.18 * t;
 				ctx.fillStyle = '#6cff6c';
-				ctx.fillRect(drawX - 32, drawY - 38, 64, 12);
+				// Health bar scaling
+				const healthBarBaseLen = 64;
+				const healthBarLen = healthBarBaseLen * (this.healthMax / HEALTH_MAX) ** 0.5;
+				ctx.fillRect(drawX - healthBarLen/2, drawY - 38, healthBarLen, 12);
 				ctx.restore();
 			}
 			ctx.restore();
@@ -248,6 +313,13 @@
 			this.dashCooldown = 0;
 			this.dashActive = false;
 			this.dashTime = 0;
+			this.teledashWarmupActive = false;
+			this.teledashWarmupTime = 0;
+			this.teledashWarmupElapsed = 0;
+			this.teledashTarget = null;
+			this.teledashOrigin = null;
+			this.teledashPendingTeleport = false;
+			this.teledashLockedAim = null;
 			this.shakeTime = 0;
 			this.shakeMag = 0;
 			this.damageFlash = 0;
@@ -278,14 +350,29 @@
 			this.dashCooldown = 0;
 			this.dashActive = false;
 			this.dashDir = { x: 0, y: 0 };
+			// Scale radius based on max health
+			this.radius = PLAYER_RADIUS * (this.healthMax / HEALTH_MAX) ** 0.5;
 			this.dashTime = 0;
-			this.dashPower = 1;
+			this.dashRangeMult = 1;
+			this.dashSpeedMult = 1;
+			this.dashCooldownMult = 1;
+			this.teledash = false;
+			this.teledashStacks = 0;
+			this.teledashWarmupActive = false;
+			this.teledashWarmupTime = 0;
+			this.teledashWarmupElapsed = 0;
+			this.teledashTarget = null;
+			this.teledashOrigin = null;
+			this.teledashPendingTeleport = false;
+			this.teledashSequence = 0;
+			this.teledashLockedAim = null;
 			this.ricochet = 0;
-			this.bigShotStacks = 0;
+			this.bigShot = false;
 			this.bigShotPending = false;
 			this.obliterator = false;
 			this.obliteratorStacks = 0;
 			this.explosive = false;
+			this.explosiveStacks = 0;
 			this.shakeTime = 0;
 			this.shakeMag = 0;
 			this.damageFlash = 0;
@@ -304,16 +391,35 @@
 			// number of projectiles: base 1 + spread (additional per Spread+ card)
 			let total = 1 + (this.spread || 0);
 			// Big Shot modifiers apply to the next shot after dashing
-			let bigStacks = (this.bigShotStacks || 0);
-			let applyBig = this.bigShotPending && bigStacks > 0;
-			// size multiplier: 1 + stacks (1 stack -> x2), speed multiplier: 0.5 ^ stacks
-			let sizeMult = applyBig ? (1 + bigStacks) : 1;
-			let speedMult = applyBig ? Math.pow(0.5, bigStacks) : 1;
+			let applyBig = this.bigShotPending && this.bigShot;
+			// size/speed multipliers come from powerup config (defaults if not present)
+			let sizeMult = applyBig ? (this.bigShotSizeMult || 2) : 1;
+			let speedMult = applyBig ? (this.bigShotSpeedMult || 0.5) : 1;
 			if (total <= 1) {
 				let b = new Bullet(this, this.x, this.y, angle);
 				if (applyBig) { b.radius *= sizeMult; b.speed *= speedMult; }
 				b.justFired = true; // mark for multiplayer sync
 				bullets.push(b);
+				// Burst+ logic: fire extra shots in succession
+				let burstCount = this.burst || 0;
+				for (let i = 0; i < burstCount; ++i) {
+					let burstDelay = 0.08 * (i+1); // increased delay between bursts
+					setTimeout(() => {
+						let bb = new Bullet(this, this.x, this.y, angle);
+						if (applyBig) { bb.radius *= sizeMult; bb.speed *= speedMult; }
+						bb.justFired = true;
+						try {
+							// push into current global bullets array so delayed shots appear after any reassignment
+							if (globalThis && globalThis.bullets) {
+								globalThis.bullets.push(bb);
+								if (typeof NET !== 'undefined' && NET.role === 'host') {
+									try { NET.tagBullet(bb); } catch (e) {}
+								}
+							} else bullets.push(bb);
+						} catch (e) { bullets.push(bb); }
+						playGunShot();
+					}, burstDelay * 1000);
+				}
 			} else {
 				// spread symmetrically around aim angle
 				let spreadArc = Math.min(Math.PI / 3, 0.16 * total); // narrow for small counts, grows with count
@@ -324,6 +430,25 @@
 					if (applyBig) { b.radius *= sizeMult; b.speed *= speedMult; }
 					b.justFired = true; // mark for multiplayer sync
 					bullets.push(b);
+					// Burst+ logic for spread shots
+					let burstCount = this.burst || 0;
+					for (let j = 0; j < burstCount; ++j) {
+						let burstDelay = 0.18 * (j+1);
+						setTimeout(() => {
+							let bb = new Bullet(this, this.x, this.y, angle + a);
+							if (applyBig) { bb.radius *= sizeMult; bb.speed *= speedMult; }
+							bb.justFired = true;
+							try {
+								if (globalThis && globalThis.bullets) {
+									globalThis.bullets.push(bb);
+									if (typeof NET !== 'undefined' && NET.role === 'host') {
+										try { NET.tagBullet(bb); } catch (e) {}
+									}
+								} else bullets.push(bb);
+							} catch (e) { bullets.push(bb); }
+							playGunShot();
+						}, burstDelay * 1000);
+					}
 				}
 			}
 			// clear pending after firing the modified shot
@@ -418,6 +543,7 @@
 			if (isBurning && !this.burning) {
 				// show a brief burning indicator without applying damage logic
 				this.burning = { time: 0, duration: 2.0 };
+				try { playBurning(2.0); } catch (e) { /* ignore audio errors */ }
 			}
 			try { playHit(); } catch (e) { /* ignore audio errors */ }
 		}
@@ -425,6 +551,7 @@
 		addCard(cardName) {
 			// allow duplicate cards so stacking works
 			this.cards.push(cardName);
+			this.recalcRadius();
 			try { updateCardsUI && updateCardsUI(); } catch (e) {}
 		}
 	}

@@ -64,8 +64,14 @@ class GameEventManager {
             case 'infestation-spawn':
                 if (typeof applyInfestationSpawnEvent === 'function') applyInfestationSpawnEvent(event.data);
                 break;
+            case 'infestation-die':
+                if (typeof applyInfestationDieEvent === 'function') applyInfestationDieEvent(event.data);
+                break;
             case 'firestorm-spawn':
                 if (typeof applyFirestormSpawnEvent === 'function') applyFirestormSpawnEvent(event.data);
+                break;
+            case 'firestorm-pre-spawn':
+                if (typeof applyFirestormPreSpawnEvent === 'function') applyFirestormPreSpawnEvent(event.data);
                 break;
             case 'burning-start':
                 if (typeof applyBurningStartEvent === 'function') applyBurningStartEvent(event.data);

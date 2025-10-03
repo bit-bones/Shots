@@ -16,10 +16,32 @@ class WorldMaster {
     this.aiSelfPickPowerups = true;
 
         // Card deck management
-        this.availableWorldMods = new Set(); // Initially all WORLD_MODIFIERS
-        this.availablePowerups = new Set(); // Initially all POWERUPS
-    this.minWorldMods = 3;
-    this.minPowerups = 5;
+        this.availableWorldMods = null;
+        this.availablePowerups = null;
+        this.minWorldMods = 3;
+        this.minPowerups = 5;
+        let _deckController = null;
+        try {
+            if (typeof window !== 'undefined') {
+                if (typeof window.ensureGlobalDeckController === 'function') {
+                    _deckController = window.ensureGlobalDeckController();
+                } else if (window.globalDeckController) {
+                    _deckController = window.globalDeckController;
+                }
+            }
+        } catch (e) {}
+        if (_deckController) {
+            try { _deckController.ensureInitialized(); } catch (e) {}
+            this.minWorldMods = _deckController.minWorldMods || this.minWorldMods;
+            this.minPowerups = _deckController.minPowerups || this.minPowerups;
+            this.availableWorldMods = _deckController.availableWorldMods;
+            this.availablePowerups = _deckController.availablePowerups;
+            try { if (typeof _deckController.attachWorldMaster === 'function') _deckController.attachWorldMaster(this); } catch (e) {}
+        } else {
+            this.availableWorldMods = new Set(); // Initially all WORLD_MODIFIERS
+            this.availablePowerups = new Set(); // Initially all POWERUPS
+            this.initializeCardDecks();
+        }
 
         // Manual control system
         this.controlledEffect = null; // Currently controlled world modifier name
@@ -28,8 +50,7 @@ class WorldMaster {
         // UI reference
         this.ui = null; // Will hold WorldMasterUI instance
 
-        // Initialize with all cards enabled and set up cooldowns
-        this.initializeCardDecks();
+        // Initialize cooldown timers
         this.initializeCooldowns();
     }
 
@@ -83,6 +104,13 @@ class WorldMaster {
 
     // Card deck management methods
     toggleWorldMod(modName, enabled) {
+        try {
+            if (typeof window !== 'undefined' && window.globalDeckController && typeof window.globalDeckController.toggleWorldMod === 'function') {
+                const result = window.globalDeckController.toggleWorldMod(modName, enabled, { worldMaster: this, skipSync: true });
+                if (result) this.syncCardDecks();
+                return result;
+            }
+        } catch (e) {}
         const hadMod = this.availableWorldMods.has(modName);
         if (enabled) {
             if (!hadMod) {
@@ -106,6 +134,13 @@ class WorldMaster {
     }
 
     togglePowerup(powerupName, enabled) {
+        try {
+            if (typeof window !== 'undefined' && window.globalDeckController && typeof window.globalDeckController.togglePowerup === 'function') {
+                const result = window.globalDeckController.togglePowerup(powerupName, enabled, { worldMaster: this, skipSync: true });
+                if (result) this.syncCardDecks();
+                return result;
+            }
+        } catch (e) {}
         const hadPowerup = this.availablePowerups.has(powerupName);
         if (enabled) {
             if (!hadPowerup) {
@@ -269,28 +304,20 @@ class WorldMaster {
 
     manualFirestorm(x, y) {
         try {
-            // Create a Firestorm instance at x,y with a larger default radius
+            // Use pre-spawn system instead of instant spawning
             const radius = 200;
-            const F = (typeof window !== 'undefined' && window.Firestorm) ? window.Firestorm : (typeof Firestorm !== 'undefined' ? Firestorm : null);
-            if (typeof F === 'function') {
-                // Host (or offline) spawns directly and informs joiner
-                if (!window.NET || !window.NET.connected || window.NET.role === 'host') {
-                    try { firestormInstance = new F(x, y, radius); } catch (e) {}
-                    try { firestormActive = true; firestormTimer = 0; } catch (e) {}
-                    // Emit via GameEvents (standard path)
-                    try { if (window.NET && window.NET.role === 'host') { GameEvents.emit('firestorm-spawn', { x, y, radius }); } } catch (e) {}
-                    // Also send direct relay once (simple redundancy, no acks/resends)
-                    try {
-                        if (window.ws && window.ws.readyState === WebSocket.OPEN) {
-                            window.ws.send(JSON.stringify({ type: 'relay', data: { type: 'firestorm-spawn', x, y, radius, manual: true } }));
-                        }
-                    } catch (e) {}
-                    return true;
-                }
-                // Non-host WM: request host action
-                this.syncAction('Firestorm', x, y);
-                return true;
+            // Host (or offline) triggers pre-spawn directly
+            if (!window.NET || !window.NET.connected || window.NET.role === 'host') {
+                try {
+                    if (typeof window.triggerFirestormPreSpawn === 'function') {
+                        return window.triggerFirestormPreSpawn(x, y, radius);
+                    }
+                } catch (e) {}
+                return false;
             }
+            // Non-host WM: request host action
+            this.syncAction('Firestorm', x, y);
+            return true;
         } catch (e) {}
         return false;
     }

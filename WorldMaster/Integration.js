@@ -5,6 +5,15 @@
 // Always reference through window to prevent "Identifier has already been declared" errors when script tags repeat.
 function _getWM() { try { return (typeof window !== 'undefined') ? window.WorldMaster : undefined; } catch (e) { return undefined; } }
 function _getWMUI() { try { return (typeof window !== 'undefined') ? window.WorldMasterUI : undefined; } catch (e) { return undefined; } }
+function _getGlobalDeckController() {
+    try {
+        if (typeof window === 'undefined') return null;
+        if (typeof window.ensureGlobalDeckController === 'function') {
+            return window.ensureGlobalDeckController();
+        }
+        return window.globalDeckController || null;
+    } catch (e) { return null; }
+}
 let _wmLocal = _getWM();
 let _wmUILocal = _getWMUI();
 // Attempt dynamic require fallback only if globals missing (Node/testing contexts)
@@ -42,6 +51,10 @@ function initializeWorldMaster(mode) {
         } catch (e) {}
         inst = getInstance();
     }
+    try {
+        const controller = _getGlobalDeckController();
+        if (controller && typeof controller.attachWorldMaster === 'function') controller.attachWorldMaster(inst);
+    } catch (e) {}
     // Ensure UI is initialized but keep it hidden until the match actually starts
     try { if (inst && inst.ui && typeof inst.ui.toggle === 'function') inst.ui.toggle(false); } catch (e) {}
 }
@@ -49,20 +62,34 @@ function initializeWorldMaster(mode) {
 // Hook into existing world modifier selection
 function getFilteredWorldModifiers(WORLD_MODIFIERS) {
     const inst = getInstance();
-    if (!inst || !inst.availableWorldMods || !inst.availableWorldMods.size) return WORLD_MODIFIERS;
+    if (inst && inst.availableWorldMods && inst.availableWorldMods.size) {
+        return (WORLD_MODIFIERS || []).filter(mod => {
+            const name = (typeof mod === 'string') ? mod : (mod && mod.name);
+            return name ? inst.availableWorldMods.has(name) : true;
+        });
+    }
+    const controller = _getGlobalDeckController();
+    if (!controller || !controller.availableWorldMods || !controller.availableWorldMods.size) return WORLD_MODIFIERS;
     return (WORLD_MODIFIERS || []).filter(mod => {
         const name = (typeof mod === 'string') ? mod : (mod && mod.name);
-        return name ? inst.availableWorldMods.has(name) : true;
+        return name ? controller.availableWorldMods.has(name) : true;
     });
 }
 
 // Hook into existing powerup selection
 function getFilteredPowerups(POWERUPS) {
     const inst = getInstance();
-    if (!inst || !inst.availablePowerups || !inst.availablePowerups.size) return POWERUPS;
+    if (inst && inst.availablePowerups && inst.availablePowerups.size) {
+        return (POWERUPS || []).filter(p => {
+            const name = (typeof p === 'string') ? p : (p && p.name);
+            return name ? inst.availablePowerups.has(name) : true;
+        });
+    }
+    const controller = _getGlobalDeckController();
+    if (!controller || !controller.availablePowerups || !controller.availablePowerups.size) return POWERUPS;
     return (POWERUPS || []).filter(p => {
         const name = (typeof p === 'string') ? p : (p && p.name);
-        return name ? inst.availablePowerups.has(name) : true;
+        return name ? controller.availablePowerups.has(name) : true;
     });
 }
 
@@ -119,6 +146,10 @@ function enableWorldMasterMode(isLocal) {
                 window.gameWorldMasterInstance.ui = WorldMasterUI ? new WorldMasterUI(window.gameWorldMasterInstance) : null;
             }
             const inst = window.gameWorldMasterInstance;
+            try {
+                const controller = _getGlobalDeckController();
+                if (controller && typeof controller.attachWorldMaster === 'function') controller.attachWorldMaster(inst);
+            } catch (e) {}
             // Keep UI hidden during setup; show only if the game is already running
             try {
                 if (typeof running !== 'undefined' && running && inst && inst.ui && typeof inst.ui.toggle === 'function') {
@@ -136,6 +167,10 @@ function disableWorldMasterMode() {
     try {
         const inst = getInstance();
         if (inst && inst.ui && typeof inst.ui.toggle === 'function') inst.ui.toggle(false);
+        try {
+            const controller = _getGlobalDeckController();
+            if (controller && typeof controller.attachWorldMaster === 'function') controller.attachWorldMaster(null);
+        } catch (e) {}
         if (typeof window !== 'undefined') window.gameWorldMasterInstance = null;
     } catch (e) {}
 }

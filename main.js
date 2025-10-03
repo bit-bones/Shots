@@ -16,6 +16,59 @@ window.gameWorldMaster.syncCardDecksFromNet = function(data) {
             window.gameWorldMasterInstance.availablePowerups.delete(data.name);
         }
     }
+    // --- Obstacle chunk burning spread (host only) ---
+    if (NET && NET.role !== 'joiner' && Array.isArray(obstacles) && obstacles.length) {
+        let spreadChecks = 0;
+        const MAX_SPREAD_CHECKS = 3000;
+        const MAX_NEW_IGNITED = 20;
+        let newIgnited = 0;
+        for (let oi = 0; oi < obstacles.length; oi++) {
+            const o = obstacles[oi];
+            if (!o || !o.chunks) continue;
+            for (let ci = 0; ci < o.chunks.length; ci++) {
+                const c = o.chunks[ci];
+                if (!c || c.destroyed || !c.burning || c.burning.time <= 0.4) continue;
+                // Attempt to ignite nearby chunks across all obstacles
+                for (let oi2 = 0; oi2 < obstacles.length; oi2++) {
+                    const o2 = obstacles[oi2];
+                    if (!o2 || !o2.chunks) continue;
+                    for (let ci2 = 0; ci2 < o2.chunks.length; ci2++) {
+                        if (newIgnited >= MAX_NEW_IGNITED) break;
+                        spreadChecks++;
+                        if (spreadChecks > MAX_SPREAD_CHECKS) break;
+                        if (oi === oi2 && ci === ci2) continue;
+                        const c2 = o2.chunks[ci2];
+                        if (!c2 || c2.destroyed || c2.burning) continue;
+                        const d = dist(c.x + c.w/2, c.y + c.h/2, c2.x + c2.w/2, c2.y + c2.h/2);
+                        const maxDist = Math.max(c.w, c.h) * 1.6;
+                        if (d <= maxDist) {
+                            const sourcePower = (c.burning && c.burning.power) ? c.burning.power : 1;
+                            // probability scales with source power; slight boost for higher-power sources
+                            const prob = Math.min(0.7, 0.12 * sourcePower + 0.05 * Math.random());
+                            if (Math.random() < prob) {
+                                // per-target randomized dissipation multiplier so some chains burn stronger
+                                const dissipation = 0.5 + Math.random() * 0.45; // 0.5 .. 0.95
+                                const newPower = Math.max(0.18, sourcePower * dissipation);
+                                // duration also gets a random multiplier influenced by dissipation
+                                const newDur = Math.max(0.9, (c.burning.duration || 2.0) * (0.6 + Math.random() * 0.7) * (0.5 + dissipation * 0.8));
+                                c2.burning = { time: 0, duration: newDur, power: newPower, nextTick: 0 };
+                                // initialize flameParticles so joiner draw shows them immediately
+                                c2.flameParticles = c2.flameParticles || [];
+                                // Emit event for joiners
+                                try { if (NET && NET.role === 'host' && NET.connected && typeof GameEvents !== 'undefined') {
+                                    GameEvents.emit('burning-start', { obstacleIndex: oi2, chunkIndex: ci2, duration: newDur, power: newPower });
+                                } } catch (e) {}
+                                newIgnited++;
+                            }
+                        }
+                    }
+                    if (spreadChecks > MAX_SPREAD_CHECKS || newIgnited >= MAX_NEW_IGNITED) break;
+                }
+                if (spreadChecks > MAX_SPREAD_CHECKS || newIgnited >= MAX_NEW_IGNITED) break;
+            }
+            if (spreadChecks > MAX_SPREAD_CHECKS || newIgnited >= MAX_NEW_IGNITED) break;
+        }
+    }
     if (window.gameWorldMasterInstance.ui) window.gameWorldMasterInstance.ui.updateCardDecks && window.gameWorldMasterInstance.ui.updateCardDecks();
 };
 window.gameWorldMaster.syncControlStateFromNet = function(data) {
@@ -175,6 +228,12 @@ function setupWorldMasterInstance(isLocal) {
             window.gameWorldMasterInstance = new window.WorldMaster(isLocal);
             window.gameWorldMasterInstance.ui = new window.WorldMasterUI(window.gameWorldMasterInstance);
         }
+        try {
+            const controller = ensureGlobalDeckController();
+            if (controller && typeof controller.attachWorldMaster === 'function') {
+                controller.attachWorldMaster(window.gameWorldMasterInstance);
+            }
+        } catch (e) {}
     } catch (e) {}
     // Initialize autoPick from UI checkbox if present
     try {
@@ -229,6 +288,11 @@ function destroyWorldMasterInstance() {
         } else {
             window.gameWorldMasterInstance = null;
         }
+        try {
+            if (window.globalDeckController && typeof window.globalDeckController.attachWorldMaster === 'function') {
+                window.globalDeckController.attachWorldMaster(null);
+            }
+        } catch (e) {}
     } catch (e) { window.gameWorldMasterInstance = null; }
 }
 
@@ -559,26 +623,26 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Prevent browser menus and stuck movement when clicking outside canvas ---
     // Prevent right-click context menu anywhere
     document.addEventListener('contextmenu', function(e) {
-        // Only allow context menu on input, textarea, or contenteditable
+        // Only allow context menu on form controls and contenteditable elements
         const t = e.target;
-        if (!(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable))) {
+        if (!(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable))) {
             e.preventDefault();
         }
     });
     // Prevent left/right mouse down/up outside canvas from causing stuck movement
     document.addEventListener('mousedown', function(e) {
-        // Allow normal interaction with dev console and input fields
+        // Allow normal interaction with dev console and form controls (inputs, textareas, selects) and contenteditable
         const t = e.target;
         if (
             (window.canvas && window.canvas.contains(t)) ||
-            (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) ||
+            (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) ||
             (t && (t.id === 'dev-console-input' || t.id === 'dev-console-log' || t.id === 'dev-console-fixed' || t.id === 'dev-console-form'))
         ) {
             return;
         }
         e.preventDefault();
-        // Defensive: clear movement/dash/shoot keys if mouse leaves canvas
-        if (window.keys) {
+    // Defensive: clear movement/dash/shoot keys if mouse leaves canvas
+    if (window.keys) {
             window.keys['left'] = false;
             window.keys['right'] = false;
             window.keys['up'] = false;
@@ -588,11 +652,11 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }, true);
     document.addEventListener('mouseup', function(e) {
-        // Allow normal interaction with dev console and input fields
+        // Allow normal interaction with dev console and form controls (inputs, textareas, selects) and contenteditable
         const t = e.target;
         if (
             (window.canvas && window.canvas.contains(t)) ||
-            (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) ||
+            (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) ||
             (t && (t.id === 'dev-console-input' || t.id === 'dev-console-log' || t.id === 'dev-console-fixed' || t.id === 'dev-console-form'))
         ) {
             return;
@@ -641,8 +705,13 @@ function showVictoryModal(winnerName, broadcast = false) {
         const title = document.getElementById('victory-title');
         if (title) title.innerText = 'Match Over';
         if (txt) txt.innerText = `${winnerName} won the match!`;
-    if (modal) modal.style.display = 'flex';
-    matchOver = true;
+        if (modal) modal.style.display = 'flex';
+        matchOver = true;
+        // Pause game selection
+        window._victoryPauseActive = true;
+        // Reset votes for multiplayer
+        window._victoryVotes = { host: null, joiner: null };
+        updateVictoryModalStatus();
         // Hide any active card UI so background selection is suppressed
         try {
             const div = document.getElementById('card-choices');
@@ -660,6 +729,54 @@ function showVictoryModal(winnerName, broadcast = false) {
 function hideVictoryModal() {
     try { const modal = document.getElementById('victory-modal'); if (modal) modal.style.display = 'none'; } catch (e) {}
     matchOver = false;
+    window._victoryPauseActive = false;
+    // Reset votes
+    window._victoryVotes = { host: null, joiner: null };
+    updateVictoryModalStatus();
+}
+
+function updateVictoryModalStatus() {
+    try {
+        const txt = document.getElementById('victory-text');
+        const modal = document.getElementById('victory-modal');
+        if (!txt || !modal) return;
+        const isMultiplayer = (typeof NET !== 'undefined' && NET.connected);
+        if (!isMultiplayer) return;
+
+        const myRole = NET.role;
+        const peerRole = (myRole === 'host') ? 'joiner' : 'host';
+        const myVote = window._victoryVotes[myRole];
+        const peerVote = window._victoryVotes[peerRole];
+
+        // Get display names
+        let myName = (myRole === 'host') ? (NET.myName || 'Host') : (NET.myName || 'Joiner');
+        let peerName = (peerRole === 'host') ? (NET.peerName || 'Host') : (NET.peerName || 'Joiner');
+        if (myRole === 'joiner') peerName = (NET.peerName || 'Host');
+
+        // Remove any previous status
+        let statusEl = modal.querySelector('#victory-status-line');
+        if (statusEl) statusEl.remove();
+
+        // Build status line
+        let statusMsg = '';
+        if (myVote && !peerVote) {
+            statusMsg = `<small style="color:#ffda72;">Waiting for ${peerName}... (You chose: ${myVote})</small>`;
+        } else if (!myVote && peerVote) {
+            statusMsg = `<small style="color:#65c6ff;">${peerName} chose: ${peerVote}</small>`;
+        } else if (myVote && peerVote) {
+            statusMsg = `<small style="color:#56ff7a;">Both voted!</small>`;
+        }
+
+        // Insert status line below buttons
+        const btnRow = modal.querySelector('div[style*="display:flex"][style*="justify-content:center"]');
+        if (btnRow && statusMsg) {
+            const line = document.createElement('div');
+            line.id = 'victory-status-line';
+            line.style.marginTop = '12px';
+            line.innerHTML = statusMsg;
+            btnRow.parentNode.insertBefore(line, btnRow.nextSibling);
+        }
+    } catch (e) {}
 }
 
 // Wire victory modal buttons
@@ -667,14 +784,93 @@ try {
     const vr = document.getElementById('victory-restart');
     const vc = document.getElementById('victory-close');
     if (vr) vr.addEventListener('click', function() {
-        // Host triggers restart that applies to both clients
-        try { player.score = 0; enemy.score = 0; } catch (e) {}
-        try { if (NET.role === 'host' && window.ws && window.ws.readyState === WebSocket.OPEN) { window.ws.send(JSON.stringify({ type:'relay', data:{ type:'match-restart' } })); } } catch (e) {}
-        hideVictoryModal();
-        try { restartGame(); } catch (e) {}
+        const isMultiplayer = (typeof NET !== 'undefined' && NET.connected);
+        if (isMultiplayer) {
+            // Record vote and broadcast
+            const myRole = NET.role;
+            window._victoryVotes[myRole] = 'Restart';
+            updateVictoryModalStatus();
+            // Broadcast vote
+            try {
+                if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+                    window.ws.send(JSON.stringify({ type:'relay', data:{ type:'victory-vote', role: myRole, choice: 'Restart' } }));
+                }
+            } catch (e) {}
+            // Check if both voted
+            checkVictoryVotes();
+        } else {
+            // Singleplayer: immediate restart
+            try { player.score = 0; enemy.score = 0; } catch (e) {}
+            hideVictoryModal();
+            try { restartGame(); } catch (e) {}
+        }
     });
-    if (vc) vc.addEventListener('click', function() { hideVictoryModal(); });
+    if (vc) {
+        // Change label to 'Continue'
+        vc.innerText = 'Continue';
+        vc.addEventListener('click', function() {
+            const isMultiplayer = (typeof NET !== 'undefined' && NET.connected);
+            if (isMultiplayer) {
+                // Record vote and broadcast
+                const myRole = NET.role;
+                window._victoryVotes[myRole] = 'Continue';
+                updateVictoryModalStatus();
+                // Broadcast vote
+                try {
+                    if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+                        window.ws.send(JSON.stringify({ type:'relay', data:{ type:'victory-vote', role: myRole, choice: 'Continue' } }));
+                    }
+                } catch (e) {}
+                // Check if both voted
+                checkVictoryVotes();
+            } else {
+                // Singleplayer: immediate continue
+                hideVictoryModal();
+                window._victoryRoundsLeft = 3;
+                window._victoryRoundsActive = true;
+            }
+        });
+    }
 } catch (e) {}
+
+function checkVictoryVotes() {
+    try {
+        const hostVote = window._victoryVotes.host;
+        const joinerVote = window._victoryVotes.joiner;
+        
+        // Both must vote
+        if (!hostVote || !joinerVote) return;
+        
+        // Determine action based on votes
+        const restartCount = (hostVote === 'Restart' ? 1 : 0) + (joinerVote === 'Restart' ? 1 : 0);
+        const continueCount = (hostVote === 'Continue' ? 1 : 0) + (joinerVote === 'Continue' ? 1 : 0);
+        
+        // If both chose same, do that action
+        // If split, prioritize Continue (allows game to continue)
+        if (restartCount === 2) {
+            // Both want restart
+            if (NET.role === 'host') {
+                try { player.score = 0; enemy.score = 0; } catch (e) {}
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) { window.ws.send(JSON.stringify({ type:'relay', data:{ type:'match-restart' } })); } } catch (e) {}
+            }
+            hideVictoryModal();
+            try { restartGame(); } catch (e) {}
+        } else {
+            // At least one wants continue, so continue
+            hideVictoryModal();
+            window._victoryRoundsLeft = 3;
+            window._victoryRoundsActive = true;
+            // Broadcast continue action for both clients
+            if (NET.role === 'host') {
+                try {
+                    if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+                        window.ws.send(JSON.stringify({ type:'relay', data:{ type:'victory-continue' } }));
+                    }
+                } catch (e) {}
+            }
+        }
+    } catch (e) {}
+}
 
 // --- Sound Effects ---
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -682,12 +878,18 @@ const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 let masterVolume = 1.0;
 let musicVolume = 1.0; // reserved if you add music
 let sfxVolume = 1.0;
-// Per-effect multipliers (0.0 - 1.0)
+// Per-effect multipliers. We map slider range 0-100 such that 50 == 1.0 (current level),
+// higher values make the effect louder than current.
 let shotVolume = 1.0;
 let explosionVolume = 1.0;
 let ricochetVolume = 1.0;
 let hitVolume = 1.0;
 let dashVolume = 1.0;
+let burningVolume = 1.0;
+// Limit concurrent procedural burning sound instances to avoid audio overload
+const MAX_BURNING_SOUNDS = 10;
+const activeBurningSounds = []; // { masterGain, stopTime, baseGain }
+let firestormBurningInstance = null; // persistent burning sound for firestorms
 // Load saved volumes from localStorage if present
 try {
     const vs = JSON.parse(localStorage.getItem('shape_shot_volumes') || '{}');
@@ -699,6 +901,7 @@ try {
     if (vs && typeof vs.ricochet === 'number') ricochetVolume = vs.ricochet;
     if (vs && typeof vs.hit === 'number') hitVolume = vs.hit;
     if (vs && typeof vs.dash === 'number') dashVolume = vs.dash;
+    if (vs && typeof vs.burning === 'number') burningVolume = vs.burning;
 } catch (e) {}
 // Load saved rounds-to-win if present
 try {
@@ -712,24 +915,42 @@ function playGunShot() {
     const g = audioCtx.createGain();
     o.type = 'square';
     o.frequency.value = 380;
-    g.gain.value = 0.05 * masterVolume * sfxVolume * shotVolume;
+    g.gain.value = 0.035 * masterVolume * sfxVolume * shotVolume;
     o.connect(g).connect(audioCtx.destination);
     o.start();
     o.frequency.linearRampToValueAtTime(180, audioCtx.currentTime + 0.09);
     g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.11);
     o.stop(audioCtx.currentTime + 0.12);
+    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'gunshot' }); } catch (e) {}
 }
 function playExplosion() {
     const o = audioCtx.createOscillator();
     const g = audioCtx.createGain();
     o.type = 'triangle';
     o.frequency.value = 80;
-    g.gain.value = 0.40 * masterVolume * sfxVolume * explosionVolume;
+    g.gain.value = 0.45 * masterVolume * sfxVolume * explosionVolume;
     o.connect(g).connect(audioCtx.destination);
     o.start();
     o.frequency.linearRampToValueAtTime(30, audioCtx.currentTime + 0.18);
     g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.22);
     o.stop(audioCtx.currentTime + 0.23);
+    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'explosion' }); } catch (e) {}
+}
+function playSoftPoof() {
+    // Softer, shorter poof sound for lifecycle expiries
+    try {
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = 'triangle';
+        o.frequency.value = 120;
+        g.gain.value = 0.12 * masterVolume * sfxVolume * explosionVolume;
+        o.connect(g).connect(audioCtx.destination);
+        o.start();
+        o.frequency.linearRampToValueAtTime(60, audioCtx.currentTime + 0.12);
+        g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.14);
+        o.stop(audioCtx.currentTime + 0.15);
+    } catch (e) {}
+    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'soft-poof' }); } catch (e) {}
 }
 function playHit() {
     const o = audioCtx.createOscillator();
@@ -742,6 +963,7 @@ function playHit() {
     o.frequency.linearRampToValueAtTime(110, audioCtx.currentTime + 0.08);
     g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.09);
     o.stop(audioCtx.currentTime + 0.1);
+    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'hit' }); } catch (e) {}
 }
 function playRicochet() {
     // subtle short 'dink' sound for ricochet/deflect
@@ -749,13 +971,14 @@ function playRicochet() {
     const g = audioCtx.createGain();
     o.type = 'triangle';
     o.frequency.value = 980; // high-pitched dink
-    g.gain.value = 0.03 * masterVolume * sfxVolume * ricochetVolume;
+    g.gain.value = 0.05 * masterVolume * sfxVolume * ricochetVolume;
     o.connect(g).connect(audioCtx.destination);
     o.start();
     // quick pitch drop and fade
     o.frequency.linearRampToValueAtTime(640, audioCtx.currentTime + 0.04);
     g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.06);
     o.stop(audioCtx.currentTime + 0.07);
+    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'ricochet' }); } catch (e) {}
 }
 function playDashWoosh(duration = 0.28, speedMult = 1.0) {
     try {
@@ -789,6 +1012,233 @@ function playDashWoosh(duration = 0.28, speedMult = 1.0) {
     highGain.gain.exponentialRampToValueAtTime(0.001, now + dur);
         high.stop(now + dur + 0.02);
     } catch (e) { /* ignore audio errors */ }
+    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'dash' }); } catch (e) {}
+}
+// Continuous burning sound builder: uses two overlapped looping buffers and randomized gain
+// automation so the result is a continuous, non-pulsing crackle. Calls remain the same
+// (playBurning(duration)) but internally we'll create a short looped source to simulate
+// ongoing burning for the requested duration.
+function playBurning(duration = 0.5) {
+    try {
+        const now = audioCtx.currentTime;
+        // clamp duration but we'll use a short loop buffer length for continuity
+        const requested = Math.max(0.1, Math.min(duration, 6.0));
+        const loopLen = 0.6; // seconds, short loop that's overlapped to create continuous texture
+
+        // Helper: create a pink-noise buffer of length loopLen
+        function createPinkBuffer(lenSec) {
+            const len = Math.floor(audioCtx.sampleRate * lenSec);
+            const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+            const d = buf.getChannelData(0);
+            let b0 = 0, b1 = 0, b2 = 0;
+            for (let i = 0; i < len; i++) {
+                const white = Math.random() * 2 - 1;
+                b0 = 0.997 * b0 + white * 0.029;
+                b1 = 0.985 * b1 + white * 0.013;
+                b2 = 0.950 * b2 + white * 0.007;
+                const pink = b0 + b1 + b2 + white * 0.02;
+                // soft decay within the small buffer to avoid clicks when stopped
+                d[i] = pink * (0.95 - (i / len) * 0.15);
+            }
+            return buf;
+        }
+
+        const bufA = createPinkBuffer(loopLen);
+        const bufB = createPinkBuffer(loopLen);
+
+        // Global filter and gain for the burning sound
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.value = 600;
+        filter.Q.value = 0.7;
+
+        const masterGain = audioCtx.createGain();
+        masterGain.gain.value = 0.05 * masterVolume * sfxVolume * burningVolume;
+
+        filter.connect(masterGain).connect(audioCtx.destination);
+
+        // If we already have too many burning sources, try to extend an existing one instead of
+        // creating a new full chain. This prevents audio overload when many entities ignite.
+        const nowActive = activeBurningSounds.filter(x => x.stopTime > now);
+        if (nowActive.length >= MAX_BURNING_SOUNDS) {
+            // Choose the one with the earliest stopTime and extend it slightly
+            nowActive.sort((a, b) => a.stopTime - b.stopTime);
+            const victim = nowActive[0];
+            // bump stopTime by requested seconds but not exceeding a reasonable cap
+            const extra = Math.min(requested, 4.0);
+            const newStop = Math.max(victim.stopTime, now) + extra;
+            // schedule a smoother gain bump to simulate more burning without adding nodes
+            try {
+                victim.masterGain.gain.cancelScheduledValues(now);
+                victim.masterGain.gain.setValueAtTime(victim.baseGain * 0.9, now + 0.01);
+                victim.masterGain.gain.linearRampToValueAtTime(victim.baseGain, now + 0.2 + Math.random() * 0.6);
+                victim.masterGain.gain.setValueAtTime(victim.baseGain, newStop - 0.08);
+                victim.masterGain.gain.linearRampToValueAtTime(0.0, newStop);
+            } catch (e) {}
+            victim.stopTime = newStop;
+            return;
+        }
+
+        // Create two sources that will alternate with small randomized offsets
+        const srcA = audioCtx.createBufferSource();
+        srcA.buffer = bufA;
+        srcA.loop = true;
+        const srcB = audioCtx.createBufferSource();
+        srcB.buffer = bufB;
+        srcB.loop = true;
+
+        // Per-source gain nodes so we can modulate amplitude independently
+        const gainA = audioCtx.createGain();
+        const gainB = audioCtx.createGain();
+        gainA.gain.value = 0.9;
+        gainB.gain.value = 0.9;
+
+        srcA.connect(gainA).connect(filter);
+        srcB.connect(gainB).connect(filter);
+
+        // Start times: stagger slightly to prevent synchronous waves
+        const startA = now + 0.01;
+        const jitter = Math.random() * 0.08;
+        const startB = now + loopLen / 2 + jitter + 0.01;
+        srcA.start(startA);
+        srcB.start(startB);
+
+        // Randomized slow gain automation to keep texture lively but not pulsing
+        function scheduleGainAutomation(gNode, sTime) {
+            const segs = Math.max(3, Math.round(loopLen * 2));
+            let t = sTime;
+            for (let i = 0; i < segs; i++) {
+                const dur = (loopLen / segs) * (0.9 + Math.random() * 0.3);
+                const val = 0.7 + Math.random() * 0.35; // gentle modulation around ~0.8
+                gNode.gain.setValueAtTime(val, t);
+                // slight linear ramp to next point
+                gNode.gain.linearRampToValueAtTime(0.65 + Math.random() * 0.4, t + dur);
+                t += dur;
+            }
+            // make sure it matches at the loop boundary smoothly
+            gNode.gain.setValueAtTime(gNode.gain.value, sTime + loopLen + 0.02);
+        }
+
+        scheduleGainAutomation(gainA, startA);
+        scheduleGainAutomation(gainB, startB);
+
+        // Stop both sources after requested duration with a smooth, slightly longer fade to avoid
+        // any perceptible truncation or clicking. Fade scales with requested time but is clamped.
+        const stopTime = now + requested;
+        const fade = Math.min(0.6, Math.max(0.12, requested * 0.25));
+        // cancel any prior schedules and smoothly target near-zero gain starting at (stopTime - fade)
+        try { masterGain.gain.cancelScheduledValues(now); } catch (e) {}
+        masterGain.gain.setValueAtTime(masterGain.gain.value, Math.max(now, stopTime - fade));
+        // use setTargetAtTime for a gentle exponential-like decay (timeConstant ~0.06)
+        masterGain.gain.setTargetAtTime(0.00001, Math.max(now, stopTime - fade) + 0.01, 0.06);
+
+        // Stop sources shortly after fade finishes to ensure complete silence
+        const stopAfter = stopTime + fade + 0.06;
+        try { srcA.stop(stopAfter); } catch (e) {}
+        try { srcB.stop(stopAfter); } catch (e) {}
+
+        // Track this active burning sound so we can cap concurrent instances
+        activeBurningSounds.push({ masterGain: masterGain, stopTime: stopAfter, baseGain: masterGain.gain.value });
+        // Cleanup entry after it stops (slightly after stopAfter)
+        setTimeout(() => {
+            for (let i = activeBurningSounds.length - 1; i >= 0; --i) {
+                if (activeBurningSounds[i].stopTime <= audioCtx.currentTime) activeBurningSounds.splice(i, 1);
+            }
+        }, (requested + fade + 0.8) * 1000);
+    } catch (e) { /* ignore audio errors */ }
+    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'burning' }); } catch (e) {}
+}
+
+// Persistent firestorm burning sound: starts when firestorm begins and stops when it ends
+function startFirestormBurning() {
+    if (firestormBurningInstance) return; // already running
+    try {
+        const now = audioCtx.currentTime;
+        const loopLen = 0.6;
+
+        function createPinkBuffer(lenSec) {
+            const len = Math.floor(audioCtx.sampleRate * lenSec);
+            const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+            const d = buf.getChannelData(0);
+            let b0 = 0, b1 = 0, b2 = 0;
+            for (let i = 0; i < len; i++) {
+                const white = Math.random() * 2 - 1;
+                b0 = 0.997 * b0 + white * 0.029;
+                b1 = 0.985 * b1 + white * 0.013;
+                b2 = 0.950 * b2 + white * 0.007;
+                const pink = b0 + b1 + b2 + white * 0.02;
+                d[i] = pink * (0.95 - (i / len) * 0.15);
+            }
+            return buf;
+        }
+
+        const bufA = createPinkBuffer(loopLen);
+        const bufB = createPinkBuffer(loopLen);
+
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.value = 420;
+        filter.Q.value = 0.7;
+
+        const masterGain = audioCtx.createGain();
+        masterGain.gain.value = 0.05 * masterVolume * sfxVolume * burningVolume;
+
+        filter.connect(masterGain).connect(audioCtx.destination);
+
+        const srcA = audioCtx.createBufferSource();
+        srcA.buffer = bufA;
+        srcA.loop = true;
+        const srcB = audioCtx.createBufferSource();
+        srcB.buffer = bufB;
+        srcB.loop = true;
+
+        const gainA = audioCtx.createGain();
+        const gainB = audioCtx.createGain();
+        gainA.gain.value = 0.9;
+        gainB.gain.value = 0.9;
+
+        srcA.connect(gainA).connect(filter);
+        srcB.connect(gainB).connect(filter);
+
+        const startA = now + 0.01;
+        const jitter = Math.random() * 0.08;
+        const startB = now + loopLen / 2 + jitter + 0.01;
+        srcA.start(startA);
+        srcB.start(startB);
+
+        function scheduleGainAutomation(gNode, sTime) {
+            const segs = Math.max(3, Math.round(loopLen * 2));
+            let t = sTime;
+            for (let i = 0; i < segs; i++) {
+                const dur = (loopLen / segs) * (0.9 + Math.random() * 0.3);
+                const val = 0.7 + Math.random() * 0.35;
+                gNode.gain.setValueAtTime(val, t);
+                gNode.gain.linearRampToValueAtTime(0.65 + Math.random() * 0.4, t + dur);
+                t += dur;
+            }
+            gNode.gain.setValueAtTime(gNode.gain.value, sTime + loopLen + 0.02);
+        }
+
+        scheduleGainAutomation(gainA, startA);
+        scheduleGainAutomation(gainB, startB);
+
+        firestormBurningInstance = { srcA, srcB, masterGain, startTime: now };
+    } catch (e) { /* ignore audio errors */ }
+}
+
+function stopFirestormBurning() {
+    if (!firestormBurningInstance) return;
+    try {
+        const now = audioCtx.currentTime;
+        const fade = 0.3;
+        const stopTime = now + fade;
+        firestormBurningInstance.masterGain.gain.cancelScheduledValues(now);
+        firestormBurningInstance.masterGain.gain.setValueAtTime(firestormBurningInstance.masterGain.gain.value, now);
+        firestormBurningInstance.masterGain.gain.setTargetAtTime(0.00001, now + 0.01, 0.06);
+        firestormBurningInstance.srcA.stop(stopTime);
+        firestormBurningInstance.srcB.stop(stopTime);
+    } catch (e) { /* ignore audio errors */ }
+    firestormBurningInstance = null;
 }
 let OBSTACLE_COUNT = 8;
 let OBSTACLE_MIN_SIZE = 70, OBSTACLE_MAX_SIZE = 170;
@@ -798,65 +1248,10 @@ let DYNAMIC_MODE = false;
 let DYNAMIC_RATE = 3.0; // seconds between spawn/despawn events
 let dynamicTimer = 0;
 let dynamicSpawnNext = true;
-let MAP_BORDER = false; // when true, border blocks bullets (ricochet only if bullet has bounces)
+let MAP_BORDER = true; // when true, border blocks bullets (ricochet only if bullet has bounces)
 
 
 // --- World Modifiers System ---
-const WORLD_MODIFIERS = [
-    {
-        name: "Infestation",
-        desc: "Chunks will randomly become alive and aggressive.",
-        effect: function() {
-            infestationActive = true;
-            infestationTimer = 0;
-        },
-        picked: false
-    },
-    {
-        name: "Spontaneous",
-        desc: "Obstacles combust Spontaneously.",
-        effect: function() {
-            spontaneousActive = true;
-            spontaneousTimer = 0;
-        },
-        picked: false
-    },
-    {
-        name: "Dynamic",
-        desc: "Toggles dynamic on at fastest setting.",
-        effect: function() {
-            if (!dynamicModifierActive) {
-                // First time: save current settings and turn on dynamic
-                dynamicPreviousMode = DYNAMIC_MODE;
-                dynamicPreviousRate = DYNAMIC_RATE;
-                DYNAMIC_MODE = true;
-                DYNAMIC_RATE = 0.5; // fastest setting
-                dynamicModifierActive = true;
-                dynamicTimer = 0; // reset timer
-                dynamicSpawnNext = true;
-            } else {
-                // Second time: revert to previous settings
-                DYNAMIC_MODE = dynamicPreviousMode;
-                DYNAMIC_RATE = dynamicPreviousRate;
-                dynamicModifierActive = false;
-                dynamicTimer = 0;
-            }
-        },
-        picked: false
-    },
-    // --- FIRESTORM MODIFIER ---
-    {
-        name: "Firestorm",
-        desc: "Storms of fire appear randomly around the map.",
-        effect: function() {
-            firestormActive = true;
-            firestormTimer = 0;
-            firestormNextTime = 2 + Math.random() * 4; // short delay before first storm
-        },
-        picked: false
-    }
-    // Add more world modifiers here
-];
 // Apply a world modifier by name with proper first/second-pick semantics
 function applyWorldModifierByName(name) {
     const mod = WORLD_MODIFIERS.find(m => m.name === name);
@@ -876,6 +1271,9 @@ function applyWorldModifierByName(name) {
                     firestormActive = false;
                     firestormInstance = null;
                     firestormTimer = 0;
+                } else if (name === 'Healers') {
+                    healersActive = false;
+                    clearHealers();
                 }
                 activeWorldModifiers = activeWorldModifiers.filter(m => m !== name);
                 usedWorldModifiers[name] = false;
@@ -895,9 +1293,143 @@ function applyWorldModifierByName(name) {
 let firestormActive = false;
 let firestormTimer = 0;
 let firestormNextTime = 0;
+let wasFirestormActive = false;
+let wasFirestormInstance = null;
 let firestormInstance = null; // holds the current firestorm object
+let firestormPreSpawnPos = null;
+let firestormPreSpawnTimer = 0;
+let firestormPreSpawnDelay = 2; // 2 seconds warning
+
+// --- Healers State ---
+let healersActive = false;
+let healers = [];
+let healerRespawnTimer = 0;
+let healerRespawnDelay = 0;
+let healerPendingRespawn = false;
+let healerPreSpawnPos = null;
+
+function clearHealers() {
+    healers.length = 0;
+    healerRespawnTimer = 0;
+    healerRespawnDelay = 0;
+    healerPendingRespawn = false;
+}
+
+function setNextHealerRespawnDelay() {
+    healerRespawnDelay = 5 + Math.random() * 5; // 5-10 seconds
+    // Pick a pre-spawn position that avoids obstacles
+    const spawnRadius = 24; // safe radius for spawn collision checks
+    let attempt = randomHealerPosition();
+    let tries = 0;
+    while (tries < 30) {
+        const ax = attempt.x;
+        const ay = attempt.y;
+        let colliding = false;
+        try {
+            if (Array.isArray(obstacles)) {
+                for (let o of obstacles) {
+                    if (!o) continue;
+                    if (typeof o.circleCollide === 'function' && o.circleCollide(ax, ay, spawnRadius)) { colliding = true; break; }
+                }
+            }
+        } catch (e) { colliding = false; }
+        if (!colliding) {
+            healerPreSpawnPos = { x: ax, y: ay };
+            break;
+        }
+        // try another spot
+        attempt = randomHealerPosition();
+        tries++;
+    }
+    // fallback: use last attempted position even if overlapping
+    if (!healerPreSpawnPos) {
+        healerPreSpawnPos = { x: attempt.x || (window.CANVAS_W/2), y: attempt.y || (CANVAS_H/2) };
+    }
+    try { console.log('[Healer] pre-spawn position set', healerPreSpawnPos, 'delay=', healerRespawnDelay.toFixed(2)); } catch (e) {}
+}
+
+function randomHealerPosition() {
+    const margin = 140;
+    return {
+        x: rand(margin, window.CANVAS_W - margin),
+        y: rand(margin, CANVAS_H - margin)
+    };
+}
+
+function spawnHealerAt(pos) {
+    // If pos is provided (e.g., from pre-spawn position), use it exactly
+    if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
+        const h = new Healer(pos.x, pos.y);
+        healers.push(h);
+        return h;
+    }
+    
+    // Otherwise, try to find a spawn position that doesn't overlap obstacles
+    const spawnRadius = 24; // safe radius for spawn collision checks
+    let attempt = randomHealerPosition();
+    let tries = 0;
+    while (tries < 30) {
+        const ax = attempt.x;
+        const ay = attempt.y;
+        let colliding = false;
+        try {
+            if (Array.isArray(obstacles)) {
+                for (let o of obstacles) {
+                    if (!o) continue;
+                    if (typeof o.circleCollide === 'function' && o.circleCollide(ax, ay, spawnRadius)) { colliding = true; break; }
+                }
+            }
+        } catch (e) { colliding = false; }
+        if (!colliding) {
+            const h = new Healer(ax, ay);
+            healers.push(h);
+            return h;
+        }
+        // try another spot
+        attempt = randomHealerPosition();
+        tries++;
+    }
+    // fallback: spawn at last attempted position even if overlapping
+    const h = new Healer(attempt.x || (window.CANVAS_W/2), attempt.y || (CANVAS_H/2));
+    healers.push(h);
+    return h;
+}
+
+function getHealerTargets() {
+    const targets = [];
+    if (player) targets.push(player);
+    if (enemy && !enemyDisabled) targets.push(enemy);
+    return targets;
+}
+
+// Global function for WorldMaster to trigger firestorm pre-spawn
+function triggerFirestormPreSpawn(x, y, radius = 200) {
+    try {
+        // Set pre-spawn position for manual WorldMaster click
+        firestormPreSpawnPos = { x, y, radius };
+        firestormPreSpawnTimer = 0;
+        try {
+            if (NET && NET.role === 'host' && NET.connected) {
+                GameEvents.emit('firestorm-pre-spawn', { x, y, radius, delay: firestormPreSpawnDelay, timer: firestormPreSpawnTimer });
+            }
+        } catch (e) {}
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// Expose to window for WorldMaster access
+if (typeof window !== 'undefined') {
+    window.triggerFirestormPreSpawn = triggerFirestormPreSpawn;
+}
 
 let worldModifierRoundInterval = 3; // default, can be set in setup
+// Victory modal continue loop
+window._victoryRoundsLeft = 0;
+window._victoryRoundsActive = false;
+// Victory modal voting system
+window._victoryVotes = { host: null, joiner: null };
 let roundsSinceLastModifier = 0;
 // Match settings
 let ROUNDS_TO_WIN = 10; // default, can be changed in setup UI
@@ -920,72 +1452,209 @@ let dynamicModifierActive = false;
 let dynamicPreviousMode = false;
 let dynamicPreviousRate = 3.0;
 
-// --- Constants ---
-const CANVAS_W = 1300, CANVAS_H = 650;
-const PLAYER_RADIUS = 19;
-const ENEMY_RADIUS = 19;
-const BULLET_RADIUS = 7;
-const BULLET_SPEED = 420;
-const SHOOT_INTERVAL = 1.2; // seconds
-const PLAYER_SPEED = 220;
-const ENEMY_SPEED = 170;
-const HEALTH_MAX = 100;
-const BULLET_DAMAGE = 18;
-const EXPLOSION_BASE_RADIUS = 57;
-const EXPLOSION_PARTICLES = 28;
-const EXPLOSION_PARTICLE_BASE = 48;
+class GlobalDeckController {
+    constructor() {
+        this.minWorldMods = 3;
+        this.minPowerups = 5;
+        this.availableWorldMods = new Set();
+        this.availablePowerups = new Set();
+        this._initialized = false;
+        this.worldMaster = null;
+        this.ui = null;
+        this.uiAdapter = null;
+        this.uiSource = null;
+    }
 
-// --- Dash Base Stats ---
-const DASH_BASE_SPEED_MULT = 2.0; // base dash speed multiplier
-const DASH_BASE_DIST = 110;       // base dash distance in px
-const DASH_BASE_COOLDOWN = 1.1;   // seconds
+    ensureInitialized() {
+        if (this._initialized) return;
+        const mods = (typeof WORLD_MODIFIERS !== 'undefined') ? WORLD_MODIFIERS : (window.WORLD_MODIFIERS || []);
+        for (const mod of mods) {
+            const name = (typeof mod === 'string') ? mod : (mod && mod.name);
+            if (name) this.availableWorldMods.add(name);
+        }
+        const pups = (typeof POWERUPS !== 'undefined') ? POWERUPS : (window.POWERUPS || []);
+        for (const pup of pups) {
+            const name = (typeof pup === 'string') ? pup : (pup && pup.name);
+            if (name) this.availablePowerups.add(name);
+        }
+        this._initialized = true;
+    }
 
-const POWERUPS = [
-    { name: "Bullet Speed+", desc: "Bullets travel faster.", effect: p => p.bulletSpeed *= 1.2 },
-    { name: "Bullet Size+", desc: "Bullets are bigger.", effect: p => p.bulletRadius *= 1.35 },
-    { name: "Bullet Dmg+", desc: "Bullets deal more damage.", effect: p => p.bulletDamage += 6 },
-    { name: "Move Speed+", desc: "You move faster.", effect: p => p.speed *= 1.18 },
-    { name: "Attack Speed+", desc: "Fire more quickly.", effect: p => p.shootInterval *= 0.8 },
-    { name: "Life Steal", desc: "Heal for 30% of damage you deal.", effect: p => p.lifeStealPct = (p.lifeStealPct||0) + 0.3 },
-    { name: "Spread+", desc: "Each stack adds one extra projectile.", effect: p => p.spread = (p.spread || 0) + 1 },
-    { name: "Piercing Bullet", desc: "Bullets pass through obstacles.", effect: p => p.pierce = true },
-    { name: "Dash+", desc: "Dash is faster and goes farther!", effect: p => { p.dashPower = (p.dashPower || 1) + 1; }},
-    { name: "Big Shot", desc: "Your next shot after dashing is larger but slower. Dash cooldown +25% per stack.", effect: p => p.bigShotStacks = (p.bigShotStacks||0) + 1 },
-    { name: "Ramming", desc: "Deal damage to anyone/anything you dash into. Dash cooldown +25% per stack.", effect: p => { p.ram = true; p.ramStacks = (p.ramStacks||0) + 1 } },
-    { name: "Deflect", desc: "Bullets ricochet off you while dashing. Each stack increases deflections per dash.", effect: p => { p.deflect = true; p.deflectStacks = (p.deflectStacks||0) + 1 } },
-    { name: "Obliterator", desc: "Bullets destroy more obstacle chunks. Each stack increases destruction.", effect: p => { p.obliterator = true; p.obliteratorStacks = (p.obliteratorStacks||0) + 1 } },
-    { name: "Ricochet", desc: "Bullets bounce off obstacles and map borders. Each stack adds +1 bounce.", effect: p => p.ricochet = (p.ricochet|0) + 1 },
-    { name: "Explosive Shots", desc: "Bullets explode on impact, damaging in a radius!", effect: p => p.explosive = true }
-];
+    attachWorldMaster(worldMaster) {
+        if (worldMaster) {
+            this.ensureInitialized();
+            const wmMods = (worldMaster && worldMaster.availableWorldMods instanceof Set) ? worldMaster.availableWorldMods : null;
+            const wmPups = (worldMaster && worldMaster.availablePowerups instanceof Set) ? worldMaster.availablePowerups : null;
+            if (wmMods && !this.availableWorldMods.size && wmMods.size) {
+                this.availableWorldMods = new Set(wmMods);
+            }
+            if (wmPups && !this.availablePowerups.size && wmPups.size) {
+                this.availablePowerups = new Set(wmPups);
+            }
+            if (this.uiAdapter) {
+                this.uiAdapter.availableWorldMods = this.availableWorldMods;
+                this.uiAdapter.availablePowerups = this.availablePowerups;
+            }
+            this.worldMaster = worldMaster;
+            worldMaster.availableWorldMods = this.availableWorldMods;
+            worldMaster.availablePowerups = this.availablePowerups;
+            worldMaster.minWorldMods = this.minWorldMods;
+            worldMaster.minPowerups = this.minPowerups;
+        } else {
+            this.worldMaster = null;
+        }
+    }
+
+    toggleWorldMod(name, enabled, context = {}) {
+        this.ensureInitialized();
+        const had = this.availableWorldMods.has(name);
+        if (enabled) {
+            if (!had) {
+                this.availableWorldMods.add(name);
+                this._afterToggle(context);
+            }
+            return true;
+        }
+        if (!had) return false;
+        if (this.availableWorldMods.size <= this.minWorldMods) {
+            return false;
+        }
+        this.availableWorldMods.delete(name);
+        this._afterToggle(context);
+        return true;
+    }
+
+    togglePowerup(name, enabled, context = {}) {
+        this.ensureInitialized();
+        const had = this.availablePowerups.has(name);
+        if (enabled) {
+            if (!had) {
+                this.availablePowerups.add(name);
+                this._afterToggle(context);
+            }
+            return true;
+        }
+        if (!had) return false;
+        if (this.availablePowerups.size <= this.minPowerups) {
+            return false;
+        }
+        this.availablePowerups.delete(name);
+        this._afterToggle(context);
+        return true;
+    }
+
+    _afterToggle(context) {
+        const wm = context && context.worldMaster ? context.worldMaster : this.worldMaster;
+        if (wm && context && context.skipSync) {
+            return;
+        }
+        if (wm && typeof wm.syncCardDecks === 'function') {
+            try { wm.syncCardDecks(); } catch (e) {}
+        }
+    }
+}
+
+function ensureGlobalDeckController() {
+    if (typeof window === 'undefined') return null;
+    if (!window.globalDeckController) {
+        window.globalDeckController = new GlobalDeckController();
+        window.globalDeckController.ensureInitialized();
+        if (window.gameWorldMasterInstance) {
+            try { window.globalDeckController.attachWorldMaster(window.gameWorldMasterInstance); } catch (e) {}
+        }
+    } else {
+        try { window.globalDeckController.ensureInitialized(); } catch (e) {}
+    }
+    return window.globalDeckController;
+}
+
+if (typeof window !== 'undefined') {
+    window.ensureGlobalDeckController = ensureGlobalDeckController;
+    ensureGlobalDeckController();
+}
 
 // --- Utilities ---
-function rand(a, b) { return a + Math.random() * (b - a); }
-function randInt(a, b) { return Math.floor(rand(a, b+1)); }
-function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
-function dist(x1, y1, x2, y2) { return Math.hypot(x2-x1, y2-y1); }
-function lerp(a, b, t) { return a + (b - a) * t; }
-function randomChoice(arr, n) {
-    let cp = [...arr], out = [];
-    for(let i = 0; i < n; ++i) out.push(cp.splice(randInt(0, cp.length-1), 1)[0]);
-    return out;
-}
-function getCardByName(name) {
-    if (!name || typeof name !== 'string') return null;
-    const key = name.trim().toLowerCase();
-    return POWERUPS.find(c => c.name && c.name.toLowerCase() === key) || null;
-}
+
 
 // Dash settings helper (extracted so both update() and drawPlayer() can use it)
-function getDashSettings(p) {
-    let power = Math.max(1, p.dashPower || 1);
-    let speedMult = DASH_BASE_SPEED_MULT + 0.33 * (power-1);
-    let dist = DASH_BASE_DIST + 38 * (power-1);
-    // increase dash cooldown if Big Shot stacks exist (each stack +25%)
-    let baseCooldown = Math.max(0.55, DASH_BASE_COOLDOWN - 0.08 * (power-1));
-    // Increase dash cooldown for Big Shot and Ramming stacks (each stack +25%)
-    let cooldown = baseCooldown * (1 + (p.bigShotStacks || 0) * 0.25 + (p.ramStacks || 0) * 0.25);
-    let duration = dist / (p.speed * speedMult);
-    return { speedMult, dist, cooldown, duration };
+
+
+
+function beginDash(p, dashVec, dashSet, opts = {}) {
+    if (!p) return;
+    const dir = dashVec ? { x: dashVec.x, y: dashVec.y } : { x: 0, y: 0 };
+    const teledash = isTeledashEnabled(p);
+    p.dashActive = true;
+    p.dashDir = dir;
+    p.dashCooldown = dashSet.cooldown;
+    p.dashTime = dashSet.duration;
+    p.deflectRemaining = (p.deflectStacks || 0);
+    if (p.bigShot) p.bigShotPending = true;
+    if (teledash) {
+        // Allow callers to suppress local warmup visual while still running the
+        // mechanical warmup on the authoritative side. Default: show visual.
+        const showWarmup = (opts && typeof opts.showWarmup !== 'undefined') ? !!opts.showWarmup : true;
+        p.teledashWarmupActive = true; // mechanical warmup (authoritative)
+        p.teledashPendingTeleport = true;
+        p.teledashWarmupTime = dashSet.warmup;
+        p.teledashWarmupElapsed = 0;
+        p.teledashOrigin = { x: p.x, y: p.y };
+        p.teledashLockedAim = opts.lockedAim || null;
+        p.teledashSequence = (p.teledashSequence || 0) + 1;
+        // Visual-only flag: when false the local client should not draw the ring.
+        p.teledashWarmupVisible = showWarmup;
+    } else {
+        try { playDashWoosh(p.dashTime, dashSet.speedMult); } catch (e) {}
+    }
+}
+
+
+
+
+
+function completeTeledash(p, dashSet, aim, blockers = {}) {
+    if (!p) return;
+    const dest = computeTeledashDestination(p, dashSet, aim, blockers);
+    p.x = dest.x;
+    p.y = dest.y;
+    p.teledashTarget = dest;
+    p.teledashWarmupActive = false;
+    p.teledashPendingTeleport = false;
+    p.teledashOrigin = null;
+    p.teledashLockedAim = null;
+    p.dashTime = 0;
+    p.dashActive = false;
+    try { playDashWoosh(dashSet.duration, dashSet.speedMult); } catch (e) {}
+}
+
+function updateTeledashWarmup(p, dt, dashSet, aimProvider, blockers = {}) {
+    if (!p || !p.teledashWarmupActive) return false;
+    p.teledashWarmupElapsed += dt;
+    const remaining = Math.max(0, (p.teledashWarmupTime || 0) - p.teledashWarmupElapsed);
+    p.dashTime = remaining;
+    if (p.teledashWarmupElapsed >= (p.teledashWarmupTime || 0)) {
+        const aim = typeof aimProvider === 'function' ? aimProvider() : aimProvider;
+        completeTeledash(p, dashSet, aim, blockers);
+        return true;
+    }
+    return false;
+}
+
+// Local-only tick for joiner clients: advance the warmup timer and set pending flag
+// but do NOT perform the authoritative teleport locally. This keeps the visual
+// indicator working for joiners without moving the entity (host is authoritative).
+function tickLocalTeledashWarmup(p, dt) {
+    if (!p || !p.teledashWarmupActive) return false;
+    p.teledashWarmupElapsed += dt;
+    const remaining = Math.max(0, (p.teledashWarmupTime || 0) - p.teledashWarmupElapsed);
+    p.dashTime = remaining;
+    if (p.teledashWarmupElapsed >= (p.teledashWarmupTime || 0)) {
+        // Warmup completed locally: clear warmup visual and mark pending teleport
+        p.teledashWarmupActive = false;
+        p.teledashPendingTeleport = true;
+        return true;
+    }
+    return false;
 }
 
 // --- Enemy AI helper: line of sight (simple) ---
@@ -1004,14 +1673,25 @@ function hasLineOfSight(ax, ay, bx, by, obstacles) {
 
 // --- Game State ---
 let canvas, ctx;
-let mouse = { x: CANVAS_W/2, y: CANVAS_H/2 };
+let mouse = { x: window.CANVAS_W/2, y: CANVAS_H/2 };
+window.mouse = mouse;
 let keys = {};
-let player, enemy, bullets, obstacles;
+var player, enemy, bullets, obstacles;
 let enemyCount = 1;
 let enemyDisabled = false; // when true, enemy exists but AI/draw are disabled (for 0 enemies option; ignored in MP)
 let explosions = [];
 let lastTimestamp = 0;
 let cardState = { active: false, player: null, callback: null };
+
+function isSelectionPauseActive() {
+    if (cardState && cardState.active) return true;
+    if (waitingForCard) return true;
+    try {
+        if (window._pendingWorldModOffer) return true;
+    } catch (e) {}
+    if (window._victoryPauseActive) return true;
+    return false;
+}
 let running = false;
 let animFrameId = null;
 let waitingForCard = false;
@@ -1154,7 +1834,7 @@ const NET = {
     dashLatch: false,
     bulletCounter: 1,
     // Joiner-side smoothing targets
-    joinerTargets: { p0: null, p1: null },
+    joinerTargets: { p0: null, p1: null, healers: new Map() },
     myName: '', // local player's display name
     peerName: '', // remote player's display name (host stores joiner name)
     setRole(role) {
@@ -1213,16 +1893,64 @@ const NET = {
     },
     // Build a host snapshot (includes timers for cooldown ring rendering)
     buildSnapshot() {
+        const serializePlayer = (p) => {
+            const dashSet = getDashSettings(p) || {};
+            return {
+                x: p.x,
+                y: p.y,
+                hp: p.health,
+                ts: p.timeSinceShot,
+                si: p.shootInterval,
+                dc: p.dashCooldown,
+                // include authoritative total cooldown so clients render the ring consistently
+                dcMax: typeof dashSet.cooldown === 'number' ? dashSet.cooldown : null,
+                da: !!p.dashActive,
+                dt: p.dashTime || 0,
+                td: !!p.teledash,
+                // NOTE: teledash warmup (visual indicator) is synced for mutual visibility
+                // so both players can see the warmup ring. Sequence and pending teleport
+                // ensure teleport completion and ordering still sync correctly.
+                tdA: !!p.teledashWarmupActive,
+                tdE: p.teledashWarmupElapsed || 0,
+                tdT: p.teledashWarmupTime || 0,
+                tdS: p.teledashSequence || 0,
+                tdP: !!p.teledashPendingTeleport,
+                tdV: !!p.teledashWarmupVisible
+            };
+        };
         const snap = {
             names: {
                 p0: (this.role === 'host' ? (this.myName || (player && player.displayName) || 'Player 1') : (this.peerName || (player && player.displayName) || 'Player 1')),
                 p1: (this.role === 'host' ? (this.peerName || (enemy && enemy.displayName) || 'Player 2') : (this.myName || (enemy && enemy.displayName) || 'Player 2'))
             },
             players: [
-                { x: player.x, y: player.y, hp: player.health, ts: player.timeSinceShot, si: player.shootInterval, dc: player.dashCooldown },
-                { x: enemy.x, y: enemy.y, hp: enemy.health, ts: enemy.timeSinceShot, si: enemy.shootInterval, dc: enemy.dashCooldown }
+                serializePlayer(player),
+                serializePlayer(enemy)
             ],
-            bullets: bullets.map(b => ({ id: b.id, x: b.x, y: b.y, angle: b.angle, speed: b.speed, r: b.radius, dmg: b.damage, bnc: b.bouncesLeft, obl: !!b.obliterator, ex: !!b.explosive, ownerRole: (b.owner === player ? 'host' : 'joiner') }))
+            bullets: bullets.map(b => ({ id: b.id, x: b.x, y: b.y, angle: b.angle, speed: b.speed, r: b.radius, dmg: b.damage, bnc: b.bouncesLeft, obl: !!b.obliterator, ex: !!b.explosive, ownerRole: (b.owner === player ? 'host' : 'joiner') })),
+            healersActive: !!healersActive,
+            healers: (healersActive ? healers.filter(h => h && h.active).map(h => ({
+                id: h.id,
+                x: h.x,
+                y: h.y,
+                health: h.health,
+                healthMax: h.healthMax,
+                damageFlash: h.damageFlash,
+                shakeTime: h.shakeTime,
+                shakeMag: h.shakeMag,
+                burning: h.burning ? { time: h.burning.time || 0, duration: h.burning.duration || 0, nextTick: h.burning.nextTick || 0 } : null
+            })) : []),
+            healerRespawn: {
+                pending: !!healerPendingRespawn,
+                timer: healerRespawnTimer,
+                delay: healerRespawnDelay,
+                preSpawnPos: healerPreSpawnPos
+            },
+            firestormPreSpawn: {
+                pos: firestormPreSpawnPos,
+                timer: firestormPreSpawnTimer,
+                delay: firestormPreSpawnDelay
+            }
         };
         return snap;
     },
@@ -1241,21 +1969,144 @@ const NET = {
                     if (typeof p0.ts === 'number') enemy.timeSinceShot = p0.ts;
                     if (typeof p0.si === 'number') enemy.shootInterval = p0.si;
                     if (typeof p0.dc === 'number') enemy.dashCooldown = p0.dc;
+                    if (typeof p0.dcMax === 'number') enemy.dashCooldownMax = p0.dcMax;
+                    enemy.dashActive = !!p0.da;
+                    if (typeof p0.dt === 'number') enemy.dashTime = p0.dt;
+                    enemy.teledash = !!p0.td;
+                    enemy.teledashWarmupActive = !!p0.tdA;
+                    enemy.teledashWarmupElapsed = typeof p0.tdE === 'number' ? p0.tdE : (enemy.teledashWarmupElapsed || 0);
+                    enemy.teledashWarmupTime = typeof p0.tdT === 'number' ? p0.tdT : (enemy.teledashWarmupTime || 0);
+                    enemy.teledashSequence = p0.tdS || enemy.teledashSequence || 0;
+                    enemy.teledashPendingTeleport = !!p0.tdP;
+                    enemy.teledashWarmupVisible = !!p0.tdV;
                 }
                 if (p1) {
                     NET.joinerTargets.p1 = { x: p1.x, y: p1.y };
+                    // Reconcile joiner's predicted position if it differs significantly from host
+                    const distToHost = Math.hypot(player.x - p1.x, player.y - p1.y);
+                    if (distToHost > 10) { // threshold for reconciliation
+                        player.reconcileX = p1.x;
+                        player.reconcileY = p1.y;
+                    }
                     player.health = p1.hp;
                     if (typeof p1.ts === 'number') player.timeSinceShot = p1.ts;
                     if (typeof p1.si === 'number') player.shootInterval = p1.si;
                     if (typeof p1.dc === 'number') player.dashCooldown = p1.dc;
+                    if (typeof p1.dcMax === 'number') player.dashCooldownMax = p1.dcMax;
+                    player.dashActive = !!p1.da;
+                    if (typeof p1.dt === 'number') player.dashTime = p1.dt;
+                    player.teledash = !!p1.td;
+                    player.teledashWarmupActive = !!p1.tdA;
+                    player.teledashWarmupElapsed = typeof p1.tdE === 'number' ? p1.tdE : (player.teledashWarmupElapsed || 0);
+                    player.teledashWarmupTime = typeof p1.tdT === 'number' ? p1.tdT : (player.teledashWarmupTime || 0);
+                    player.teledashSequence = p1.tdS || player.teledashSequence || 0;
+                    player.teledashPendingTeleport = !!p1.tdP;
+                    player.teledashWarmupVisible = !!p1.tdV;
                 }
                 // On first snapshot or if positions uninitialized, snap directly to avoid lerp jump
                 if (typeof enemy.x !== 'number' || typeof enemy.y !== 'number') { if (p0) { enemy.x = p0.x; enemy.y = p0.y; } }
                 if (typeof player.x !== 'number' || typeof player.y !== 'number') { if (p1) { player.x = p1.x; player.y = p1.y; } }
             } else {
                 // Fallback mapping (not used on host normally)
-                if (p0) { player.x = p0.x; player.y = p0.y; player.health = p0.hp; }
-                if (p1) { enemy.x = p1.x; enemy.y = p1.y; enemy.health = p1.hp; }
+                if (p0) {
+                    player.x = p0.x; player.y = p0.y; player.health = p0.hp;
+                    if (typeof p0.ts === 'number') player.timeSinceShot = p0.ts;
+                    if (typeof p0.si === 'number') player.shootInterval = p0.si;
+                    if (typeof p0.dc === 'number') player.dashCooldown = p0.dc;
+                    player.dashActive = !!p0.da;
+                    if (typeof p0.dt === 'number') player.dashTime = p0.dt;
+                    player.teledash = !!p0.td;
+                    player.teledashWarmupActive = !!p0.tdA;
+                    player.teledashWarmupElapsed = typeof p0.tdE === 'number' ? p0.tdE : (player.teledashWarmupElapsed || 0);
+                    player.teledashWarmupTime = typeof p0.tdT === 'number' ? p0.tdT : (player.teledashWarmupTime || 0);
+                    player.teledashSequence = p0.tdS || player.teledashSequence || 0;
+                    player.teledashPendingTeleport = !!p0.tdP;
+                    player.teledashWarmupVisible = !!p0.tdV;
+                }
+                if (p1) {
+                    enemy.x = p1.x; enemy.y = p1.y; enemy.health = p1.hp;
+                    if (typeof p1.ts === 'number') enemy.timeSinceShot = p1.ts;
+                    if (typeof p1.si === 'number') enemy.shootInterval = p1.si;
+                    if (typeof p1.dc === 'number') enemy.dashCooldown = p1.dc;
+                    enemy.dashActive = !!p1.da;
+                    if (typeof p1.dt === 'number') enemy.dashTime = p1.dt;
+                    enemy.teledash = !!p1.td;
+                    enemy.teledashWarmupActive = !!p1.tdA;
+                    enemy.teledashWarmupElapsed = typeof p1.tdE === 'number' ? p1.tdE : (enemy.teledashWarmupElapsed || 0);
+                    enemy.teledashWarmupTime = typeof p1.tdT === 'number' ? p1.tdT : (enemy.teledashWarmupTime || 0);
+                    enemy.teledashSequence = p1.tdS || enemy.teledashSequence || 0;
+                    enemy.teledashPendingTeleport = !!p1.tdP;
+                    enemy.teledashWarmupVisible = !!p1.tdV;
+                }
+            }
+            if (typeof snap.healersActive !== 'undefined') {
+                if (!snap.healersActive && healersActive) {
+                    clearHealers();
+                }
+                healersActive = !!snap.healersActive;
+            }
+            if (healersActive) {
+                const incomingHealers = new Map();
+                for (const h of (snap.healers || [])) {
+                    if (!h || typeof h.id === 'undefined') continue;
+                    incomingHealers.set(h.id, h);
+                }
+                for (let i = healers.length - 1; i >= 0; i--) {
+                    const h = healers[i];
+                    if (!incomingHealers.has(h.id)) healers.splice(i, 1);
+                }
+                for (const data of incomingHealers.values()) {
+                    let h = healers.find(existing => existing.id === data.id);
+                    if (!h) {
+                        h = new Healer(data.x, data.y);
+                        h.id = data.id;
+                        healers.push(h);
+                    }
+                    // Store target position for smoothing on joiner
+                    if (NET.role === 'joiner') {
+                        NET.joinerTargets.healers.set(data.id, { x: data.x, y: data.y });
+                    } else {
+                        h.x = data.x;
+                        h.y = data.y;
+                    }
+                    if (typeof data.healthMax === 'number') h.healthMax = data.healthMax;
+                    if (typeof data.health === 'number') h.health = data.health;
+                    h.active = data.health > 0;
+                    h.damageFlash = data.damageFlash || 0;
+                    h.shakeTime = data.shakeTime || 0;
+                    h.shakeMag = data.shakeMag || 0;
+                    if (data.burning) {
+                        h.burning = {
+                            time: data.burning.time || 0,
+                            duration: data.burning.duration || 0,
+                            nextTick: data.burning.nextTick
+                        };
+                    } else {
+                        h.burning = null;
+                    }
+                    if (!Array.isArray(h.flameParticles)) h.flameParticles = [];
+                }
+                if (snap.healerRespawn) {
+                    healerPendingRespawn = !!snap.healerRespawn.pending;
+                    healerRespawnTimer = snap.healerRespawn.timer || 0;
+                    healerRespawnDelay = snap.healerRespawn.delay || 0;
+                    healerPreSpawnPos = snap.healerRespawn.preSpawnPos || null;
+                }
+                // Sync firestorm pre-spawn state
+                if (snap.firestormPreSpawn) {
+                    firestormPreSpawnPos = snap.firestormPreSpawn.pos || null;
+                    firestormPreSpawnTimer = snap.firestormPreSpawn.timer || 0;
+                    firestormPreSpawnDelay = snap.firestormPreSpawn.delay || 2;
+                }
+            } else {
+                healers.length = 0;
+                healerPendingRespawn = false;
+                healerRespawnTimer = 0;
+                healerRespawnDelay = 0;
+                healerPreSpawnPos = null;
+                if (NET.joinerTargets && NET.joinerTargets.healers) {
+                    NET.joinerTargets.healers.clear();
+                }
             }
             // bullets: upsert by id, remove missing
             const incoming = new Map();
@@ -1268,12 +2119,20 @@ const NET = {
             for (const sb of incoming.values()) {
                 if (have.has(sb.id)) {
                     const b = have.get(sb.id);
-                    // On joiner, don't snap bullet x/y; set targets for smoothing
-                    b.targetX = sb.x; b.targetY = sb.y;
-                    b.angle = sb.angle; b.speed = sb.speed;
+                    // For locally controlled bullets, do NOT override position/angle from snapshot
+                    const isLocal = (sb.ownerRole === 'host' && NET.role === 'host') || (sb.ownerRole === 'joiner' && NET.role === 'joiner');
+                    if (!isLocal) {
+                        b.targetX = sb.x; b.targetY = sb.y;
+                        b.targetAngle = sb.angle;
+                    }
+                    b.speed = sb.speed;
                     b.radius = sb.r; b.damage = sb.dmg; b.bouncesLeft = sb.bnc;
                     b.obliterator = !!sb.obl; b.explosive = !!sb.ex;
                     b.active = true;
+                    // Set isLocalPlayerBullet for host/joiner bullets
+                    if (isLocal) {
+                        b.isLocalPlayerBullet = true;
+                    }
                 } else {
                     // Map ownerRole from snapshot to a local entity so visual owner/color is correct
                     const owner = (typeof sb.ownerRole === 'string') ? getEntityForRole(sb.ownerRole) : player;
@@ -1282,6 +2141,11 @@ const NET = {
                     nb.bouncesLeft = sb.bnc; nb.obliterator = !!sb.obl; nb.explosive = !!sb.ex;
                     nb.active = true;
                     nb.targetX = sb.x; nb.targetY = sb.y;
+                    nb.targetAngle = sb.angle;
+                    // Set isLocalPlayerBullet for joiner's bullets
+                    if (sb.ownerRole === 'joiner' && NET.role === 'joiner') {
+                        nb.isLocalPlayerBullet = true;
+                    }
                     bullets.push(nb);
                 }
             }
@@ -1293,10 +2157,9 @@ const NET = {
     },
     // Read local input (joiner). We map to existing variables.
     collectLocalInput() {
-    // Continuous shoot: true while space or left-click is held (or legacy player.shootQueued)
-    // Use keyboard state or legacy player.shootQueued as a fallback so holding continues to fire
+    // Shoot: continuous while held. Use keyboard state or legacy player.shootQueued as a fallback.
     const spacePressed = !!keys[' '] || !!keys['space'] || !!player.shootQueued;
-    const shootPressed = spacePressed; // continuous press (not edge-trigger)
+    const shootPressed = !!spacePressed;
         // Dash edge trigger: true exactly once when shift (or mapped right-click) is pressed
         const dashPressed = !!keys['shift'];
         const dashNow = dashPressed && !this.dashLatch;
@@ -1310,8 +2173,29 @@ const NET = {
             aimX: mouse.x,
             aimY: mouse.y
         };
-        // Update latch state
-        this.shootLatch = !!spacePressed;
+        // If this client is a joiner and is initiating a dash, start a local-only warmup
+        // so the player immediately sees the range ring. The actual teleport remains
+        // host-authoritative and will be applied via snapshot/pending flags.
+        try {
+            if (NET.role === 'joiner' && out.dash && player && player.dash && !player.dashActive && player.dashCooldown <= 0) {
+                const dashSet = getDashSettings(player);
+                player.dashActive = true;
+                player.dashDir = player.dashDir || { x: 0, y: 0 };
+                player.dashCooldown = dashSet.cooldown;
+                player.dashTime = dashSet.duration;
+                if (isTeledashEnabled(player)) {
+                    player.teledashWarmupActive = true;
+                    player.teledashPendingTeleport = true;
+                    player.teledashWarmupTime = dashSet.warmup;
+                    player.teledashWarmupElapsed = 0;
+                    player.teledashOrigin = { x: player.x, y: player.y };
+                    player.teledashSequence = (player.teledashSequence || 0) + 1;
+                    player.teledashWarmupVisible = true; // show local visual for joiner
+                }
+            }
+        } catch (e) {}
+    // Update latch state (used for local edge-detection elsewhere like dash)
+    this.shootLatch = !!spacePressed;
         this.dashLatch = !!dashPressed;
         return out;
     },
@@ -1342,12 +2226,40 @@ function applyExplosionEvent(data) {
     if (typeof playExplosion === 'function') playExplosion();
 }
 
+function applyInfestationDieEvent(data) {
+    // Visual-only: play the same small poof explosion when an infested chunk dies on joiner
+    if (!data) return;
+    // Prefer to find the infested chunk by id and deactivate it so visuals stay in sync
+    try {
+        if (typeof data.id !== 'undefined') {
+            const found = (infestedChunks || []).find(ic => ic && (ic.id === data.id));
+            if (found) {
+                // trigger local poof at the chunk center and deactivate
+                const cx = found.x + found.w/2;
+                const cy = found.y + found.h/2;
+                found.active = false;
+                try { explosions.push(new Explosion(cx, cy, 25, "#8f4f8f", 0, null, false)); } catch (e) {}
+                try { if (typeof playSoftPoof === 'function') playSoftPoof(); } catch (e) {}
+                return;
+            }
+        }
+    } catch (e) {}
+    // Fallback: spawn visual by coords if id not found
+    const x = typeof data.x === 'number' ? data.x : (data.cx || 0);
+    const y = typeof data.y === 'number' ? data.y : (data.cy || 0);
+    explosions.push(new Explosion(x, y, 25, "#8f4f8f", 0, null, false));
+    if (typeof playSoftPoof === 'function') playSoftPoof();
+}
+
 function applyDamageFlashEvent(data) {
     // Find entity by ID and apply visual damage flash
     if (!data || typeof data.entityId === 'undefined') return;
     let entity = null;
     if (player && player.id === data.entityId) entity = player;
     else if (enemy && enemy.id === data.entityId) entity = enemy;
+    else if (Array.isArray(healers)) {
+        entity = healers.find(h => h && h.id === data.entityId) || null;
+    }
     if (entity && typeof entity.applyDamageFlash === 'function') {
         entity.applyDamageFlash(data.damage, data.isBurning);
         if (typeof playHit === 'function') playHit();
@@ -1359,9 +2271,14 @@ function applyHealingEffectEvent(data) {
     let entity = null;
     if (player && player.id === data.entityId) entity = player;
     else if (enemy && enemy.id === data.entityId) entity = enemy;
+    // If not found among players, try healers
+    if (!entity && Array.isArray(healers)) {
+        entity = healers.find(h => h && h.id === data.entityId) || null;
+    }
     if (!entity || typeof entity.triggerHealingEffect !== 'function') return;
     const healAmount = typeof data.healAmount === 'number' ? data.healAmount : 0;
     const intensityOverride = typeof data.intensity === 'number' ? data.intensity : 0;
+    // Joiner-side only: show visuals without re-syncing
     entity.triggerHealingEffect(Math.max(healAmount, 1), { skipSync: true, intensityOverride });
 }
 
@@ -1380,6 +2297,13 @@ function applyChunkUpdateEvent(data) {
         if (typeof upd.y === 'number') c.y = upd.y;
         if (typeof upd.vx === 'number') c.vx = upd.vx;
         if (typeof upd.vy === 'number') c.vy = upd.vy;
+        // Apply burning state if present
+        if (upd.burning) {
+            c.burning = { time: upd.burning.time || 0, duration: upd.burning.duration || 2.5, power: upd.burning.power || 1 };
+            if (!c.flameParticles) c.flameParticles = [];
+        } else if (upd.burning === null) {
+            c.burning = null;
+        }
     }
 }
 
@@ -1393,11 +2317,37 @@ function applyInfestationSpawnEvent(data) {
     if (!data) return;
     // Create a visual-only infested chunk on joiner
     try {
-        const ic = new InfestedChunk({ x: data.x, y: data.y, w: data.w, h: data.h, hp: data.hp || 1 }, null);
-        // keep the new infested chunk active for visuals; don't modify authoritative obstacle state
-        ic.id = data.id || ic.id;
-        infestedChunks.push(ic);
+        // Respect max active infested chunks for visuals too
+        try {
+            const activeCount = (infestedChunks || []).filter(ic => ic && ic.active).length;
+            if (activeCount < 10) {
+                // avoid duplicate visuals if we already have a chunk with this id
+                if (typeof data.id !== 'undefined' && (infestedChunks || []).some(ic => ic && ic.id === data.id)) return;
+                // create visual-only infested chunk on joiner
+                const chunkStub = { x: data.x, y: data.y, w: data.w, h: data.h, hp: data.hp || 1 };
+                const ic = new InfestedChunk(chunkStub, null, true);
+                // keep the new infested chunk active for visuals; set id so die events map correctly
+                ic.id = data.id || ic.id;
+                infestedChunks.push(ic);
+            }
+        } catch (e) {}
     } catch (e) { /* ignore errors on joiner */ }
+}
+
+function applyFirestormPreSpawnEvent(data) {
+    if (!data || (typeof NET !== 'undefined' && NET.role === 'host')) return;
+    try {
+        if (typeof data.delay === 'number' && data.delay > 0) {
+            firestormPreSpawnDelay = data.delay;
+        }
+        firestormPreSpawnTimer = data.timer || 0;
+        if (typeof data.x === 'number' && typeof data.y === 'number') {
+            const radius = (typeof data.radius === 'number' && data.radius > 0) ? data.radius : (firestormPreSpawnPos ? firestormPreSpawnPos.radius : 200);
+            firestormPreSpawnPos = { x: data.x, y: data.y, radius };
+        } else {
+            firestormPreSpawnPos = null;
+        }
+    } catch (e) {}
 }
 
 function applyFirestormSpawnEvent(data) {
@@ -1407,6 +2357,11 @@ function applyFirestormSpawnEvent(data) {
         firestormInstance = new Firestorm(data.x, data.y, data.radius);
         // If a stop flag is included, clear immediately
         if (data.done) firestormInstance = null;
+        // Clear any pending pre-spawn warning once the firestorm starts or finishes
+        if (!data || data.done || typeof data.x === 'number') {
+            firestormPreSpawnPos = null;
+            firestormPreSpawnTimer = 0;
+        }
     } catch (e) {}
 }
 
@@ -1416,13 +2371,14 @@ function applyDynamicSpawnEvent(data) {
         const oi = data.obstacleIndex;
         const odata = data.obstacle;
         if (typeof oi === 'number' && odata) {
+            // Create visual-only obstacle exactly at the host-specified index so joiner map matches host
             const obs = new Obstacle(odata.x, odata.y, odata.w, odata.h);
-            // Prefer to place into the same index if available
-            if (typeof obstacles[oi] !== 'undefined') {
-                obstacles[oi] = obs;
-            } else {
-                obstacles.push(obs);
-            }
+            // Expand array if needed
+            while (obstacles.length <= oi) obstacles.push(null);
+            obstacles[oi] = obs;
+            // Clear any residual destroyed flag on this slot (host intends this to be active)
+            obs.destroyed = false;
+            // no-op
         }
     } catch (e) {}
 }
@@ -1444,29 +2400,9 @@ function applyDynamicDespawnEvent(data) {
                 }
             }
             o.destroyed = true;
-            // Optionally schedule a local replacement after similar delay as host
-            setTimeout(() => {
-                // try to replace with new obstacle (non-authoritative, visual only)
-                let tries = 0;
-                while (tries < 60) {
-                    tries++;
-                    let size = rand(OBSTACLE_MIN_SIZE, OBSTACLE_MAX_SIZE);
-                    let w = size, h = size;
-                    let x = rand(60, CANVAS_W - w - 60);
-                    let y = rand(60, CANVAS_H - h - 60);
-                    const newObs = new Obstacle(x, y, w, h);
-                    let safe = true;
-                    for (let k = 0; k < obstacles.length; k++) {
-                        if (k === oi) continue;
-                        let o2 = obstacles[k];
-                        if (!o2) continue;
-                        if (!o2.destroyed && rectsOverlap(o2, newObs)) { safe = false; break; }
-                    }
-                    if (!safe) continue;
-                    obstacles[oi] = newObs;
-                    break;
-                }
-            }, 700 + Math.random()*300);
+            // Note: joiner must NOT autonomously spawn replacements — host is authoritative.
+            // Any replacement or further dynamic-spawn will arrive as a `dynamic-spawn` event from host.
+            // no-op
         }
     } catch (e) {}
 }
@@ -1481,7 +2417,17 @@ function applyBurningStartEvent(data) {
         } else if (typeof data.obstacleIndex === 'number' && typeof data.chunkIndex === 'number') {
             const obs = obstacles[data.obstacleIndex];
             if (obs && obs.chunks && obs.chunks[data.chunkIndex]) {
-                obs.chunks[data.chunkIndex].burning = { time: 0, duration: data.duration || 2.5 };
+                const c = obs.chunks[data.chunkIndex];
+                c.burning = { time: 0, duration: data.duration || 2.5, power: (typeof data.power === 'number' ? data.power : 1) };
+                // ensure joiner has local flame particle array for visuals
+                if (!c.flameParticles) c.flameParticles = [];
+            }
+        } else if (typeof data.infestedId !== 'undefined') {
+            // Start burning on an infested chunk (joiner receives this for visuals)
+            const found = (infestedChunks || []).find(ic => ic && ic.id === data.infestedId);
+            if (found) {
+                found.burning = { time: 0, duration: data.duration || 2.5, power: (typeof data.power === 'number' ? data.power : 1) };
+                if (!found.flameParticles) found.flameParticles = [];
             }
         }
     } catch (e) {}
@@ -1498,6 +2444,10 @@ function applyBurningStopEvent(data) {
             if (obs && obs.chunks && obs.chunks[data.chunkIndex]) {
                 obs.chunks[data.chunkIndex].burning = null;
             }
+        } else if (typeof data.infestedId !== 'undefined') {
+            // Stop burning on an infested chunk (joiner receives this for visuals)
+            const found = (infestedChunks || []).find(ic => ic && ic.id === data.infestedId);
+            if (found) found.burning = null;
         }
     } catch (e) {}
 }
@@ -1507,6 +2457,7 @@ function applySoundEffectEvent(data) {
     try {
         switch (data.name) {
             case 'explosion': if (typeof playExplosion === 'function') playExplosion(); break;
+            case 'soft-poof': if (typeof playSoftPoof === 'function') playSoftPoof(); break;
             case 'hit': if (typeof playHit === 'function') playHit(); break;
             case 'ricochet': if (typeof playRicochet === 'function') playRicochet(); break;
             case 'dash': if (typeof playDashWoosh === 'function') playDashWoosh(); break;
@@ -1584,7 +2535,7 @@ function generateObstacles() {
         tries++;
         let size = rand(OBSTACLE_MIN_SIZE, OBSTACLE_MAX_SIZE);
         let w = size, h = size;
-        let x = rand(60, CANVAS_W - w - 60);
+        let x = rand(60, window.CANVAS_W - w - 60);
         let y = rand(60, CANVAS_H - h - 60);
         let obs = new Obstacle(x, y, w, h);
         let centerX = x + w/2, centerY = y + h/2;
@@ -1593,13 +2544,13 @@ function generateObstacles() {
             let minDist = Math.max(w, h) * 0.6 + player.radius + 12;
             if (dist(centerX, centerY, player.x, player.y) <= minDist) safe = false;
         } else {
-            if (dist(centerX, centerY, CANVAS_W/3, CANVAS_H/2) <= 110) safe = false;
+            if (dist(centerX, centerY, window.CANVAS_W/3, CANVAS_H/2) <= 110) safe = false;
         }
         if (!enemyDisabled && typeof enemy !== 'undefined' && enemy) {
             let minDist = Math.max(w, h) * 0.6 + enemy.radius + 12;
             if (dist(centerX, centerY, enemy.x, enemy.y) <= minDist) safe = false;
         } else {
-            if (dist(centerX, centerY, 2*CANVAS_W/3, CANVAS_H/2) <= 110) safe = false;
+            if (dist(centerX, centerY, 2*window.CANVAS_W/3, CANVAS_H/2) <= 110) safe = false;
         }
         if (!obstacles.some(o => rectsOverlap(o, obs))) {
         } else safe = false;
@@ -1620,93 +2571,11 @@ function deserializeObstacles(arr) {
     }
 }
 
-function isCircleClear(cx, cy, cr) {
-    if (cx - cr < 0 || cy - cr < 0 || cx + cr > CANVAS_W || cy + cr > CANVAS_H) return false;
-    for (let o of obstacles) {
-        if (!o) continue;
-        if (o.circleCollide(cx, cy, cr)) return false;
-    }
-    return true;
-}
 
-function findNearestClearPosition(x0, y0, cr, opts = {}) {
-    const maxRadius = opts.maxRadius || 420;
-    const step = opts.step || 12;
-    const angleStep = opts.angleStep || 0.6;
-    if (isCircleClear(x0, y0, cr)) return { x: x0, y: y0 };
-    for (let r = step; r <= maxRadius; r += step) {
-        for (let a = 0; a < Math.PI*2; a += angleStep) {
-            let nx = x0 + Math.cos(a) * r;
-            let ny = y0 + Math.sin(a) * r;
-            if (isCircleClear(nx, ny, cr)) return { x: nx, y: ny };
-        }
-    }
-    let candidates = [ {x: x0, y: 60+cr}, {x: x0, y: CANVAS_H-60-cr}, {x: 60+cr, y: y0}, {x: CANVAS_W-60-cr, y: y0}, {x: CANVAS_W/2, y: CANVAS_H/2} ];
-    for (let c of candidates) if (isCircleClear(c.x, c.y, cr)) return c;
-    return { x: x0, y: y0 };
-}
 
-function positionPlayersSafely() {
-    const MIN_SEP = 140;
-    let pStart = { x: CANVAS_W/3, y: CANVAS_H/2 };
-    let eStart = { x: 2*CANVAS_W/3, y: CANVAS_H/2 };
-    // If single-player WorldMaster mode with 2 AI, ensure blue AI (player object) spawns on left half
-    // and red AI (enemy object) spawns on right half, with good separation and away from corners.
-    const isSingleWM2AI = (() => {
-        try { return (window.localPlayerIndex === -1 && window.aiCount === 2 && !NET.connected); } catch (e) { return false; }
-    })();
-    if (isSingleWM2AI) {
-        pStart = { x: Math.max(120, CANVAS_W * 0.25), y: CANVAS_H/2 };
-        eStart = { x: Math.min(CANVAS_W - 120, CANVAS_W * 0.75), y: CANVAS_H/2 };
-    }
-    if (!player) player = new Player(true, "#65c6ff", pStart.x, pStart.y);
-    if (!enemy) enemy = new Player(false, "#ff5a5a", eStart.x, eStart.y);
-    // If enemyDisabled, mark enemy to skip AI/draw but keep object for compatibility
-    if (enemyDisabled) enemy.disabled = true; else enemy.disabled = false;
-    let pPos = findNearestClearPosition(pStart.x, pStart.y, player.radius);
-    player.x = pPos.x; player.y = pPos.y;
-    let ePos = findNearestClearPosition(eStart.x, eStart.y, enemy.radius);
-    if (!enemyDisabled && dist(ePos.x, ePos.y, player.x, player.y) < MIN_SEP) {
-        // Try to find an alternative on the same side first; if WM2AI mode, bias search away horizontally
-        let found = false;
-        const maxR = 420;
-        for (let r = 140; r <= maxR && !found; r += 40) {
-            for (let a = 0; a < Math.PI*2 && !found; a += 0.5) {
-                let nx = eStart.x + Math.cos(a) * r;
-                let ny = eStart.y + Math.sin(a) * r;
-                if (!isCircleClear(nx, ny, enemy.radius)) continue;
-                if (dist(nx, ny, player.x, player.y) >= MIN_SEP) {
-                    // If single WM 2-AI, prefer positions on the right half for enemy
-                    if (isSingleWM2AI) {
-                        if (nx < CANVAS_W * 0.5) continue;
-                    }
-                    ePos = { x: nx, y: ny };
-                    found = true; break;
-                }
-            }
-        }
-        // If still not found and in WM2AI, attempt to nudge player to left area and re-run positioning
-        if (!found && isSingleWM2AI) {
-            // attempt to find a new player position further left, then find enemy further right
-            let altP = findNearestClearPosition(Math.max(80, CANVAS_W * 0.2), CANVAS_H/2, player.radius);
-            if (altP && isCircleClear(altP.x, altP.y, player.radius)) {
-                player.x = altP.x; player.y = altP.y;
-                ePos = findNearestClearPosition(Math.min(CANVAS_W - 80, CANVAS_W * 0.8), CANVAS_H/2, enemy.radius);
-            }
-        }
-    }
-    if (NET.connected || !enemyDisabled) { enemy.x = ePos.x; enemy.y = ePos.y; }
-    // After both players exist, enforce color mapping by role
-    if (NET.connected) {
-        if (NET.role === 'host') {
-            if (player) player.color = '#65c6ff';
-            if (enemy) enemy.color = '#ff5a5a';
-        } else if (NET.role === 'joiner') {
-            if (player) player.color = '#ff5a5a';
-            if (enemy) enemy.color = '#65c6ff';
-        }
-    }
-}
+
+
+
 function rectsOverlap(a, b) {
     return !(a.x + a.w < b.x || b.x + b.w < a.x ||
              a.y + a.h < b.y || b.y + b.h < a.y);
@@ -1725,7 +2594,7 @@ function spawnDynamicObstacle() {
         tries++;
         let size = rand(OBSTACLE_MIN_SIZE, OBSTACLE_MAX_SIZE);
         let w = size, h = size;
-        let x = rand(60, CANVAS_W - w - 60);
+        let x = rand(60, window.CANVAS_W - w - 60);
         let y = rand(60, CANVAS_H - h - 60);
         let obs = new Obstacle(x, y, w, h);
         let centerX = x + w/2, centerY = y + h/2;
@@ -1798,7 +2667,7 @@ function despawnDynamicObstacle() {
                 tries++;
                 let size = rand(OBSTACLE_MIN_SIZE, OBSTACLE_MAX_SIZE);
                 let w = size, h = size;
-                let x = rand(60, CANVAS_W - w - 60);
+                let x = rand(60, window.CANVAS_W - w - 60);
                 let y = rand(60, CANVAS_H - h - 60);
                 let newObs = new Obstacle(x, y, w, h);
                 let centerX = x + w/2, centerY = y + h/2;
@@ -1843,7 +2712,8 @@ function gameLoop(ts) {
     lastTimestamp = ts;
     // Always run NET frame so networking continues while card UI is active
     try { if (NET && typeof NET.onFrame === 'function') NET.onFrame(dt); } catch (e) {}
-    if (!cardState.active) {
+    const selectionPaused = isSelectionPauseActive();
+    if (!selectionPaused) {
         update(dt);
     } else {
         // Keep WorldMaster cooldowns/UI ticking during card UI
@@ -1866,7 +2736,7 @@ function update(dt) {
     const simulateLocally = !NET.connected || NET.role === 'host';
     // Joiner: smooth positions toward latest snapshot targets and tick timers locally
     if (NET.connected && NET.role === 'joiner') {
-        const s = 16; // smoothing rate (higher = snappier)
+        const s = 25; // smoothing rate (higher = snappier)
         const t = Math.max(0, Math.min(1, s * dt));
         const tgt0 = NET.joinerTargets && NET.joinerTargets.p0;
         const tgt1 = NET.joinerTargets && NET.joinerTargets.p1;
@@ -1874,9 +2744,16 @@ function update(dt) {
             enemy.x = lerp(enemy.x, tgt0.x, t);
             enemy.y = lerp(enemy.y, tgt0.y, t);
         }
-        if (tgt1 && player && typeof player.x === 'number' && typeof player.y === 'number') {
-            player.x = lerp(player.x, tgt1.x, t);
-            player.y = lerp(player.y, tgt1.y, t);
+        // For joiner, smooth reconcile own player position when needed
+        if (player && typeof player.reconcileX === 'number' && typeof player.reconcileY === 'number') {
+            const reconcileT = Math.max(0, Math.min(1, 25 * dt)); // smoother reconciliation
+            player.x = lerp(player.x, player.reconcileX, reconcileT);
+            player.y = lerp(player.y, player.reconcileY, reconcileT);
+            const dist = Math.hypot(player.x - player.reconcileX, player.y - player.reconcileY);
+            if (dist < 1) { // close enough, clear reconcile
+                delete player.reconcileX;
+                delete player.reconcileY;
+            }
         }
         // Smoothly animate cooldown rings between snapshots
         if (player) {
@@ -1886,6 +2763,39 @@ function update(dt) {
         if (enemy) {
             if (typeof enemy.timeSinceShot === 'number') enemy.timeSinceShot += dt;
             if (typeof enemy.dashCooldown === 'number') enemy.dashCooldown = Math.max(0, enemy.dashCooldown - dt);
+        }
+        // Smooth healer positions
+        if (NET.joinerTargets && NET.joinerTargets.healers) {
+            for (const healer of healers) {
+                if (!healer || !healer.active) continue;
+                const target = NET.joinerTargets.healers.get(healer.id);
+                if (target && typeof healer.x === 'number' && typeof healer.y === 'number') {
+                    healer.x = lerp(healer.x, target.x, t);
+                    healer.y = lerp(healer.y, target.y, t);
+                }
+            }
+        }
+        // Smooth healer positions
+        if (NET.joinerTargets && NET.joinerTargets.healers) {
+            for (const healer of healers) {
+                if (!healer || !healer.active) continue;
+                const target = NET.joinerTargets.healers.get(healer.id);
+                if (target && typeof healer.x === 'number' && typeof healer.y === 'number') {
+                    healer.x = lerp(healer.x, target.x, t);
+                    healer.y = lerp(healer.y, target.y, t);
+                }
+            }
+        }
+        // Smooth healer positions
+        if (NET.joinerTargets && NET.joinerTargets.healers) {
+            for (const healer of healers) {
+                if (!healer || !healer.active) continue;
+                const target = NET.joinerTargets.healers.get(healer.id);
+                if (target && typeof healer.x === 'number' && typeof healer.y === 'number') {
+                    healer.x = lerp(healer.x, target.x, t);
+                    healer.y = lerp(healer.y, target.y, t);
+                }
+            }
         }
     }
         // --- WorldMaster cooldowns/UI ---
@@ -1916,39 +2826,149 @@ function update(dt) {
                     c.burning.time += dt;
                     if (!c.burning.nextTick) c.burning.nextTick = 0;
                     c.burning.nextTick -= dt;
-                    if (c.burning.nextTick <= 0) {
-                        // Damage chunk
-                        c.hp = (typeof c.hp === 'number') ? c.hp - 0.25 : 1.0 - 0.25;
-                        c.alpha = Math.max(0.25, Math.min(1, c.hp));
-                        c.burning.nextTick = 0.32 + Math.random()*0.18;
-                        if (c.hp <= 0) {
-                            c.destroyed = true;
-                            c.burning = null;
-                            // Relay chunk destruction to joiner
-                            try {
-                                if (NET && NET.role === 'host' && NET.connected && window.ws && window.ws.readyState === WebSocket.OPEN) {
-                                    const oi = obstacles.indexOf(o);
-                                    const ci = o.chunks.indexOf(c);
-                                    if (typeof oi === 'number' && oi >= 0 && typeof ci === 'number' && ci >= 0) {
-                                        const updates = [{ i: ci, destroyed: true, flying: !!c.flying, vx: c.vx||0, vy: c.vy||0, alpha: c.alpha||1, x: c.x, y: c.y }];
+                        if (c.burning.nextTick <= 0) {
+                            // Visual particle spawn/timer update (joiner+host)
+                            if (!Array.isArray(c.flameParticles)) c.flameParticles = [];
+                            if (c.flameParticles.length < 18 && Math.random() < 0.92) {
+                                const cx = c.x + c.w/2 + (Math.random() - 0.5) * c.w * 0.6;
+                                const cy = c.y + c.h/2 + (Math.random() - 0.5) * c.h * 0.6;
+                                c.flameParticles.push({ x: cx, y: cy, vx: (Math.random() - 0.5) * 28, vy: -30 + Math.random() * -18, life: 0.55 + Math.random() * 0.7, maxLife: 0.55 + Math.random() * 0.7, r: 2 + Math.random() * 3, hue: 18 + Math.random() * 30 });
+                            }
+                            // Advance the nextTick for visuals (both host and joiner)
+                            c.burning.nextTick = 0.44 + Math.random()*0.22;
+
+                            // Host-authoritative changes: HP, heat accumulation, ignition and destruction
+                            if (NET && NET.role !== 'joiner') {
+                                // Damage chunk (reduced for longer burn)
+                                c.hp = (typeof c.hp === 'number') ? c.hp - 0.11 : 1.0 - 0.11;
+                                c.alpha = Math.max(0.25, Math.min(1, c.hp));
+                                // Relay partial damage/alpha to joiner so partially-damaged chunks stay in sync
+                                try {
+                                    if (NET && NET.role === 'host' && NET.connected) {
+                                        const oi = obstacles.indexOf(o);
+                                        const ci = o.chunks.indexOf(c);
+                                        if (typeof oi === 'number' && oi >= 0 && typeof ci === 'number' && ci >= 0) {
+                                            const upd = { i: ci, alpha: c.alpha, x: c.x, y: c.y };
+                                            if (c.burning) upd.burning = { time: c.burning.time || 0, duration: c.burning.duration || 2.5, power: c.burning.power || 1 };
+                                            try { createSyncedChunkUpdate(oi, [upd]); } catch (e) {}
+                                        }
+                                    }
+                                } catch (e) {}
+
+                                // Gradual heat accumulation for adjacent chunks (host only)
+                                for (let o2 of obstacles) {
+                                    if (!o2 || !o2.chunks) continue;
+                                    for (let c2 of o2.chunks) {
+                                        if (!c2 || c2 === c || c2.destroyed || c2.burning) continue;
+                                        const d = dist(c.x + c.w/2, c.y + c.h/2, c2.x + c2.w/2, c2.y + c2.h/2);
+                                        const maxDist = Math.max(c.w, c.h) * 1.6;
+                                        if (d <= maxDist) {
+                                            // Accumulate heat from burning neighbor
+                                            c2.heat = (c2.heat || 0) + 0.13 * (c.burning.power || 1);
+                                            // If heat exceeds threshold, ignite
+                                            if (c2.heat > 1.0) {
+                                                const dissipation = 0.5 + Math.random() * 0.45;
+                                                const newPower = Math.max(0.18, (c.burning.power || 1) * dissipation);
+                                                const newDur = Math.max(1.2, (c.burning.duration || 2.0) * (0.7 + Math.random() * 0.7) * (0.5 + dissipation * 0.8));
+                                                c2.burning = { time: 0, duration: newDur, power: newPower, nextTick: 0 };
+                                                c2.flameParticles = c2.flameParticles || [];
+                                                c2.heat = 0;
+                                                // Emit event for joiners
+                                                try { if (NET && NET.role === 'host' && NET.connected && typeof GameEvents !== 'undefined') {
+                                                    const oi2 = obstacles.indexOf(o2);
+                                                    const ci2 = o2.chunks.indexOf(c2);
+                                                    GameEvents.emit('burning-start', { obstacleIndex: oi2, chunkIndex: ci2, duration: newDur, power: newPower });
+                                                } } catch (e) {}
+                                            }
+                                        }
                                     }
                                 }
-                            } catch (e) {}
+
+                                // If HP depleted, destroy and sync
+                                if (c.hp <= 0) {
+                                    c.destroyed = true;
+                                    c.burning = null;
+                                    // Relay chunk destruction to joiner via chunk update
+                                    try {
+                                        if (NET && NET.role === 'host' && NET.connected) {
+                                            const oi = obstacles.indexOf(o);
+                                            const ci = o.chunks.indexOf(c);
+                                            if (typeof oi === 'number' && oi >= 0 && typeof ci === 'number' && ci >= 0) {
+                                                const updates = [{ i: ci, destroyed: true, flying: !!c.flying, vx: c.vx||0, vy: c.vy||0, alpha: c.alpha||1, x: c.x, y: c.y }];
+                                                try { createSyncedChunkUpdate(oi, updates); } catch (e) {}
+                                            }
+                                        }
+                                    } catch (e) {}
+                                }
+                            }
+                        }
+                    if (c.burning && c.burning.time > c.burning.duration) {
+                        // Only the host clears burning and emits stop — joiner waits for authoritative event
+                        if (NET && NET.role !== 'joiner') {
+                            c.burning = null;
+                            try { if (NET && NET.role === 'host' && NET.connected) {
+                                const oi = obstacles.indexOf(o);
+                                const ci = o.chunks.indexOf(c);
+                                if (typeof oi === 'number' && oi >= 0 && typeof ci === 'number' && ci >= 0) {
+                                    GameEvents.emit('burning-stop', { obstacleIndex: oi, chunkIndex: ci });
+                                }
+                            } } catch (e) {}
                         }
                     }
-                    if (c.burning && c.burning.time > c.burning.duration) {
-                        c.burning = null;
-                        try { if (NET && NET.role === 'host' && NET.connected) {
-                            const oi = obstacles.indexOf(o);
-                            const ci = o.chunks.indexOf(c);
-                            if (typeof oi === 'number' && oi >= 0 && typeof ci === 'number' && ci >= 0) {
-                                GameEvents.emit('burning-stop', { obstacleIndex: oi, chunkIndex: ci });
-                            }
-                        } } catch (e) {}
+                    // Update any chunk flame particles
+                    if (Array.isArray(c.flameParticles) && c.flameParticles.length) {
+                        for (let fp of c.flameParticles) {
+                            fp.x += fp.vx * dt;
+                            fp.y += fp.vy * dt;
+                            fp.vy += 80 * dt;
+                            fp.life -= dt;
+                        }
+                        c.flameParticles = c.flameParticles.filter(p => p.life > 0);
                     }
                 }
             }
             if (chunkChecks > MAX_CHUNK_CHECKS_PER_FRAME) break;
+        }
+    }
+
+    // --- Infested-chunk burning spread (host only) ---
+    if (NET && NET.role !== 'joiner' && Array.isArray(infestedChunks) && infestedChunks.length) {
+        // limit checks to avoid heavy CPU
+        let spreadChecks = 0;
+        const MAX_SPREAD_CHECKS = 1200;
+        for (let i = 0; i < infestedChunks.length; ++i) {
+            const ic = infestedChunks[i];
+            if (!ic || !ic.active || !ic.burning) continue;
+            // Only attempt spread after a short burn time so it feels natural
+            if (ic.burning.time < 0.4) continue;
+            // iterate other infested chunks nearby
+            for (let j = 0; j < infestedChunks.length; ++j) {
+                if (i === j) continue;
+                spreadChecks++;
+                if (spreadChecks > MAX_SPREAD_CHECKS) break;
+                const ic2 = infestedChunks[j];
+                if (!ic2 || !ic2.active || ic2.burning) continue;
+                const d = dist(ic.x + ic.w/2, ic.y + ic.h/2, ic2.x + ic2.w/2, ic2.y + ic2.h/2);
+                const maxDist = Math.max(ic.w, ic.h) * 1.6;
+                if (d <= maxDist) {
+                    // chance to ignite depends on source power and distance; bias slightly with randomness
+                    const sourcePower = (ic.burning && ic.burning.power) ? ic.burning.power : 1;
+                    const prob = Math.min(0.6, 0.12 * sourcePower + 0.04 * Math.random());
+                    if (Math.random() < prob) {
+                        // per-target randomized dissipation multiplier so some chains burn stronger
+                        const dissipation = 0.5 + Math.random() * 0.45; // 0.5 .. 0.95
+                        const newPower = Math.max(0.18, sourcePower * dissipation);
+                        const newDur = Math.max(0.9, (ic.burning.duration || 2.0) * (0.6 + Math.random() * 0.7) * (0.5 + dissipation * 0.8));
+                        ic2.burning = { time: 0, duration: newDur, power: newPower, nextTick: 0 };
+                        // relay to joiner for visuals
+                        try { if (NET && NET.role === 'host' && NET.connected && typeof GameEvents !== 'undefined') {
+                            // find if this infested chunk maps to an obstacle chunk index (best-effort)
+                            GameEvents.emit('burning-start', { infestedId: ic2.id, duration: newDur, power: newPower });
+                        } } catch (e) {}
+                    }
+                }
+            }
+            if (spreadChecks > MAX_SPREAD_CHECKS) break;
         }
     }
     // --- Firestorm World Modifier Logic ---
@@ -1957,20 +2977,34 @@ function update(dt) {
     if (NET.role !== 'joiner' && firestormActive && !wmControllingFirestorm) {
         firestormTimer += dt;
         if (!firestormInstance && firestormTimer >= firestormNextTime) {
-            // Spawn a new firestorm (host creates and relays)
-            firestormTimer = 0;
-            firestormNextTime = 10 + Math.random() * 20;
-            let fx = rand(120, CANVAS_W - 120);
-            let fy = rand(90, CANVAS_H - 90);
-            // Increase firestorm size range (was 110-180)
-            let fradius = rand(140, 260);
-            firestormInstance = new Firestorm(fx, fy, fradius);
-            // Relay to joiner
-            try {
-                if (NET && NET.role === 'host' && NET.connected) {
-                    GameEvents.emit('firestorm-spawn', { x: fx, y: fy, radius: fradius });
-                }
-            } catch (e) {}
+            // Start pre-spawn warning if not already started
+            if (!firestormPreSpawnPos) {
+                let fx = rand(120, window.CANVAS_W - 120);
+                let fy = rand(90, CANVAS_H - 90);
+                firestormPreSpawnPos = { x: fx, y: fy, radius: rand(140, 260) };
+                firestormPreSpawnTimer = 0;
+                    try {
+                        if (NET && NET.role === 'host' && NET.connected) {
+                            GameEvents.emit('firestorm-pre-spawn', { x: fx, y: fy, radius: firestormPreSpawnPos.radius, delay: firestormPreSpawnDelay, timer: firestormPreSpawnTimer });
+                        }
+                    } catch (e) {}
+            }
+            
+            firestormPreSpawnTimer += dt;
+            if (firestormPreSpawnTimer >= firestormPreSpawnDelay) {
+                // Spawn the actual firestorm at pre-spawn position
+                firestormTimer = 0;
+                firestormNextTime = 10 + Math.random() * 20;
+                firestormInstance = new Firestorm(firestormPreSpawnPos.x, firestormPreSpawnPos.y, firestormPreSpawnPos.radius);
+                // Relay to joiner
+                try {
+                    if (NET && NET.role === 'host' && NET.connected) {
+                        GameEvents.emit('firestorm-spawn', { x: firestormPreSpawnPos.x, y: firestormPreSpawnPos.y, radius: firestormPreSpawnPos.radius });
+                    }
+                } catch (e) {}
+                firestormPreSpawnPos = null;
+                firestormPreSpawnTimer = 0;
+            }
         }
         // Host will still handle lifecycle and relay removal when done
         if (firestormInstance && NET && NET.role === 'host') {
@@ -1982,6 +3016,37 @@ function update(dt) {
                 } catch (e) {}
                 firestormInstance = null;
             }
+        }
+    } else if (NET.role !== 'joiner' && firestormPreSpawnPos && !firestormActive) {
+        // Clear pre-spawn only if firestorm becomes inactive (not when WM is controlling)
+        firestormPreSpawnPos = null;
+        firestormPreSpawnTimer = 0;
+    }
+    
+    // Manage persistent firestorm burning sound
+    if (firestormInstance && !wasFirestormInstance) {
+        startFirestormBurning();
+    } else if (!firestormInstance && wasFirestormInstance) {
+        stopFirestormBurning();
+    }
+    wasFirestormInstance = firestormInstance;
+    
+    // Handle WorldMaster-triggered firestorm pre-spawns (runs independently of wmControllingFirestorm)
+    if (NET.role !== 'joiner' && firestormPreSpawnPos && !firestormInstance) {
+        firestormPreSpawnTimer += dt;
+        if (firestormPreSpawnTimer >= firestormPreSpawnDelay) {
+            // Spawn the actual firestorm at pre-spawn position
+            firestormInstance = new Firestorm(firestormPreSpawnPos.x, firestormPreSpawnPos.y, firestormPreSpawnPos.radius);
+            firestormActive = true;
+            playBurning(5.0); // Play burning sound for firestorm
+            // Relay to joiner
+            try {
+                if (NET && NET.role === 'host' && NET.connected) {
+                    GameEvents.emit('firestorm-spawn', { x: firestormPreSpawnPos.x, y: firestormPreSpawnPos.y, radius: firestormPreSpawnPos.radius });
+                }
+            } catch (e) {}
+            firestormPreSpawnPos = null;
+            firestormPreSpawnTimer = 0;
         }
     }
 
@@ -2010,15 +3075,32 @@ function update(dt) {
                     }
                 }
             }
+            
             if (availableChunks.length > 0) {
-                let target = availableChunks[Math.floor(Math.random() * availableChunks.length)];
-                let infestedChunk = new InfestedChunk(target.chunk, target.obstacle);
-                infestedChunks.push(infestedChunk);
-                // Relay to joiner
+                // Enforce maximum active infested chunks
+                let target = null;
+                let spawnedInf = null;
                 try {
-                    if (NET && NET.role === 'host' && NET.connected && window.ws && window.ws.readyState === WebSocket.OPEN) {
+                    const activeCount = (infestedChunks || []).filter(ic => ic && ic.active).length;
+                    if (activeCount < 10) {
+                        target = availableChunks[Math.floor(Math.random() * availableChunks.length)];
+                        spawnedInf = new InfestedChunk(target.chunk, target.obstacle);
+                        infestedChunks.push(spawnedInf);
+                    }
+                } catch (e) {
+                    // fallback: spawn if error
+                    target = availableChunks[Math.floor(Math.random() * availableChunks.length)];
+                    try {
+                        spawnedInf = new InfestedChunk(target.chunk, target.obstacle);
+                        infestedChunks.push(spawnedInf);
+                    } catch (e2) {}
+                }
+                // Relay to joiner (only if we spawned)
+                try {
+                    if (spawnedInf && NET && NET.role === 'host' && NET.connected && window.ws && window.ws.readyState === WebSocket.OPEN) {
                         let oi = obstacles.indexOf(target.obstacle);
                         let ci = target.obstacle.chunks.indexOf(target.chunk);
+                        try { GameEvents.emit('infestation-spawn', { obstacleIndex: oi, chunkIndex: ci, id: spawnedInf.id, x: spawnedInf.x, y: spawnedInf.y, w: spawnedInf.w, h: spawnedInf.h, hp: spawnedInf.hp }); } catch (e) {}
                     }
                 } catch (e) {}
             }
@@ -2131,165 +3213,196 @@ function update(dt) {
                 }
             }
             let dashSet = getDashSettings(player);
-            player.dashActive = true;
-            player.dashDir = dashVec;
-            player.dashTime = dashSet.duration;
-            player.dashCooldown = dashSet.cooldown;
-            // Initialize per-dash deflect allowance
-            player.deflectRemaining = (player.deflectStacks || 0);
-            // mark next shot as big if player has stacks
-            if ((player.bigShotStacks||0) > 0) player.bigShotPending = true;
-            // play dash woosh (scale by duration and speed multiplier)
-            try { playDashWoosh(player.dashTime, dashSet.speedMult); } catch (e) {}
+            beginDash(player, dashVec, dashSet);
         }
         if (player.dashActive) {
             let dashSet = getDashSettings(player);
-            let dashVx = player.dashDir.x * player.speed * dashSet.speedMult;
-            let dashVy = player.dashDir.y * player.speed * dashSet.speedMult;
-            let oldX = player.x, oldY = player.y;
-            player.x += dashVx * dt;
-            player.y += dashVy * dt;
-            player.x = clamp(player.x, player.radius, CANVAS_W-player.radius);
-            player.y = clamp(player.y, player.radius, CANVAS_H-player.radius);
-            let collided = false;
-            // First: check collision with the enemy (characters) so ramming hits players/enemies directly in open space
-            if (!enemyDisabled && player.ram && dist(player.x, player.y, enemy.x, enemy.y) < player.radius + enemy.radius) {
-                let dmg = 18 + (player.ramStacks || 0) * 6; // damage scales per ram stack
-                enemy._lastAttacker = player;
-                enemy.takeDamage(dmg);
-                enemy._lastAttacker = null;
-                // revert position and mark collision so dash ends (mirror obstacle behavior)
-                player.x = oldX; player.y = oldY;
-                collided = true;
-            }
-            // Also check collision with infested chunks (they behave like destructible enemies)
-            if (!collided && player.ram && (player.obliterator || (player.obliteratorStacks || 0) > 0) && infestedChunks && infestedChunks.length) {
-                for (let ic of infestedChunks) {
-                    if (!ic.active) continue;
-                    let centerX = ic.x + ic.w/2, centerY = ic.y + ic.h/2;
-                    let thresh = Math.max(ic.w, ic.h) * 0.5 + player.radius;
-                    if (dist(player.x, player.y, centerX, centerY) < thresh) {
+            if (isTeledashEnabled(player)) {
+                const blockers = { obstacles, others: enemyDisabled ? [] : [enemy] };
+                const aimProvider = () => ({ x: mouse.x, y: mouse.y });
+                updateTeledashWarmup(player, dt, dashSet, aimProvider, blockers);
+            } else {
+                let dashVx = player.dashDir.x * player.speed * dashSet.speedMult;
+                let dashVy = player.dashDir.y * player.speed * dashSet.speedMult;
+                let oldX = player.x, oldY = player.y;
+                player.x += dashVx * dt;
+                player.y += dashVy * dt;
+                player.x = clamp(player.x, player.radius, window.CANVAS_W-player.radius);
+                player.y = clamp(player.y, player.radius, CANVAS_H-player.radius);
+                let collided = false;
+                // First: check collision with the enemy (characters) so ramming hits players/enemies directly in open space
+                if (!enemyDisabled && player.ram && dist(player.x, player.y, enemy.x, enemy.y) < player.radius + enemy.radius) {
+                    let dmg = 18 + (player.ramStacks || 0) * 6; // damage scales per ram stack
+                    enemy._lastAttacker = player;
+                    enemy.takeDamage(dmg);
+                    enemy._lastAttacker = null;
+                    // Knockback logic: shove enemy in dash direction, scaling with ram stacks, but stop at obstacles
+                    if (player.dashDir) {
                         let ramStacks = player.ramStacks || 0;
-                        let oblStacks = player.obliteratorStacks || 0;
-                        let radiusMul = 1 + 0.22 * ramStacks;
-                        let powerMul = 1 + 0.45 * oblStacks;
-                        let basePower = 1.6 * (1 + 0.4 * ramStacks);
-                        // chip the infested chunk (uses hp and explosion FX)
-                        ic.chipAt(player.x, player.y, player.radius * 1.6 * radiusMul, basePower * powerMul, player.obliterator, false);
-                        player.x = oldX; player.y = oldY;
-                        collided = true;
-                        break;
+                        let knockbackDist = 60 + ramStacks * 40; // base 60px, +40px per stack
+                        let steps = Math.ceil(knockbackDist / 8); // move in 8px increments
+                        let stepX = player.dashDir.x * (knockbackDist / steps);
+                        let stepY = player.dashDir.y * (knockbackDist / steps);
+                        for (let i = 0; i < steps; ++i) {
+                            let nextX = enemy.x + stepX;
+                            let nextY = enemy.y + stepY;
+                            // Check collision with obstacles
+                            let collides = false;
+                            for (let o of obstacles) {
+                                if (o.circleCollide(nextX, nextY, enemy.radius)) {
+                                    collides = true;
+                                    break;
+                                }
+                            }
+                            if (collides) break;
+                            enemy.x = nextX;
+                            enemy.y = nextY;
+                        }
+                        // Clamp enemy position to arena bounds
+                        enemy.x = clamp(enemy.x, enemy.radius, window.CANVAS_W - enemy.radius);
+                        enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H - enemy.radius);
                     }
+                    // revert position and mark collision so dash ends (mirror obstacle behavior)
+                    player.x = oldX; player.y = oldY;
+                    collided = true;
                 }
-            }
-            // If no character collision, check collision with obstacles and apply ram/obliterator effects
-            if (!collided) {
-                for (let o of obstacles) {
-                    if (o.circleCollide(player.x, player.y, player.radius)) {
-                        // If player has ramming, deal damage to obstacle chunks at impact
-                        if (player.ram && (player.obliterator || (player.obliteratorStacks || 0) > 0)) {
-                            // Compute collision point and chip only if player has obliterator
-                            let cx = player.x, cy = player.y;
+                // Also check collision with infested chunks (they behave like destructible enemies)
+                if (!collided && player.ram && (player.obliterator || (player.obliteratorStacks || 0) > 0) && infestedChunks && infestedChunks.length) {
+                    for (let ic of infestedChunks) {
+                        if (!ic.active) continue;
+                        let centerX = ic.x + ic.w/2, centerY = ic.y + ic.h/2;
+                        let thresh = Math.max(ic.w, ic.h) * 0.5 + player.radius;
+                        if (dist(player.x, player.y, centerX, centerY) < thresh) {
                             let ramStacks = player.ramStacks || 0;
                             let oblStacks = player.obliteratorStacks || 0;
-                            let radiusMul = 1 + 0.22 * ramStacks;
-                            let powerMul = 1 + 0.45 * oblStacks;
-                            // base power moderately tuned for dash
+                            let radiusMul = 1 + 0.22 * ramStacks; // ram radius scaling kept as-is
+                            // Increased obliterator power scaling: stronger per-stack effect
+                            let powerMul = 1 + 0.75 * oblStacks;
                             let basePower = 1.6 * (1 + 0.4 * ramStacks);
-                            o.chipChunksAt(cx, cy, player.radius * 1.6 * radiusMul, basePower * powerMul, player.obliterator, false);
+                            // chip the infested chunk (uses hp and explosion FX)
+                            ic.chipAt(player.x, player.y, player.radius * 1.6 * radiusMul, basePower * powerMul, player.obliterator, false, 0);
+                            player.x = oldX; player.y = oldY;
+                            collided = true;
+                            break;
                         }
-                        player.x = oldX;
-                        player.y = oldY;
-                        collided = true;
-                        break;
                     }
                 }
-            }
-            player.dashTime -= dt;
-            if (player.dashTime <= 0 || collided) {
-                player.dashActive = false;
+                // If no character collision, check collision with obstacles and apply ram/obliterator effects
+                if (!collided) {
+                    for (let o of obstacles) {
+                        if (o.circleCollide(player.x, player.y, player.radius)) {
+                            // If player has ramming, deal damage to obstacle chunks at impact
+                            if (player.ram && (player.obliterator || (player.obliteratorStacks || 0) > 0)) {
+                                // Compute collision point and chip only if player has obliterator
+                                let cx = player.x, cy = player.y;
+                                let ramStacks = player.ramStacks || 0;
+                                let oblStacks = player.obliteratorStacks || 0;
+                                let radiusMul = 1 + 0.22 * ramStacks; // keep ram-based radius unchanged
+                                let powerMul = 1 + 0.75 * oblStacks;
+                                // base power moderately tuned for dash
+                                let basePower = 1.6 * (1 + 0.4 * ramStacks);
+                                // Do NOT apply fire shot effect when ramming
+                                o.chipChunksAt(cx, cy, player.radius * 1.6 * radiusMul, basePower * powerMul, player.obliterator, false, 0);
+                            }
+                            player.x = oldX;
+                            player.y = oldY;
+                            collided = true;
+                            break;
+                        }
+                    }
+                }
+                player.dashTime -= dt;
+                if (player.dashTime <= 0 || collided) {
+                    player.dashActive = false;
+                }
             }
         } else {
             player.dashCooldown = Math.max(0, player.dashCooldown - dt);
         }
     }
+    // Joiner clients should locally tick their own teledash warmup visuals so they
+    // can see the range ring even though the host is authoritative for teleport.
+    try {
+        if (NET && NET.role === 'joiner') {
+            // Advance local warmup timers for the joiner's own player object
+            tickLocalTeledashWarmup(player, dt);
+        }
+    } catch (e) {}
     if (simulateLocally && !enemyDisabled && enemy.dash && !NET.connected) {
         if (!enemy.dashActive && Math.random() < 0.003 && enemy.dashCooldown <= 0) {
             let dx = enemy.x - player.x, dy = enemy.y - player.y;
             let norm = Math.hypot(dx, dy);
             let dir = norm > 0 ? { x: dx/norm, y: dy/norm } : { x: 1, y: 0 };
             let dashSet = getDashSettings(enemy);
-            enemy.dashActive = true;
-            enemy.dashDir = dir;
-            enemy.dashTime = dashSet.duration;
-            enemy.dashCooldown = dashSet.cooldown;
-            // Initialize enemy deflect allowance for this dash
-            enemy.deflectRemaining = (enemy.deflectStacks || 0);
-            if ((enemy.bigShotStacks||0) > 0) enemy.bigShotPending = true;
-            // play dash woosh for enemy
-            try { playDashWoosh(enemy.dashTime, dashSet.speedMult); } catch (e) {}
+            beginDash(enemy, dir, dashSet, { lockedAim: { x: player.x, y: player.y } });
         }
         if (enemy.dashActive) {
             let dashSet = getDashSettings(enemy);
-            let dashVx = enemy.dashDir.x * enemy.speed * dashSet.speedMult;
-            let dashVy = enemy.dashDir.y * enemy.speed * dashSet.speedMult;
-            let oldx = enemy.x, oldy = enemy.y;
-            enemy.x += dashVx * dt;
-            enemy.y += dashVy * dt;
-            enemy.x = clamp(enemy.x, enemy.radius, CANVAS_W-enemy.radius);
-            enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H-enemy.radius);
-            let collided = false;
-            // First: check collision with player directly so enemy dash damages player in open space
-            if (enemy.ram && dist(enemy.x, enemy.y, player.x, player.y) < enemy.radius + player.radius) {
-                let dmg = 18 + (enemy.ramStacks || 0) * 6;
-                player._lastAttacker = enemy;
-                player.takeDamage(dmg);
-                player._lastAttacker = null;
-                enemy.x = oldx; enemy.y = oldy;
-                collided = true;
-            }
-            // Also check collision with infested chunks
-            if (!collided && enemy.ram && (enemy.obliterator || (enemy.obliteratorStacks || 0) > 0) && infestedChunks && infestedChunks.length) {
-                for (let ic of infestedChunks) {
-                    if (!ic.active) continue;
-                    let centerX = ic.x + ic.w/2, centerY = ic.y + ic.h/2;
-                    let thresh = Math.max(ic.w, ic.h) * 0.5 + enemy.radius;
-                    if (dist(enemy.x, enemy.y, centerX, centerY) < thresh) {
-                        let ramStacks = enemy.ramStacks || 0;
-                        let oblStacks = enemy.obliteratorStacks || 0;
-                        let radiusMul = 1 + 0.22 * ramStacks;
-                        let powerMul = 1 + 0.45 * oblStacks;
-                        let basePower = 1.6 * (1 + 0.4 * ramStacks);
-                        ic.chipAt(enemy.x, enemy.y, enemy.radius * 1.6 * radiusMul, basePower * powerMul, enemy.obliterator, false);
-                        enemy.x = oldx; enemy.y = oldy;
-                        collided = true;
-                        break;
-                    }
+            if (isTeledashEnabled(enemy)) {
+                const blockers = { obstacles, others: [player] };
+                const aimProvider = () => ({ x: player.x, y: player.y });
+                updateTeledashWarmup(enemy, dt, dashSet, aimProvider, blockers);
+            } else {
+                let dashVx = enemy.dashDir.x * enemy.speed * dashSet.speedMult;
+                let dashVy = enemy.dashDir.y * enemy.speed * dashSet.speedMult;
+                let oldx = enemy.x, oldy = enemy.y;
+                enemy.x += dashVx * dt;
+                enemy.y += dashVy * dt;
+                enemy.x = clamp(enemy.x, enemy.radius, window.CANVAS_W-enemy.radius);
+                enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H-enemy.radius);
+                let collided = false;
+                // First: check collision with player directly so enemy dash damages player in open space
+                if (enemy.ram && dist(enemy.x, enemy.y, player.x, player.y) < enemy.radius + player.radius) {
+                    let dmg = 18 + (enemy.ramStacks || 0) * 6;
+                    player._lastAttacker = enemy;
+                    player.takeDamage(dmg);
+                    player._lastAttacker = null;
+                    enemy.x = oldx; enemy.y = oldy;
+                    collided = true;
                 }
-            }
-            // If no character collision, check collision with obstacles
-            if (!collided) {
-                for(let o of obstacles) {
-                    if(o.circleCollide(enemy.x, enemy.y, enemy.radius)) {
-                        // Enemy ramming into obstacles
-                        if (enemy.ram && (enemy.obliterator || (enemy.obliteratorStacks || 0) > 0)) {
-                            let cx = enemy.x, cy = enemy.y;
+                // Also check collision with infested chunks
+                if (!collided && enemy.ram && (enemy.obliterator || (enemy.obliteratorStacks || 0) > 0) && infestedChunks && infestedChunks.length) {
+                    for (let ic of infestedChunks) {
+                        if (!ic.active) continue;
+                        let centerX = ic.x + ic.w/2, centerY = ic.y + ic.h/2;
+                        let thresh = Math.max(ic.w, ic.h) * 0.5 + enemy.radius;
+                        if (dist(enemy.x, enemy.y, centerX, centerY) < thresh) {
                             let ramStacks = enemy.ramStacks || 0;
                             let oblStacks = enemy.obliteratorStacks || 0;
                             let radiusMul = 1 + 0.22 * ramStacks;
                             let powerMul = 1 + 0.45 * oblStacks;
                             let basePower = 1.6 * (1 + 0.4 * ramStacks);
-                            o.chipChunksAt(cx, cy, enemy.radius * 1.6 * radiusMul, basePower * powerMul, enemy.obliterator, false);
+                            ic.chipAt(enemy.x, enemy.y, enemy.radius * 1.6 * radiusMul, basePower * powerMul, enemy.obliterator, false, (enemy.fireshotStacks || 0));
+                            enemy.x = oldx; enemy.y = oldy;
+                            collided = true;
+                            break;
                         }
-                        enemy.x = oldx; enemy.y = oldy;
-                        collided = true;
-                        break;
                     }
                 }
-            }
-            enemy.dashTime -= dt;
-            if (enemy.dashTime <= 0 || collided) {
-                enemy.dashActive = false;
+                // If no character collision, check collision with obstacles
+                if (!collided) {
+                    for(let o of obstacles) {
+                        if(o.circleCollide(enemy.x, enemy.y, enemy.radius)) {
+                            // Enemy ramming into obstacles
+                            if (enemy.ram && (enemy.obliterator || (enemy.obliteratorStacks || 0) > 0)) {
+                                let cx = enemy.x, cy = enemy.y;
+                                let ramStacks = enemy.ramStacks || 0;
+                                let oblStacks = enemy.obliteratorStacks || 0;
+                                let radiusMul = 1 + 0.22 * ramStacks;
+                                let powerMul = 1 + 0.75 * oblStacks;
+                                let basePower = 1.6 * (1 + 0.4 * ramStacks);
+                                o.chipChunksAt(cx, cy, enemy.radius * 1.6 * radiusMul, basePower * powerMul, enemy.obliterator, false, (enemy.fireshotStacks || 0));
+                            }
+                            enemy.x = oldx; enemy.y = oldy;
+                            collided = true;
+                            break;
+                        }
+                    }
+                }
+                enemy.dashTime -= dt;
+                if (enemy.dashTime <= 0 || collided) {
+                    enemy.dashActive = false;
+                }
             }
         } else {
             enemy.dashCooldown = Math.max(0, enemy.dashCooldown - dt);
@@ -2306,7 +3419,7 @@ function update(dt) {
             let speed = player.speed;
             let oldX = player.x;
             player.x += input.x * speed * dt;
-            player.x = clamp(player.x, player.radius, CANVAS_W-player.radius);
+            player.x = clamp(player.x, player.radius, window.CANVAS_W-player.radius);
             let collidedX = false;
             for (let o of obstacles) {
                 if (o.circleCollide(player.x, player.y, player.radius)) {
@@ -2341,7 +3454,7 @@ function update(dt) {
                 let oldx = enemy.x, oldy = enemy.y;
                 enemy.x += vx * speed * dt;
                 enemy.y += vy * speed * dt;
-                enemy.x = clamp(enemy.x, enemy.radius, CANVAS_W-enemy.radius);
+                enemy.x = clamp(enemy.x, enemy.radius, window.CANVAS_W-enemy.radius);
                 enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H-enemy.radius);
                 for(let o of obstacles) {
                     if(o.circleCollide(enemy.x, enemy.y, enemy.radius)) { enemy.x = oldx; enemy.y = oldy; }
@@ -2351,64 +3464,99 @@ function update(dt) {
         // If enemy is currently dashing, move and resolve collisions (host authoritative)
         if (enemy.dashActive) {
             let dashSet = getDashSettings(enemy);
-            let dashVx = enemy.dashDir.x * enemy.speed * dashSet.speedMult;
-            let dashVy = enemy.dashDir.y * enemy.speed * dashSet.speedMult;
-            let oldx = enemy.x, oldy = enemy.y;
-            enemy.x += dashVx * dt;
-            enemy.y += dashVy * dt;
-            enemy.x = clamp(enemy.x, enemy.radius, CANVAS_W-enemy.radius);
-            enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H-enemy.radius);
-            let collided = false;
-            // Collision with player (ram)
-            if (enemy.ram && dist(enemy.x, enemy.y, player.x, player.y) < enemy.radius + player.radius) {
-                let dmg = 18 + (enemy.ramStacks || 0) * 6;
-                player._lastAttacker = enemy;
-                player.takeDamage(dmg);
-                player._lastAttacker = null;
-                enemy.x = oldx; enemy.y = oldy;
-                collided = true;
-            }
-            // Collision with infested chunks (ram/obliterator effects)
-            if (!collided && enemy.ram && (enemy.obliterator || (enemy.obliteratorStacks || 0) > 0) && infestedChunks && infestedChunks.length) {
-                for (let ic of infestedChunks) {
-                    if (!ic.active) continue;
-                    let centerX = ic.x + ic.w/2, centerY = ic.y + ic.h/2;
-                    let thresh = Math.max(ic.w, ic.h) * 0.5 + enemy.radius;
-                    if (dist(enemy.x, enemy.y, centerX, centerY) < thresh) {
-                        let ramStacks = enemy.ramStacks || 0;
-                        let oblStacks = enemy.obliteratorStacks || 0;
-                        let radiusMul = 1 + 0.22 * ramStacks;
-                        let powerMul = 1 + 0.45 * oblStacks;
-                        let basePower = 1.6 * (1 + 0.4 * ramStacks);
-                        ic.chipAt(enemy.x, enemy.y, enemy.radius * 1.6 * radiusMul, basePower * powerMul, enemy.obliterator, false);
-                        enemy.x = oldx; enemy.y = oldy;
-                        collided = true;
-                        break;
+            if (isTeledashEnabled(enemy)) {
+                const blockers = { obstacles, others: [player] };
+                const aimProvider = () => ({
+                    x: (NET.remoteInput && typeof NET.remoteInput.aimX === 'number') ? NET.remoteInput.aimX : player.x,
+                    y: (NET.remoteInput && typeof NET.remoteInput.aimY === 'number') ? NET.remoteInput.aimY : player.y
+                });
+                updateTeledashWarmup(enemy, dt, dashSet, aimProvider, blockers);
+            } else {
+                let dashVx = enemy.dashDir.x * enemy.speed * dashSet.speedMult;
+                let dashVy = enemy.dashDir.y * enemy.speed * dashSet.speedMult;
+                let oldx = enemy.x, oldy = enemy.y;
+                enemy.x += dashVx * dt;
+                enemy.y += dashVy * dt;
+                enemy.x = clamp(enemy.x, enemy.radius, window.CANVAS_W-enemy.radius);
+                enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H-enemy.radius);
+                let collided = false;
+                // Collision with player (ram) - apply damage + knockback similar to player-side ram
+                if (enemy.ram && dist(enemy.x, enemy.y, player.x, player.y) < enemy.radius + player.radius) {
+                    let dmg = 18 + (enemy.ramStacks || 0) * 6;
+                    player._lastAttacker = enemy;
+                    player.takeDamage(dmg);
+                    player._lastAttacker = null;
+                    // Knockback logic: shove player in enemy dash direction, scaling with ram stacks, but stop at obstacles
+                    let dirX = enemy.dashDir ? enemy.dashDir.x : (player.x - enemy.x);
+                    let dirY = enemy.dashDir ? enemy.dashDir.y : (player.y - enemy.y);
+                    let norm = Math.hypot(dirX, dirY) || 1;
+                    dirX /= norm; dirY /= norm;
+                    let ramStacks = enemy.ramStacks || 0;
+                    let knockbackDist = 60 + ramStacks * 40; // base 60px, +40px per stack
+                    let steps = Math.ceil(knockbackDist / 8);
+                    let stepX = dirX * (knockbackDist / steps);
+                    let stepY = dirY * (knockbackDist / steps);
+                    for (let i = 0; i < steps; ++i) {
+                        let nextX = player.x + stepX;
+                        let nextY = player.y + stepY;
+                        // Check collision with obstacles for the player
+                        let collides = false;
+                        for (let o of obstacles) {
+                            if (o.circleCollide(nextX, nextY, player.radius)) { collides = true; break; }
+                        }
+                        if (collides) break;
+                        player.x = nextX;
+                        player.y = nextY;
                     }
+                    // Clamp player position to arena bounds
+                    player.x = clamp(player.x, player.radius, window.CANVAS_W - player.radius);
+                    player.y = clamp(player.y, player.radius, CANVAS_H - player.radius);
+                    // Revert enemy position and mark collision so dash ends
+                    enemy.x = oldx; enemy.y = oldy;
+                    collided = true;
                 }
-            }
-            // Collision with obstacles
-            if (!collided) {
-                for (let o of obstacles) {
-                    if (o.circleCollide(enemy.x, enemy.y, enemy.radius)) {
-                        if (enemy.ram && (enemy.obliterator || (enemy.obliteratorStacks || 0) > 0)) {
-                            let cx = enemy.x, cy = enemy.y;
+                // Collision with infested chunks (ram/obliterator effects)
+                if (!collided && enemy.ram && (enemy.obliterator || (enemy.obliteratorStacks || 0) > 0) && infestedChunks && infestedChunks.length) {
+                    for (let ic of infestedChunks) {
+                        if (!ic.active) continue;
+                        let centerX = ic.x + ic.w/2, centerY = ic.y + ic.h/2;
+                        let thresh = Math.max(ic.w, ic.h) * 0.5 + enemy.radius;
+                        if (dist(enemy.x, enemy.y, centerX, centerY) < thresh) {
                             let ramStacks = enemy.ramStacks || 0;
                             let oblStacks = enemy.obliteratorStacks || 0;
                             let radiusMul = 1 + 0.22 * ramStacks;
                             let powerMul = 1 + 0.45 * oblStacks;
                             let basePower = 1.6 * (1 + 0.4 * ramStacks);
-                            o.chipChunksAt(cx, cy, enemy.radius * 1.6 * radiusMul, basePower * powerMul, enemy.obliterator, false);
+                            ic.chipAt(enemy.x, enemy.y, enemy.radius * 1.6 * radiusMul, basePower * powerMul, enemy.obliterator, false);
+                            enemy.x = oldx; enemy.y = oldy;
+                            collided = true;
+                            break;
                         }
-                        enemy.x = oldx; enemy.y = oldy;
-                        collided = true;
-                        break;
                     }
                 }
-            }
-            enemy.dashTime -= dt;
-            if (enemy.dashTime <= 0 || collided) {
-                enemy.dashActive = false;
+                // Collision with obstacles
+                if (!collided) {
+                    for (let o of obstacles) {
+                        if (o.circleCollide(enemy.x, enemy.y, enemy.radius)) {
+                            if (enemy.ram && (enemy.obliterator || (enemy.obliteratorStacks || 0) > 0)) {
+                                let cx = enemy.x, cy = enemy.y;
+                                let ramStacks = enemy.ramStacks || 0;
+                                let oblStacks = enemy.obliteratorStacks || 0;
+                                let radiusMul = 1 + 0.22 * ramStacks;
+                                let powerMul = 1 + 0.75 * oblStacks;
+                                let basePower = 1.6 * (1 + 0.4 * ramStacks);
+                                o.chipChunksAt(cx, cy, enemy.radius * 1.6 * radiusMul, basePower * powerMul, enemy.obliterator, false);
+                            }
+                            enemy.x = oldx; enemy.y = oldy;
+                            collided = true;
+                            break;
+                        }
+                    }
+                }
+                enemy.dashTime -= dt;
+                if (enemy.dashTime <= 0 || collided) {
+                    enemy.dashActive = false;
+                }
             }
         } else {
             // Cooldown ticks when not dashing
@@ -2416,34 +3564,52 @@ function update(dt) {
         }
         // Remote dash intent processed once per input sequence to avoid double-firing when cooldown finishes
         if (NET.remoteDashReqSeq && NET.remoteDashReqSeq > NET.lastProcessedRemoteDashSeq && enemy.dash && !enemy.dashActive && enemy.dashCooldown <= 0) {
-            // trigger dash in the same way as AI, using direction toward aim
-            let dx = (ri.aimX||player.x) - enemy.x;
-            let dy = (ri.aimY||player.y) - enemy.y;
-            let norm = Math.hypot(dx, dy) || 1;
-            let dir = { x: dx/norm, y: dy/norm };
-            let dashSet = getDashSettings(enemy);
-            enemy.dashActive = true; enemy.dashDir = dir; enemy.dashTime = dashSet.duration; enemy.dashCooldown = dashSet.cooldown;
-            enemy.deflectRemaining = (enemy.deflectStacks || 0);
-            if ((enemy.bigShotStacks||0) > 0) enemy.bigShotPending = true;
-            try { playDashWoosh(enemy.dashTime, dashSet.speedMult); } catch (e) {}
+            // If the remote (joiner) is currently moving, dash in that movement direction so dash follows movement
+            // Otherwise fallback to aim-based dash (toward cursor) as before.
+            let dir = { x: 0, y: 0 };
+            if (vx || vy) {
+                // use movement vector from remote input
+                let norm = Math.hypot(vx, vy) || 1;
+                dir.x = vx / norm; dir.y = vy / norm;
+                let dashSet = getDashSettings(enemy);
+                // Host should show the remote player's warmup ring for mutual visibility
+                beginDash(enemy, dir, dashSet, { showWarmup: true });
+            } else {
+                // trigger dash using direction toward aim (cursor) when stationary
+                let dx = (ri.aimX||player.x) - enemy.x;
+                let dy = (ri.aimY||player.y) - enemy.y;
+                let norm = Math.hypot(dx, dy) || 1;
+                dir = { x: dx/norm, y: dy/norm };
+                let dashSet = getDashSettings(enemy);
+                // Host-side dash for remote: show the remote's warmup ring for mutual visibility
+                beginDash(enemy, dir, dashSet, { lockedAim: { x: ri.aimX || player.x, y: ri.aimY || player.y }, showWarmup: true });
+            }
             NET.lastProcessedRemoteDashSeq = NET.remoteDashReqSeq;
             NET.remoteDashReqSeq = 0;
         }
         // Always tick enemy shoot timer on host
         enemy.timeSinceShot += dt;
-        // Remote shoot intent (queued) fires once when off cooldown
-    if (NET.remoteShootQueued && enemy.timeSinceShot >= enemy.shootInterval) {
-        // Use joiner's aim coordinates (from remote input) if available
-        let aimX = (ri && typeof ri.aimX === 'number') ? ri.aimX : player.x;
-        let aimY = (ri && typeof ri.aimY === 'number') ? ri.aimY : player.y;
-        let target = { x: aimX, y: aimY };
-        enemy.shootToward(target, bullets);
+        // Remote shoot intent: only fire if remote input currently indicates shoot is held
+        if (NET.remoteShootQueued && enemy.timeSinceShot >= enemy.shootInterval) {
+            // Only proceed if the remote input currently wants to shoot (holding), otherwise drop the queued request
+            const remoteWantsShoot = !!(NET.remoteInput && NET.remoteInput.shoot);
+            if (remoteWantsShoot) {
+                // Use joiner's aim coordinates (from remote input) if available
+                let aimX = (ri && typeof ri.aimX === 'number') ? ri.aimX : player.x;
+                let aimY = (ri && typeof ri.aimY === 'number') ? ri.aimY : player.y;
+                let target = { x: aimX, y: aimY };
+                enemy.shootToward(target, bullets);
                 // tag bullets with ids (host)
                 for (let i = bullets.length-1; i >= 0; i--) {
                     if (bullets[i].owner === enemy && !bullets[i].id) NET.tagBullet(bullets[i]);
                 }
                 enemy.timeSinceShot = 0;
+                // If the remote is still holding, keep remoteShootQueued true so subsequent shots fire as cooldown completes
+                // Otherwise clear the queued flag to avoid delayed firing
+                if (!remoteWantsShoot) NET.remoteShootQueued = false;
+            } else {
                 NET.remoteShootQueued = false;
+            }
         }
         // Clear transient flags so future presses can re-queue
         NET.remoteInput.shoot = false; NET.remoteInput.dash = false;
@@ -2457,10 +3623,22 @@ function update(dt) {
     if (simulateLocally && !blueAIActive) player.timeSinceShot += dt;
     if (simulateLocally && !blueAIActive && player.shootQueued && player.timeSinceShot >= player.shootInterval) {
         player.shootToward(mouse, bullets);
+        // If this client is a joiner doing local prediction, mark newly fired bullets as local so Shot Controller can steer them
+        if (NET.role === 'joiner') {
+            for (let i = bullets.length - 1; i >= 0; --i) {
+                const b = bullets[i];
+                if (b.owner === player && b.justFired) {
+                    b.isLocalPlayerBullet = true;
+                }
+            }
+        }
         // Host assigns bullet ids for player's bullets
         if (NET.role === 'host') {
             for (let i = bullets.length-1; i >= 0; i--) {
-                if (bullets[i].owner === player && !bullets[i].id) NET.tagBullet(bullets[i]);
+                if (bullets[i].owner === player && !bullets[i].id) {
+                    NET.tagBullet(bullets[i]);
+                    bullets[i].isLocalPlayerBullet = true;
+                }
             }
         }
         player.timeSinceShot = 0;
@@ -2472,11 +3650,11 @@ function update(dt) {
         if (window.localPlayerIndex === -1 && window.aiCount === 2) {
             // Ensure both AI exist
             if (!window.ai1) {
-                window.ai1 = new Player(false, "#ff5a5a", CANVAS_W/3, CANVAS_H/2);
+                window.ai1 = new Player(false, "#ff5a5a", window.CANVAS_W/3, CANVAS_H/2);
                 window.ai1.displayName = "AI 1";
             }
             if (!window.ai2) {
-                window.ai2 = new Player(false, "#65c6ff", 2*CANVAS_W/3, CANVAS_H/2);
+                window.ai2 = new Player(false, "#65c6ff", 2*window.CANVAS_W/3, CANVAS_H/2);
                 window.ai2.displayName = "AI 2";
             }
             let aiA = window.ai1, aiB = window.ai2;
@@ -2528,7 +3706,7 @@ function update(dt) {
                     let oldx = self.x, oldy = self.y;
                     self.x += mvx * speed * dt;
                     self.y += mvy * speed * dt;
-                    self.x = clamp(self.x, self.radius, CANVAS_W-self.radius);
+                    self.x = clamp(self.x, self.radius, window.CANVAS_W-self.radius);
                     self.y = clamp(self.y, self.radius, CANVAS_H-self.radius);
                     for (let o of obstacles) {
                         if (o.circleCollide(self.x, self.y, self.radius)) { self.x = oldx; self.y = oldy; break; }
@@ -2583,7 +3761,7 @@ function update(dt) {
                 let oldx = enemy.x, oldy = enemy.y;
                 enemy.x += mvx * speed * dt;
                 enemy.y += mvy * speed * dt;
-                enemy.x = clamp(enemy.x, enemy.radius, CANVAS_W-enemy.radius);
+                enemy.x = clamp(enemy.x, enemy.radius, window.CANVAS_W-enemy.radius);
                 enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H-enemy.radius);
                 for (let o of obstacles) {
                     if (o.circleCollide(enemy.x, enemy.y, enemy.radius)) { enemy.x = oldx; enemy.y = oldy; break; }
@@ -2653,7 +3831,7 @@ function update(dt) {
                     let oldx = self.x, oldy = self.y;
                     self.x += mvx * speed * dt;
                     self.y += mvy * speed * dt;
-                    self.x = clamp(self.x, self.radius, CANVAS_W-self.radius);
+                    self.x = clamp(self.x, self.radius, window.CANVAS_W-self.radius);
                     self.y = clamp(self.y, self.radius, CANVAS_H-self.radius);
                     for (let o of obstacles) {
                         if (o.circleCollide(self.x, self.y, self.radius)) { self.x = oldx; self.y = oldy; break; }
@@ -2665,44 +3843,47 @@ function update(dt) {
                     let norm = Math.hypot(dx, dy) || 1;
                     let dir = { x: dx/norm, y: dy/norm };
                     let dashSet = getDashSettings(self);
-                    self.dashActive = true; self.dashDir = dir; self.dashTime = dashSet.duration; self.dashCooldown = dashSet.cooldown;
-                    self.deflectRemaining = (self.deflectStacks || 0);
-                    if ((self.bigShotStacks||0) > 0) self.bigShotPending = true;
-                    try { playDashWoosh(self.dashTime, dashSet.speedMult); } catch (e) {}
+                    beginDash(self, dir, dashSet, { lockedAim: { x: target.x, y: target.y } });
                 }
                 if (self.dashActive) {
                     let dashSet = getDashSettings(self);
-                    let dashVx = self.dashDir.x * self.speed * dashSet.speedMult;
-                    let dashVy = self.dashDir.y * self.speed * dashSet.speedMult;
-                    let oldx = self.x, oldy = self.y;
-                    self.x += dashVx * dt; self.y += dashVy * dt;
-                    self.x = clamp(self.x, self.radius, CANVAS_W-self.radius);
-                    self.y = clamp(self.y, self.radius, CANVAS_H-self.radius);
-                    let collided = false;
-                    if (self.ram && dist(self.x, self.y, target.x, target.y) < self.radius + target.radius) {
-                        let dmg = 18 + (self.ramStacks || 0) * 6;
-                        target._lastAttacker = self;
-                        target.takeDamage(dmg);
-                        target._lastAttacker = null;
-                        self.x = oldx; self.y = oldy; collided = true;
-                    }
-                    if (!collided) {
-                        for (let o of obstacles) {
-                            if (o.circleCollide(self.x, self.y, self.radius)) {
-                                if (self.ram && (self.obliterator || (self.obliteratorStacks || 0) > 0)) {
-                                    let cx = self.x, cy = self.y;
-                                    let ramStacks = self.ramStacks || 0;
-                                    let oblStacks = self.obliteratorStacks || 0;
-                                    let radiusMul = 1 + 0.22 * ramStacks;
-                                    let powerMul = 1 + 0.45 * oblStacks;
-                                    let basePower = 1.6 * (1 + 0.4 * ramStacks);
-                                    o.chipChunksAt(cx, cy, self.radius * 1.6 * radiusMul, basePower * powerMul, self.obliterator, false);
+                    if (isTeledashEnabled(self)) {
+                        const blockers = { obstacles, others: [target] };
+                        const aimProvider = () => ({ x: target.x, y: target.y });
+                        updateTeledashWarmup(self, dt, dashSet, aimProvider, blockers);
+                    } else {
+                        let dashVx = self.dashDir.x * self.speed * dashSet.speedMult;
+                        let dashVy = self.dashDir.y * self.speed * dashSet.speedMult;
+                        let oldx = self.x, oldy = self.y;
+                        self.x += dashVx * dt; self.y += dashVy * dt;
+                        self.x = clamp(self.x, self.radius, window.CANVAS_W-self.radius);
+                        self.y = clamp(self.y, self.radius, CANVAS_H-self.radius);
+                        let collided = false;
+                        if (self.ram && dist(self.x, self.y, target.x, target.y) < self.radius + target.radius) {
+                            let dmg = 18 + (self.ramStacks || 0) * 6;
+                            target._lastAttacker = self;
+                            target.takeDamage(dmg);
+                            target._lastAttacker = null;
+                            self.x = oldx; self.y = oldy; collided = true;
+                        }
+                        if (!collided) {
+                            for (let o of obstacles) {
+                                if (o.circleCollide(self.x, self.y, self.radius)) {
+                                    if (self.ram && (self.obliterator || (self.obliteratorStacks || 0) > 0)) {
+                                        let cx = self.x, cy = self.y;
+                                        let ramStacks = self.ramStacks || 0;
+                                        let oblStacks = self.obliteratorStacks || 0;
+                                        let radiusMul = 1 + 0.22 * ramStacks;
+                                        let powerMul = 1 + 0.45 * oblStacks;
+                                        let basePower = 1.6 * (1 + 0.4 * ramStacks);
+                                        o.chipChunksAt(cx, cy, self.radius * 1.6 * radiusMul, basePower * powerMul, self.obliterator, false, (self.fireshotStacks || 0));
+                                    }
+                                    self.x = oldx; self.y = oldy; collided = true; break;
                                 }
-                                self.x = oldx; self.y = oldy; collided = true; break;
                             }
                         }
+                        self.dashTime -= dt; if (self.dashTime <= 0 || collided) self.dashActive = false;
                     }
-                    self.dashTime -= dt; if (self.dashTime <= 0 || collided) self.dashActive = false;
                 } else {
                     if (typeof self.dashCooldown === 'number') self.dashCooldown = Math.max(0, self.dashCooldown - dt);
                 }
@@ -2768,7 +3949,7 @@ function update(dt) {
                     let oldx = self.x, oldy = self.y;
                     self.x += mvx * speed * dt;
                     self.y += mvy * speed * dt;
-                    self.x = clamp(self.x, self.radius, CANVAS_W-self.radius);
+                    self.x = clamp(self.x, self.radius, window.CANVAS_W-self.radius);
                     self.y = clamp(self.y, self.radius, CANVAS_H-self.radius);
                     for (let o of obstacles) {
                         if (o.circleCollide(self.x, self.y, self.radius)) { self.x = oldx; self.y = oldy; break; }
@@ -2780,44 +3961,47 @@ function update(dt) {
                     let norm = Math.hypot(dx, dy) || 1;
                     let dir = { x: dx/norm, y: dy/norm };
                     let dashSet = getDashSettings(self);
-                    self.dashActive = true; self.dashDir = dir; self.dashTime = dashSet.duration; self.dashCooldown = dashSet.cooldown;
-                    self.deflectRemaining = (self.deflectStacks || 0);
-                    if ((self.bigShotStacks||0) > 0) self.bigShotPending = true;
-                    try { playDashWoosh(self.dashTime, dashSet.speedMult); } catch (e) {}
+                    beginDash(self, dir, dashSet, { lockedAim: { x: target.x, y: target.y } });
                 }
                 if (self.dashActive) {
                     let dashSet = getDashSettings(self);
-                    let dashVx = self.dashDir.x * self.speed * dashSet.speedMult;
-                    let dashVy = self.dashDir.y * self.speed * dashSet.speedMult;
-                    let oldx = self.x, oldy = self.y;
-                    self.x += dashVx * dt; self.y += dashVy * dt;
-                    self.x = clamp(self.x, self.radius, CANVAS_W-self.radius);
-                    self.y = clamp(self.y, self.radius, CANVAS_H-self.radius);
-                    let collided = false;
-                    if (self.ram && dist(self.x, self.y, target.x, target.y) < self.radius + target.radius) {
-                        let dmg = 18 + (self.ramStacks || 0) * 6;
-                        target._lastAttacker = self;
-                        target.takeDamage(dmg);
-                        target._lastAttacker = null;
-                        self.x = oldx; self.y = oldy; collided = true;
-                    }
-                    if (!collided) {
-                        for (let o of obstacles) {
-                            if (o.circleCollide(self.x, self.y, self.radius)) {
-                                if (self.ram && (self.obliterator || (self.obliteratorStacks || 0) > 0)) {
-                                    let cx = self.x, cy = self.y;
-                                    let ramStacks = self.ramStacks || 0;
-                                    let oblStacks = self.obliteratorStacks || 0;
-                                    let radiusMul = 1 + 0.22 * ramStacks;
-                                    let powerMul = 1 + 0.45 * oblStacks;
-                                    let basePower = 1.6 * (1 + 0.4 * ramStacks);
-                                    o.chipChunksAt(cx, cy, self.radius * 1.6 * radiusMul, basePower * powerMul, self.obliterator, false);
+                    if (isTeledashEnabled(self)) {
+                        const blockers = { obstacles, others: [target] };
+                        const aimProvider = () => ({ x: target.x, y: target.y });
+                        updateTeledashWarmup(self, dt, dashSet, aimProvider, blockers);
+                    } else {
+                        let dashVx = self.dashDir.x * self.speed * dashSet.speedMult;
+                        let dashVy = self.dashDir.y * self.speed * dashSet.speedMult;
+                        let oldx = self.x, oldy = self.y;
+                        self.x += dashVx * dt; self.y += dashVy * dt;
+                        self.x = clamp(self.x, self.radius, window.CANVAS_W-self.radius);
+                        self.y = clamp(self.y, self.radius, CANVAS_H-self.radius);
+                        let collided = false;
+                        if (self.ram && dist(self.x, self.y, target.x, target.y) < self.radius + target.radius) {
+                            let dmg = 18 + (self.ramStacks || 0) * 6;
+                            target._lastAttacker = self;
+                            target.takeDamage(dmg);
+                            target._lastAttacker = null;
+                            self.x = oldx; self.y = oldy; collided = true;
+                        }
+                        if (!collided) {
+                            for (let o of obstacles) {
+                                if (o.circleCollide(self.x, self.y, self.radius)) {
+                                    if (self.ram && (self.obliterator || (self.obliteratorStacks || 0) > 0)) {
+                                        let cx = self.x, cy = self.y;
+                                        let ramStacks = self.ramStacks || 0;
+                                        let oblStacks = self.obliteratorStacks || 0;
+                                        let radiusMul = 1 + 0.22 * ramStacks;
+                                        let powerMul = 1 + 0.45 * oblStacks;
+                                        let basePower = 1.6 * (1 + 0.4 * ramStacks);
+                                        o.chipChunksAt(cx, cy, self.radius * 1.6 * radiusMul, basePower * powerMul, self.obliterator, false);
+                                    }
+                                    self.x = oldx; self.y = oldy; collided = true; break;
                                 }
-                                self.x = oldx; self.y = oldy; collided = true; break;
                             }
                         }
+                        self.dashTime -= dt; if (self.dashTime <= 0 || collided) self.dashActive = false;
                     }
-                    self.dashTime -= dt; if (self.dashTime <= 0 || collided) self.dashActive = false;
                 } else {
                     if (typeof self.dashCooldown === 'number') self.dashCooldown = Math.max(0, self.dashCooldown - dt);
                 }
@@ -2827,22 +4011,56 @@ function update(dt) {
     // Bullets: on host (or solo), integrate locally; on joiner, lerp toward snapshot targets for smooth visuals
     if (simulateLocally) {
         for (let b of bullets) if (b.active) b.update(dt);
+        // On host, steer enemy bullets (joiner) toward joiner's aim if they have Shot Controller
+        if (NET.connected && NET.role === 'host' && NET.remoteInput && typeof NET.remoteInput.aimX === 'number' && typeof NET.remoteInput.aimY === 'number') {
+            for (let b of bullets) {
+                if (b.active && b.owner === enemy && b.shotController && b.playerControlActive) {
+                    let dx = NET.remoteInput.aimX - b.x;
+                    let dy = NET.remoteInput.aimY - b.y;
+                    let distToCursor = Math.hypot(dx, dy);
+                    if (distToCursor > 2) {
+                        let steerAngle = Math.atan2(dy, dx);
+                        // Smoothly steer toward cursor (limit turn rate for control)
+                        let turnRate = 0.13; // radians per frame
+                        let da = steerAngle - b.angle;
+                        // Wrap angle to [-PI, PI]
+                        while (da > Math.PI) da -= 2 * Math.PI;
+                        while (da < -Math.PI) da += 2 * Math.PI;
+                        if (Math.abs(da) > turnRate) {
+                            b.angle += turnRate * Math.sign(da);
+                        } else {
+                            b.angle = steerAngle;
+                        }
+                    }
+                }
+            }
+        }
     } else {
         const s = 24; // bullet smoothing rate (snappier than players)
         const t = Math.max(0, Math.min(1, s * dt));
         for (let b of bullets) {
             if (!b.active) continue;
+            // If this bullet is locally controlled (host or joiner), simulate it locally
+            if (b.isLocalPlayerBullet) {
+                try { b.update(dt); } catch (e) { /* ignore update errors to avoid crash */ }
+                continue;
+            }
+            // Otherwise, smooth position/angle from snapshot
             const tx = (typeof b.targetX === 'number') ? b.targetX : b.x;
             const ty = (typeof b.targetY === 'number') ? b.targetY : b.y;
+            const ta = (typeof b.targetAngle === 'number') ? b.targetAngle : b.angle;
             b.x = lerp(b.x, tx, t);
             b.y = lerp(b.y, ty, t);
+            b.angle = lerpAngle(b.angle, ta, t);
+            // Optionally, smooth angle as well (if needed)
         }
     }
     for (let o of obstacles) o.update(dt);
     // Always update explosion visuals. Only apply damage/chunk updates on the authoritative side (host or single-player).
     const explosionPlayers = [player].concat(enemyDisabled ? [] : [enemy]);
+    const explosionHealers = (healersActive && healers.length) ? healers.filter(h => h && h.active) : [];
     for (let e of explosions) {
-        if (!e.done) e.update(dt, obstacles, explosionPlayers, simulateLocally);
+        if (!e.done) e.update(dt, obstacles, explosionPlayers, simulateLocally, explosionHealers);
     }
     explosions = explosions.filter(e => !e.done);
 
@@ -2891,9 +4109,37 @@ function update(dt) {
                     victim._lastAttacker = b.owner || null;
                     victim.takeDamage(b.damage);
                     victim._lastAttacker = null;
+                    // Fireshot: apply burning
+                    if (b.fireshot) {
+                        let stacks = (b.owner && b.owner.fireshotStacks) ? b.owner.fireshotStacks : 1;
+                        victim.burning = { time: 0, duration: 1.2 + 1.3 * stacks };
+                    }
                 }
                 b.active = false;
                 hit = true;
+            }
+        }
+        if (hit) continue;
+
+        if (healersActive && healers.length) {
+            for (const healer of healers) {
+                if (!healer || !healer.active) continue;
+                if (dist(b.x, b.y, healer.x, healer.y) < b.radius + healer.radius) {
+                    if (b.explosive) {
+                        triggerExplosion(b, healer.x, healer.y);
+                    } else {
+                        healer._lastAttacker = b.owner || null;
+                        healer.takeDamage(b.damage, b.owner || null);
+                        healer._lastAttacker = null;
+                        if (b.fireshot) {
+                            const stacks = (b.owner && b.owner.fireshotStacks) ? b.owner.fireshotStacks : 1;
+                            healer.burning = { time: 0, duration: 1.2 + 1.3 * stacks };
+                        }
+                    }
+                    b.active = false;
+                    hit = true;
+                    break;
+                }
             }
         }
         if (hit) continue;
@@ -2908,11 +4154,17 @@ function update(dt) {
                 // Only bullets whose owner has obliterator can chip infested chunks
                 if (b.obliterator || (b.obliteratorStacks || 0) > 0) {
                     let stacks = b.obliteratorStacks || 0;
-                    let radiusMul = 1.22 * (1 + 0.35 * stacks);
-                    let powerMul = 1 + 0.45 * stacks;
+                    // stronger obliterator stacking: bigger chip radius and more chip power per stack
+                    let radiusMul = 1.22 * (1 + 0.6 * stacks);
+                    let powerMul = 1 + 0.75 * stacks;
                     let chipPower = (b.damage/18) * powerMul;
                     let didChip = ic.chipAt(b.x, b.y, b.radius * radiusMul, chipPower, b.obliterator, b.explosive);
                     if (didChip) {
+                        // Fireshot: apply burning to chunk
+                        if (b.fireshot) {
+                            let stacks = (b.owner && b.owner.fireshotStacks) ? b.owner.fireshotStacks : 1;
+                            ic.burning = { time: 0, duration: 1.2 + 1.3 * stacks };
+                        }
                         if (b.explosive) {
                             triggerExplosion(b, centerX, centerY);
                             b.active = false;
@@ -2955,9 +4207,9 @@ function update(dt) {
                 if (b.obliterator) {
                     // Scale chip radius and power by obliterator stacks on the bullet (from owner)
                     let stacks = b.obliteratorStacks || 0;
-                    // base multiplier: small bump per stack (1 + 0.35*stacks)
-                    let radiusMul = 1.22 * (1 + 0.35 * stacks);
-                    let powerMul = 1 + 0.45 * stacks;
+                    // stronger obliterator effect on bullets' chip radius and power
+                    let radiusMul = 1.22 * (1 + 0.6 * stacks);
+                    let powerMul = 1 + 0.75 * stacks;
                     // Find the collided chunk/closest point BEFORE chipping so we can reflect
                     let collidedChunk = null;
                     let closestX = 0, closestY = 0;
@@ -2980,7 +4232,14 @@ function update(dt) {
                             break;
                         }
                     }
-                    let didChip = o.chipChunksAt(b.x, b.y, b.radius * radiusMul, (b.damage/18) * powerMul, true);
+                    let didChip = o.chipChunksAt(
+                        b.x, b.y,
+                        b.radius * radiusMul,
+                        (b.damage/18) * powerMul,
+                        b.obliterator || true, // ensure obliterator flag is set if bullet has it
+                        false,
+                        b.fireshotStacks || 0
+                    );
                     if (didChip) {
                         // If the bullet is explosive, trigger a full explosion at the impact
                         // even if we used obliterator-style chunk chipping. Then deactivate the bullet.
@@ -3101,6 +4360,60 @@ function update(dt) {
         if (p.healthbarFlash > 0) p.healthbarFlash -= dt;
     });
 
+    // --- Healers logic ---
+    if (healersActive) {
+        if (simulateLocally) {
+            if (!healers.length) {
+                if (!healerPendingRespawn) {
+                    spawnHealerAt();
+                }
+            }
+            const targets = getHealerTargets();
+            let anyAlive = false;
+            for (const healer of healers) {
+                if (!healer) continue;
+                if (healer.active) {
+                    anyAlive = true;
+                    healer.update(dt, targets);
+                } else if (!healerPendingRespawn) {
+                    healerPendingRespawn = true;
+                    healerRespawnTimer = 0;
+                    setNextHealerRespawnDelay();
+                }
+            }
+            healers = healers.filter(h => h && h.active);
+            // Clean up inactive healer targets
+            if (NET.joinerTargets && NET.joinerTargets.healers) {
+                for (const [id, target] of NET.joinerTargets.healers.entries()) {
+                    const healerExists = healers.some(h => h && h.id === id);
+                    if (!healerExists) {
+                        NET.joinerTargets.healers.delete(id);
+                    }
+                }
+            }
+            if (!anyAlive && !healerPendingRespawn) {
+                healerPendingRespawn = true;
+                healerRespawnTimer = 0;
+                setNextHealerRespawnDelay();
+            }
+            if (healerPendingRespawn) {
+                healerRespawnTimer += dt;
+                if (healerRespawnTimer >= healerRespawnDelay) {
+                    healerRespawnTimer = 0;
+                    healerPendingRespawn = false;
+                    healers = healers.filter(h => h && h.active);
+                    spawnHealerAt(healerPreSpawnPos);
+                    healerPreSpawnPos = null;
+                }
+            }
+        } else {
+            for (const healer of healers) {
+                if (!healer || !healer.active) continue;
+                healer.update(dt, null, { applyGameLogic: false });
+            }
+        }
+    }
+
     // --- Respawn, health reset, card (host-authoritative) ---
     // Run when in single-player (not connected) OR when connected as host
     if (!waitingForCard && (!NET.connected || NET.role === 'host')) {
@@ -3111,15 +4424,30 @@ function update(dt) {
                 const loser = p;
                 const loserRole = (loser === player) ? 'host' : 'joiner';
                 const winner = (loser === player) ? enemy : player;
-                winner.score++;
+                // Only increment score if not in continue loop
+                let allowScore = true;
+                if (window._victoryRoundsActive && window._victoryRoundsLeft === 3) {
+                    // Just resumed from continue, don't increment score again
+                    allowScore = false;
+                }
+                if (allowScore) winner.score++;
                 // Check for match victory
                 try {
                     if (typeof ROUNDS_TO_WIN !== 'number' || ROUNDS_TO_WIN <= 0) ROUNDS_TO_WIN = 10;
-                    if (winner.score >= ROUNDS_TO_WIN) {
+                    // Infinite continue loop logic
+                    if (window._victoryRoundsActive) {
+                        window._victoryRoundsLeft--;
+                        if (window._victoryRoundsLeft <= 0) {
+                            window._victoryRoundsActive = false;
+                            showVictoryModal((winner.displayName || (winner.isPlayer ? 'Player' : 'Enemy')), NET.role === 'host');
+                            return;
+                        }
+                    } else if (winner.score >= ROUNDS_TO_WIN) {
                         try { logDev && logDev(`[MATCH] ${winner.displayName || (winner.isPlayer ? 'Player' : 'Enemy')} wins match (${winner.score} >= ${ROUNDS_TO_WIN}). Showing victory modal.`); } catch (e) {}
                         // Show victory modal and broadcast match-end to clients; host controls restart
-                        try { showVictoryModal((winner.displayName || (winner.isPlayer ? 'Player' : 'Enemy')), NET.role === 'host'); } catch (e) {}
+                        showVictoryModal((winner.displayName || (winner.isPlayer ? 'Player' : 'Enemy')), NET.role === 'host');
                         // Do not auto-restart; wait for host to press Restart
+                        return;
                     }
                 } catch (e) {}
                 if (winner.healOnKill) {
@@ -3154,7 +4482,7 @@ function update(dt) {
                 } else {
                     generateObstacles();
                 }
-                positionPlayersSafely();
+                window.positionPlayersSafely();
                 // Reset both entities and heal them to full for the new round
                 try {
                     // reset preserves position; ensure both start fully healed
@@ -3201,6 +4529,17 @@ function update(dt) {
                             joinerPos: { x: enemy.x, y: enemy.y, hp: enemy.health },
                             scores: { host: (player.score||0), joiner: (enemy.score||0) }
                         }}));
+                    }
+                } catch (e) {}
+                // Remove existing healers completely at round end and start respawn timer
+                try {
+                    if (healersActive && Array.isArray(healers) && healers.length) {
+                        // Clear all healers from the map entirely
+                        healers.length = 0;
+                        // Start respawn timer for a fresh healer
+                        healerPendingRespawn = true;
+                        healerRespawnTimer = 0;
+                        setNextHealerRespawnDelay();
                     }
                 } catch (e) {}
                 // Decide what selection to show
@@ -3317,7 +4656,12 @@ function update(dt) {
                         // remember last offered choices locally so a declined pick can re-open the UI
                         window._lastOfferedChoices = { choices: powerupChoices, chooserRole: powerupChooserRole };
                     } catch (e) {}
-                    try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-offer', choices: powerupChoices, chooserRole: powerupChooserRole } })); } catch (e) {}
+                    try {
+                        // Only relay powerup offers to joiners if powerups are enabled for the match
+                        if (!(typeof window.setupAllowPowerups !== 'undefined' && window.setupAllowPowerups === false)) {
+                            if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-offer', choices: powerupChoices, chooserRole: powerupChooserRole } }));
+                        }
+                    } catch (e) {}
                 }, 700);
                 break;
             }
@@ -3328,22 +4672,38 @@ function update(dt) {
 // --- Explosion trigger ---
 function triggerExplosion(bullet, x, y) {
     let owner = bullet.owner;
-    let explosionRadius = EXPLOSION_BASE_RADIUS * (bullet.radius / BULLET_RADIUS) * (1 + bullet.damage/34);
-    let explosionDamage = bullet.damage * (1.15 + bullet.radius / BULLET_RADIUS * 0.22);
+    // reduce bullet-size influence: use a sublinear exponent so very large bullets affect radius less
+    const sizeFactor = Math.pow(Math.max(0.1, (bullet.radius / window.BULLET_RADIUS)), 0.6);
+    let explosionRadius = window.EXPLOSION_BASE_RADIUS * sizeFactor * (1 + bullet.damage/64);
+    // keep damage scaling for explosion damage, but reduce size-driven damage boost
+    let explosionDamage = bullet.damage * (1.08 + 0.12 * sizeFactor);
     let canObliterate = bullet.obliterator;
     if (canObliterate) {
-        explosionRadius *= 1.25;
-        explosionDamage *= 1.18;
+        // smaller obliterator radius bonus to avoid very large splash
+        explosionRadius *= 1.12;
+        explosionDamage *= 1.12;
     }
-    explosionRadius = Math.min(explosionRadius, 220);
+    // lower the maximum allowed explosion radius
+    explosionRadius = Math.min(explosionRadius, 170);
     explosionDamage = Math.max(8, Math.min(explosionDamage, 90));
+    // Fireshot: mark explosion as fiery
+    let isFireshot = bullet.fireshot;
+    // Scale explosion radius slightly per explosive stack (small per-stack bonus)
+    let explosiveStacks = bullet.explosiveStacks || 0;
+    if (explosiveStacks > 0) {
+        // each stack increases radius by ~12% (tunable)
+        explosionRadius *= (1 + 0.12 * explosiveStacks);
+        // ensure the cap still applies
+        explosionRadius = Math.min(explosionRadius, 200);
+    }
     explosions.push(new Explosion(
         x, y,
         explosionRadius,
         owner.color,
         explosionDamage,
         owner,
-        canObliterate
+        canObliterate,
+        isFireshot
     ));
     playExplosion();
     // If we're host in a multiplayer game, broadcast a visual-only explosion event
@@ -3353,16 +4713,60 @@ function triggerExplosion(bullet, x, y) {
 
 // --- Draw ---
 function draw() {
-    ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+    ctx.clearRect(0, 0, window.CANVAS_W, CANVAS_H);
     if (MAP_BORDER) {
         ctx.save();
         ctx.strokeStyle = '#3d4550';
         ctx.lineWidth = 6;
         ctx.globalAlpha = 0.55;
-        ctx.strokeRect(3, 3, CANVAS_W-6, CANVAS_H-6);
+        ctx.strokeRect(3, 3, window.CANVAS_W-6, CANVAS_H-6);
         ctx.restore();
     }
     for(let o of obstacles) o.draw(ctx);
+    // Draw healer pre-spawn indicator if pending
+    if (healerPendingRespawn && healerPreSpawnPos) {
+        // show only during final 2 seconds before spawn
+        const remaining = Math.max(0, (healerRespawnDelay || 0) - healerRespawnTimer);
+        if (remaining <= 2) {
+            const now = performance.now();
+            const pulse = 0.8 + 0.2 * Math.sin(now / 250); // slower, gentler pulse
+            ctx.save();
+            ctx.globalCompositeOperation = 'lighter';
+            const radius = 56 + 10 * Math.sin(now / 300);
+            const grad = ctx.createRadialGradient(healerPreSpawnPos.x, healerPreSpawnPos.y, 8, healerPreSpawnPos.x, healerPreSpawnPos.y, radius);
+            grad.addColorStop(0, `rgba(76,255,122,${0.42 * pulse})`);
+            grad.addColorStop(0.7, `rgba(76,255,122,${0.16 * pulse})`);
+            grad.addColorStop(1, 'rgba(76,255,122,0)');
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(healerPreSpawnPos.x, healerPreSpawnPos.y, radius, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+    }
+    // Draw firestorm pre-spawn indicator if pending
+    if (firestormPreSpawnPos) {
+        const now = performance.now();
+        const pulse = 0.8 + 0.2 * Math.sin(now / 200); // slightly faster pulse than healer
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        const radius = firestormPreSpawnPos.radius * 0.6 + 16 * Math.sin(now / 280);
+        const grad = ctx.createRadialGradient(firestormPreSpawnPos.x, firestormPreSpawnPos.y, 12, firestormPreSpawnPos.x, firestormPreSpawnPos.y, radius);
+        grad.addColorStop(0, `rgba(255,100,50,${0.45 * pulse})`);
+        grad.addColorStop(0.6, `rgba(255,150,80,${0.18 * pulse})`);
+        grad.addColorStop(1, 'rgba(255,100,50,0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(firestormPreSpawnPos.x, firestormPreSpawnPos.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+    }
+    if (healersActive) {
+        for (const healer of healers) {
+            if (!healer || !healer.active) continue;
+            healer.draw(ctx);
+        }
+    }
     for(let b of bullets) {
         ctx.save();
         ctx.globalAlpha = 0.78;
@@ -3370,6 +4774,24 @@ function draw() {
         ctx.beginPath();
         ctx.arc(b.x, b.y, b.radius, 0, Math.PI*2);
         ctx.fill();
+        // Fireshot: draw fire particles
+        if (b.fireshot) {
+            for (let i = 0; i < 4; ++i) {
+                let ang = Math.random() * Math.PI * 2;
+                let dist = b.radius * (0.7 + Math.random() * 0.6);
+                let px = b.x + Math.cos(ang) * dist;
+                let py = b.y + Math.sin(ang) * dist;
+                ctx.globalAlpha = 0.32 + Math.random() * 0.18;
+                ctx.beginPath();
+                ctx.arc(px, py, 2.2 + Math.random() * 2.2, 0, Math.PI*2);
+                ctx.fillStyle = `rgba(255,${180+Math.floor(Math.random()*60)},40,0.85)`;
+                ctx.shadowColor = '#ffb347';
+                ctx.shadowBlur = 8;
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            }
+            ctx.globalAlpha = 0.78;
+        }
         if (b.explosive) {
             ctx.globalAlpha = 0.38;
             ctx.shadowColor = "#fff";
@@ -3420,7 +4842,7 @@ function draw() {
     ctx.fillStyle = "#65c6ff";
     ctx.fillText(pName + ": " + ((player && typeof player.score === 'number') ? player.score : '0'), 24, 34);
         ctx.fillStyle = "#ff5a5a";
-        if (enemy) ctx.fillText(eName + ": " + ((enemy && typeof enemy.score === 'number') ? enemy.score : '0'), CANVAS_W - 220, 34);
+        if (enemy) ctx.fillText(eName + ": " + ((enemy && typeof enemy.score === 'number') ? enemy.score : '0'), window.CANVAS_W - 220, 34);
     } else {
         // Multiplayer: implement exact specification for WM mode
         const isJoiner = (NET.role === 'joiner');
@@ -3463,7 +4885,7 @@ function draw() {
                 redLabel = joinerName;
             }
             ctx.fillStyle = "#ff5a5a";
-            if (joinerEntity) ctx.fillText(redLabel + ": " + ((joinerEntity && typeof joinerEntity.score === 'number') ? joinerEntity.score : '0'), CANVAS_W - 220, 34);
+            if (joinerEntity) ctx.fillText(redLabel + ": " + ((joinerEntity && typeof joinerEntity.score === 'number') ? joinerEntity.score : '0'), window.CANVAS_W - 220, 34);
         }
     }
     ctx.restore();
@@ -3491,30 +4913,52 @@ function drawPlayer(p) {
         ctx.save();
         ctx.beginPath();
         ctx.arc(p.x + shakeX, p.y + shakeY, p.radius + 7, -Math.PI/2, -Math.PI/2 + Math.PI*2*cdFrac, false);
-    // Use the player's own color for cooldown ring to match role mapping
-    ctx.strokeStyle = p.color;
+        ctx.strokeStyle = p.color;
         ctx.globalAlpha = 0.48;
         ctx.lineWidth = 4.2;
-    ctx.shadowColor = p.color;
+        ctx.shadowColor = p.color;
         ctx.shadowBlur = 2;
         ctx.stroke();
+        // Always draw the black base circle underneath the cooldown ring
+    ctx.globalAlpha = 1;
+    ctx.shadowBlur = 0;
+    ctx.beginPath();
+    ctx.arc(p.x + shakeX, p.y + shakeY, p.radius + 7, -Math.PI/2, -Math.PI/2 + Math.PI*2*cdFrac, false);
+    ctx.strokeStyle = "#222";
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
         ctx.restore();
     }
 
     // Draw dash cooldown only (do not show dash-progress while dashing)
     try {
         let dashSet = getDashSettings(p);
-        if ((dashSet.cooldown || 0) > 0 && p.dashCooldown > 0) {
-            // readyFrac: 0 = just used (empty arc), 1 = ready (full)
-            let readyFrac = 1 - clamp(p.dashCooldown / dashSet.cooldown, 0, 1);
+        let ringFrac = null;
+        let ringColor = '#ffd86b';
+        let ringGlow = '#ffd86b';
+        let ringAlpha = 0.62;
+        const isTele = isTeledashEnabled(p);
+        if (isTele && p.teledashWarmupActive && (dashSet.warmup || 0) > 0) {
+            const warmupTotal = Math.max(0.001, p.teledashWarmupTime || dashSet.warmup || 0);
+            ringFrac = clamp((p.teledashWarmupElapsed || 0) / warmupTotal, 0, 1);
+            // Use the same yellow used for dash cooldown rings so warmup matches player's dash UI
+            ringColor = 'rgba(200,220,255,0.9)';
+            ringGlow = 'rgba(200,220,255,0.9)';
+            ringAlpha = 0.62;
+        } else if ((dashSet.cooldown || 0) > 0 && p.dashCooldown > 0) {
+            // Prefer authoritative max cooldown from host snapshot when available (joiner)
+            const maxCd = (typeof p.dashCooldownMax === 'number' && p.dashCooldownMax > 0) ? p.dashCooldownMax : dashSet.cooldown;
+            ringFrac = 1 - clamp(p.dashCooldown / maxCd, 0, 1);
+        }
+        if (ringFrac !== null && ringFrac > 0) {
             ctx.save();
             ctx.beginPath();
-            ctx.arc(p.x + shakeX, p.y + shakeY, p.radius + 13, -Math.PI/2, -Math.PI/2 + Math.PI*2*readyFrac, false);
-            ctx.strokeStyle = '#ffd86b';
-            ctx.globalAlpha = 0.62;
+            ctx.arc(p.x + shakeX, p.y + shakeY, p.radius + 13, -Math.PI/2, -Math.PI/2 + Math.PI*2*ringFrac, false);
+            ctx.strokeStyle = ringColor;
+            ctx.globalAlpha = ringAlpha;
             ctx.lineWidth = 3.6;
-            ctx.shadowColor = '#ffd86b';
-            ctx.shadowBlur = 6;
+            ctx.shadowColor = ringGlow;
+            ctx.shadowBlur = ringColor === '#6ecbff' ? 7 : 6;
             ctx.stroke();
             ctx.restore();
         }
@@ -3524,7 +4968,9 @@ function drawPlayer(p) {
     ctx.strokeStyle = "#222";
     ctx.lineWidth = 2.5;
     ctx.stroke();
-    let w = 54, h = 10;
+    const healthBarBaseW = 54;
+    let w = Math.max(18, healthBarBaseW * Math.sqrt((p.healthMax || window.HEALTH_MAX) / window.HEALTH_MAX));
+    let h = 10;
     let x = p.x - w/2 + shakeX, y = p.y - p.radius - 18 + shakeY;
     ctx.save();
     if (p.healthbarFlash > 0) {
@@ -3546,6 +4992,13 @@ function drawPlayer(p) {
 function showPowerupCards(loser) {
     cardState.active = true;
     cardState.player = loser;
+    // Allow the setup UI to completely disable powerups for this match
+    try {
+        if (typeof window.setupAllowPowerups !== 'undefined' && window.setupAllowPowerups === false) {
+            logDev('[CARD FLOW] Powerups are disabled via setup; skipping powerup offer.');
+            return; // do not show powerup chooser
+        }
+    } catch (e) {}
     let div = document.getElementById('card-choices');
     div.innerHTML = "";
     let powerupPool = POWERUPS;
@@ -3777,6 +5230,13 @@ function showPowerupCards(loser) {
 // Networked selection helpers (host composes choices and sends; clients display based on chooserRole)
 function netShowPowerupCards(choiceNames, chooserRole) {
     if (matchOver) return; // suppress during match-end modal
+    // Respect setup checkbox: if powerups are disabled for this match, skip showing
+    try {
+        if (typeof window.setupAllowPowerups !== 'undefined' && window.setupAllowPowerups === false) {
+            logDev('[CARD FLOW] Powerups are disabled via setup; skipping networked powerup offer.');
+            return;
+        }
+    } catch (e) {}
     // chooserRole: 'host' or 'joiner'
     // Map role to the correct local entity so color usage is correct on clients
     // In networked mode, use getEntityForRole which maps based on NET.role.
@@ -4209,6 +5669,13 @@ function netShowPowerupCards(choiceNames, chooserRole) {
 
 function netShowWorldModifierCards(choiceNames, chooserRole, finalIdx /* optional */, opts /* optional */) {
     if (matchOver) return; // suppress during match-end modal
+    // Allow the setup UI to completely disable world modifiers for this match
+    try {
+        if (typeof window.setupAllowWorldMods !== 'undefined' && window.setupAllowWorldMods === false) {
+            logDev('[CARD FLOW] World modifiers are disabled via setup; skipping world modifier offer.');
+            return;
+        }
+    } catch (e) {}
     let options = opts;
     let resolvedFinalIdx = finalIdx;
     if (typeof resolvedFinalIdx === 'object' && resolvedFinalIdx !== null && options === undefined) {
@@ -4849,8 +6316,22 @@ function setupOverlayInit() {
                                         const c = obs.chunks[ci];
                                         if (!c || c.destroyed) continue;
                                         if (x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h) {
-                                            const inf = new InfestedChunk(c, obs); infestedChunks.push(inf);
-                                            try { GameEvents.emit('infestation-spawn', { obstacleIndex: oi, chunkIndex: ci, id: inf.id, x: inf.x, y: inf.y, w: inf.w, h: inf.h, hp: inf.hp }); } catch (e) {}
+                                            // Enforce max active infested chunks
+                                            try {
+                                                const activeCount = (infestedChunks || []).filter(ic => ic && ic.active).length;
+                                                if (activeCount < 10) {
+                                                    const inf = new InfestedChunk(c, obs);
+                                                    infestedChunks.push(inf);
+                                                }
+                                            } catch (e) {
+                                                const inf = new InfestedChunk(c, obs);
+                                                infestedChunks.push(inf);
+                                            }
+                                            try {
+                                                if (typeof inf !== 'undefined' && inf) {
+                                                    GameEvents.emit('infestation-spawn', { obstacleIndex: oi, chunkIndex: ci, id: inf.id, x: inf.x, y: inf.y, w: inf.w, h: inf.h, hp: inf.hp });
+                                                }
+                                            } catch (e) {}
                                             oi = obstacles.length; break;
                                         }
                                     }
@@ -4875,7 +6356,7 @@ function setupOverlayInit() {
                                         // jitter around desired px,py a bit
                                         const jitterX = px + rand(-40, 40);
                                         const jitterY = py + rand(-40, 40);
-                                        let nx = Math.max(60, Math.min(CANVAS_W - 60 - w, jitterX - w/2));
+                                        let nx = Math.max(60, Math.min(window.CANVAS_W - 60 - w, jitterX - w/2));
                                         let ny = Math.max(60, Math.min(CANVAS_H - 60 - h, jitterY - h/2));
                                         const candidate = new Obstacle(nx, ny, w, h);
                                         const centerX = nx + w/2, centerY = ny + h/2;
@@ -4903,7 +6384,7 @@ function setupOverlayInit() {
                                 if (clicked >= 0) {
                                     // Remove clicked (mark chunks flying) and append a new obstacle elsewhere so flying chunks remain visible
                                     destroyIdx(clicked);
-                                    const newObs = makeAt(rand(80, CANVAS_W-80), rand(80, CANVAS_H-80));
+                                    const newObs = makeAt(rand(80, window.CANVAS_W-80), rand(80, CANVAS_H-80));
                                     if (newObs) {
                                         obstacles.push(newObs);
                                         try { GameEvents.emit('dynamic-spawn', { obstacleIndex: obstacles.indexOf(newObs), obstacle: { x: newObs.x, y: newObs.y, w: newObs.w, h: newObs.h } }); } catch (e) {}
@@ -5158,19 +6639,18 @@ function setupOverlayInit() {
                         setTimeout(() => netShowWorldModifierCards(data.choices||[], data.chooserRole, finalIdx, { manual }), 200);
                     }
                 } else if (data && data.type === 'card-pick') {
-                    // Joiner sent a pick: host should confirm before applying.
+                    // Joiner sent a pick: auto-accept and apply silently on host
                     if (NET.role === 'host') {
-                        // store pending pick for host confirmation UI
-                        window._pendingHostConfirm = { kind: 'card', pickerRole: data.pickerRole, cardName: data.card };
-                        showHostConfirmOverlay(`Joiner picked: ${data.card}. Accept?`);
+                        const pending = { kind: 'card', pickerRole: data.pickerRole, cardName: data.card };
+                        applyHostPendingConfirm(pending);
                     } else {
                         // ignore (only host handles picks)
                     }
                 } else if (data && data.type === 'mod-pick') {
-                    // Joiner sent a world-mod pick: host should confirm before applying
+                    // Joiner sent a world-mod pick: auto-accept and apply silently on host
                     if (NET.role === 'host') {
-                        window._pendingHostConfirm = { kind: 'mod', chooserRole: data.chooserRole || data.pickerRole, name: data.name };
-                        showHostConfirmOverlay(`Joiner picked world mod: ${data.name}. Accept?`);
+                        const pending = { kind: 'mod', chooserRole: data.chooserRole || data.pickerRole, name: data.name };
+                        applyHostPendingConfirm(pending);
                     }
                 } else if (data && data.type === 'card-apply') {
                     // Apply on non-host clients (host already applied during pick)
@@ -5279,8 +6759,20 @@ function setupOverlayInit() {
                         if (NET.role !== 'host') {
                             const oi = data.obstacleIndex, ci = data.chunkIndex;
                             if (typeof oi === 'number' && typeof ci === 'number' && obstacles[oi] && obstacles[oi].chunks[ci]) {
-                                let infestedChunk = new InfestedChunk(obstacles[oi].chunks[ci], obstacles[oi]);
-                                infestedChunks.push(infestedChunk);
+                                try {
+                                    const activeCount = (infestedChunks || []).filter(ic => ic && ic.active).length;
+                                    if (activeCount < 10) {
+                                        // avoid duplicates by id if provided
+                                        if (typeof data.id !== 'undefined' && (infestedChunks || []).some(ic => ic && ic.id === data.id)) return;
+                                        let infestedChunk = new InfestedChunk(obstacles[oi].chunks[ci], obstacles[oi]);
+                                        infestedChunk.id = data.id || infestedChunk.id;
+                                        infestedChunks.push(infestedChunk);
+                                    }
+                                } catch (e) {
+                                    let infestedChunk = new InfestedChunk(obstacles[oi].chunks[ci], obstacles[oi]);
+                                    infestedChunk.id = data.id || infestedChunk.id;
+                                    infestedChunks.push(infestedChunk);
+                                }
                             }
                         }
                     } catch (e) {}
@@ -5298,7 +6790,7 @@ function setupOverlayInit() {
                             // Visual-only explosion sent from host: recreate locally on joiner
                             try {
                                 if (NET.role !== 'host') {
-                                    const ex = new Explosion(data.x, data.y, data.radius || EXPLOSION_BASE_RADIUS, data.color || '#ffffff', data.damage || 0, null, !!data.obl);
+                                    const ex = new Explosion(data.x, data.y, data.radius || window.EXPLOSION_BASE_RADIUS, data.color || '#ffffff', data.damage || 0, null, !!data.obl);
                                     explosions.push(ex);
                                     try { playExplosion(); } catch (e) {}
                                 }
@@ -5357,6 +6849,22 @@ function setupOverlayInit() {
                 } else if (data && data.type === 'match-restart') {
                     // Host requested a restart for all clients
                     try { hideVictoryModal(); restartGame(); } catch (e) {}
+                } else if (data && data.type === 'victory-vote') {
+                    // Peer sent their vote
+                    try {
+                        const peerRole = data.role;
+                        const choice = data.choice;
+                        window._victoryVotes[peerRole] = choice;
+                        updateVictoryModalStatus();
+                        checkVictoryVotes();
+                    } catch (e) {}
+                } else if (data && data.type === 'victory-continue') {
+                    // Host confirmed continue action
+                    try {
+                        hideVictoryModal();
+                        window._victoryRoundsLeft = 3;
+                        window._victoryRoundsActive = true;
+                    } catch (e) {}
                 } else if (data && data.type === 'card-decline') {
                     // Host declined the joiner's pick; clear waiting state and log
                     try { waitingForCard = false; cardState.active = false; } catch (e) {}
@@ -5388,6 +6896,42 @@ function setupOverlayInit() {
     function hideHostConfirmOverlay() {
         try { const overlay = document.getElementById('host-confirm-overlay'); if (overlay) overlay.style.display = 'none'; } catch (e) {}
         try { window._pendingHostConfirm = null; } catch (e) {}
+    }
+
+    // Apply a pending host confirmation immediately (same logic as clicking the host Accept button)
+    function applyHostPendingConfirm(pending) {
+        try {
+            if (!pending) return;
+            if (pending.kind === 'card') {
+                const target = getEntityForRole(pending.pickerRole);
+                const card = getCardByName(pending.cardName);
+                if (target && card) {
+                    try { card.effect(target); target.addCard(card.name); } catch (e) {}
+                }
+                // Broadcast applied so clients close UI
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: pending.pickerRole, card: pending.cardName } })); } catch (e) {}
+                // Ensure host UI closes as well
+                try { const div = document.getElementById('card-choices'); if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); } } catch (e) {}
+                // If there was a pending world modifier offer queued for this round, show it now on host and broadcast to joiner
+                try {
+                    if (window._pendingWorldModOffer) {
+                        const offer = window._pendingWorldModOffer;
+                        window._pendingWorldModOffer = null;
+                        try { waitingForCard = true; } catch (e) {}
+                        try { netShowWorldModifierCards(offer.choices, offer.chooserRole, offer.finalIdx, offer); } catch (e) {}
+                        try {
+                            if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-offer', choices: offer.choices, chooserRole: offer.chooserRole, finalIdx: offer.finalIdx, manual: !!offer.manual } }));
+                        } catch (e) {}
+                    }
+                } catch (e) {}
+            } else if (pending.kind === 'mod') {
+                const name = pending.name;
+                try { applyWorldModifierByName(name); } catch (e) {}
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-apply', name } })); } catch (e) {}
+            }
+            try { cardState.active = false; waitingForCard = false; } catch (e) {}
+            try { window._pendingHostConfirm = null; } catch (e) {}
+        } catch (err) { console.warn('applyHostPendingConfirm error', err); }
     }
 
     // Wire host confirm buttons (accept/decline)
@@ -5564,9 +7108,89 @@ function setupOverlayInit() {
     const dynamicRateSlider = document.getElementById('dynamic-rate');
     const dynamicRateValue = document.getElementById('dynamic-rate-value');
     const mapBorderCheckbox = document.getElementById('map-border');
-    const worldModifierSlider = document.getElementById('world-modifier-interval');
-    const worldModifierValue = document.getElementById('world-modifier-value');
+    // Ensure map border is checked by default on load
+    if (mapBorderCheckbox) mapBorderCheckbox.checked = true;
+    // The world modifier interval slider was moved into the World Master modal.
+    // We'll attempt to find it in the modal when needed; keep references null for now.
+    let worldModifierSlider = document.getElementById('world-modifier-interval') || null;
+    let worldModifierValue = document.getElementById('world-modifier-value') || null;
     const roundsInput = document.getElementById('rounds-to-win');
+    const managePowerupsBtn = document.getElementById('setup-manage-powerups');
+    const manageWorldModsBtn = document.getElementById('setup-manage-mods');
+    const setupEnableWorldMods = document.getElementById('setup-enable-worldmods');
+    const setupEnablePowerups = document.getElementById('setup-enable-powerups');
+
+    function getSetupDeckUI() {
+        const controller = ensureGlobalDeckController();
+        if (!controller) return null;
+        if (window.gameWorldMasterInstance && window.gameWorldMasterInstance.ui) {
+            try { controller.attachWorldMaster(window.gameWorldMasterInstance); } catch (e) {}
+            return window.gameWorldMasterInstance.ui;
+        }
+        if (controller.ui && controller.uiSource === 'global') {
+            if (controller.uiAdapter) {
+                controller.uiAdapter.minWorldMods = controller.minWorldMods;
+                controller.uiAdapter.minPowerups = controller.minPowerups;
+            }
+            return controller.ui;
+        }
+        if (typeof WorldMasterUI !== 'function') return null;
+        const adapter = {
+            minWorldMods: controller.minWorldMods,
+            minPowerups: controller.minPowerups,
+            availableWorldMods: controller.availableWorldMods,
+            availablePowerups: controller.availablePowerups,
+            autoPick: true,
+            aiSelfPickPowerups: true,
+            toggleWorldMod: (name, enabled) => controller.toggleWorldMod(name, enabled, {}),
+            togglePowerup: (name, enabled) => controller.togglePowerup(name, enabled, {})
+        };
+        controller.uiAdapter = adapter;
+        controller.ui = new WorldMasterUI(adapter, { attachPanel: false, attachCooldownDisplay: false, activeModsPolling: false });
+        controller.uiSource = 'global';
+        return controller.ui;
+    }
+
+    if (managePowerupsBtn) {
+        managePowerupsBtn.onclick = () => {
+            if (typeof window.setupAllowPowerups !== 'undefined' && window.setupAllowPowerups === false) return;
+            const ui = getSetupDeckUI();
+            if (ui && typeof ui.showPowerupDeck === 'function') ui.showPowerupDeck();
+        };
+    }
+    if (manageWorldModsBtn) {
+        manageWorldModsBtn.onclick = () => {
+            if (typeof window.setupAllowWorldMods !== 'undefined' && window.setupAllowWorldMods === false) return;
+            const ui = getSetupDeckUI();
+            if (ui && typeof ui.showWorldModDeck === 'function') ui.showWorldModDeck();
+        };
+    }
+    // Initialize global flags for setup-enabled features (default true)
+    try {
+        window.setupAllowWorldMods = !(setupEnableWorldMods && setupEnableWorldMods.type === 'checkbox' && setupEnableWorldMods.checked === false);
+    } catch (e) { window.setupAllowWorldMods = true; }
+    try {
+        window.setupAllowPowerups = !(setupEnablePowerups && setupEnablePowerups.type === 'checkbox' && setupEnablePowerups.checked === false);
+    } catch (e) { window.setupAllowPowerups = true; }
+    // Reflect initial disabled state on the manage buttons
+    try {
+        const modsBtn = document.getElementById('setup-manage-mods');
+        const pupsBtn = document.getElementById('setup-manage-powerups');
+        if (modsBtn) {
+            if (!window.setupAllowWorldMods) modsBtn.classList.add('disabled'); else modsBtn.classList.remove('disabled');
+        }
+        if (pupsBtn) {
+            if (!window.setupAllowPowerups) pupsBtn.classList.add('disabled'); else pupsBtn.classList.remove('disabled');
+        }
+    } catch (e) {}
+    if (setupEnableWorldMods) setupEnableWorldMods.onchange = () => {
+        window.setupAllowWorldMods = !!setupEnableWorldMods.checked;
+        try { const modsBtn = document.getElementById('setup-manage-mods'); if (modsBtn) { if (!window.setupAllowWorldMods) modsBtn.classList.add('disabled'); else modsBtn.classList.remove('disabled'); } } catch (e) {}
+    };
+    if (setupEnablePowerups) setupEnablePowerups.onchange = () => {
+        window.setupAllowPowerups = !!setupEnablePowerups.checked;
+        try { const pupsBtn = document.getElementById('setup-manage-powerups'); if (pupsBtn) { if (!window.setupAllowPowerups) pupsBtn.classList.add('disabled'); else pupsBtn.classList.remove('disabled'); } } catch (e) {}
+    };
     
     densitySlider.oninput = () => { densityValue.textContent = densitySlider.value; };
     sizeSlider.oninput = () => { sizeValue.textContent = sizeSlider.value; };
@@ -5576,9 +7200,12 @@ function setupOverlayInit() {
     dynamicRateSlider.oninput = () => {
         dynamicRateValue.textContent = parseFloat(dynamicRateSlider.value).toFixed(2);
     };
-    worldModifierSlider.oninput = () => {
-        worldModifierValue.textContent = worldModifierSlider.value;
-    };
+    // If the setup slider exists (fallback), wire its display update. Otherwise, the modal will handle showing the value.
+    try {
+        if (worldModifierSlider && worldModifierValue) {
+            worldModifierSlider.oninput = () => { worldModifierValue.textContent = worldModifierSlider.value; };
+        }
+    } catch (e) {}
     // If host edits rounds input live, broadcast the change so joiner UI stays in sync
     try {
         if (roundsInput) {
@@ -5600,7 +7227,15 @@ function setupOverlayInit() {
         DYNAMIC_MODE = !!dynamicCheckbox.checked;
         DYNAMIC_RATE = parseFloat(dynamicRateSlider.value);
         MAP_BORDER = !!mapBorderCheckbox.checked;
-        worldModifierRoundInterval = parseInt(worldModifierSlider.value);
+        // Read world modifier interval from the modal slider if present, otherwise use the setup slider fallback
+        try {
+            const modalSlider = document.getElementById('wm-world-mod-interval');
+            if (modalSlider && modalSlider.type === 'range') {
+                worldModifierRoundInterval = parseInt(modalSlider.value);
+            } else if (worldModifierSlider) {
+                worldModifierRoundInterval = parseInt(worldModifierSlider.value);
+            }
+        } catch (e) {}
         // Read rounds-to-win setting
         try {
             const roundsInput = document.getElementById('rounds-to-win');
@@ -6013,14 +7648,33 @@ function startGame() {
             }
         }
     }
-    positionPlayersSafely();
-    // Ensure colors are right for current mode
+    window.positionPlayersSafely();
+    // Ensure colors and display names are right for current mode
     if (!NET.connected) {
         if (player) player.color = '#65c6ff';
         if (enemy) enemy.color = '#ff5a5a';
+    } else {
+        // Multiplayer: host is always blue, joiner is always red
+        if (NET.role === 'host') {
+            if (player) player.color = '#65c6ff';
+            if (enemy) enemy.color = '#ff5a5a';
+            if (player) player.displayName = NET.myName || 'Player 1';
+            if (enemy) enemy.displayName = NET.peerName || 'Player 2';
+        } else if (NET.role === 'joiner') {
+            if (player) player.color = '#ff5a5a';
+            if (enemy) enemy.color = '#65c6ff';
+            if (player) player.displayName = NET.myName || 'Player 2';
+            if (enemy) enemy.displayName = NET.peerName || 'Player 1';
+        }
     }
     // Ensure enemy existence and disabled flag according to selection
-    if (!enemy) enemy = new Player(false, "#ff5a5a", CANVAS_W*0.66, CANVAS_H/2);
+    if (!enemy) {
+        if (NET.connected && NET.role === 'joiner') {
+            enemy = new Player(false, "#65c6ff", window.CANVAS_W*0.33, CANVAS_H/2);
+        } else {
+            enemy = new Player(false, "#ff5a5a", window.CANVAS_W*0.66, CANVAS_H/2);
+        }
+    }
     enemyDisabled = (enemyCount <= 0);
     
     lastTimestamp = 0;
@@ -6111,7 +7765,7 @@ updateCardsUI();
 // --- Options modal wiring ---
 function saveVolumesToStorage() {
     try {
-        localStorage.setItem('shape_shot_volumes', JSON.stringify({ master: masterVolume, music: musicVolume, sfx: sfxVolume, shot: shotVolume, explosion: explosionVolume, ricochet: ricochetVolume, hit: hitVolume, dash: dashVolume }));
+        localStorage.setItem('shape_shot_volumes', JSON.stringify({ master: masterVolume, music: musicVolume, sfx: sfxVolume, shot: shotVolume, explosion: explosionVolume, ricochet: ricochetVolume, hit: hitVolume, dash: dashVolume, burning: burningVolume }));
     } catch (e) {}
 }
 
@@ -6136,11 +7790,15 @@ function applyVolumeSlidersToUI() {
     const hiv = document.getElementById('hit-vol-val');
     const da = document.getElementById('dash-vol');
     const dav = document.getElementById('dash-vol-val');
-    if (sh) { sh.value = Math.round(shotVolume * 100); if (shv) shv.innerText = sh.value; }
-    if (ex) { ex.value = Math.round(explosionVolume * 100); if (exv) exv.innerText = ex.value; }
-    if (ric) { ric.value = Math.round(ricochetVolume * 100); if (ricv) ricv.innerText = ric.value; }
-    if (hi) { hi.value = Math.round(hitVolume * 100); if (hiv) hiv.innerText = hi.value; }
-    if (da) { da.value = Math.round(dashVolume * 100); if (dav) dav.innerText = da.value; }
+    const bu = document.getElementById('burning-vol');
+    const buv = document.getElementById('burning-vol-val');
+    // Map multipliers so slider value 50 represents multiplier 1.0
+    if (sh) { sh.value = Math.round(shotVolume * 50); if (shv) shv.innerText = Math.round(sh.value); }
+    if (ex) { ex.value = Math.round(explosionVolume * 50); if (exv) exv.innerText = Math.round(ex.value); }
+    if (ric) { ric.value = Math.round(ricochetVolume * 50); if (ricv) ricv.innerText = Math.round(ric.value); }
+    if (hi) { hi.value = Math.round(hitVolume * 50); if (hiv) hiv.innerText = Math.round(hi.value); }
+    if (da) { da.value = Math.round(dashVolume * 50); if (dav) dav.innerText = Math.round(da.value); }
+    if (bu) { bu.value = Math.round(burningVolume * 50); if (buv) buv.innerText = Math.round(bu.value); }
 }
 
     // Load saved display name into setup input (if present)
@@ -6173,6 +7831,82 @@ document.addEventListener('DOMContentLoaded', function() {
             applyVolumeSlidersToUI();
         });
     }
+
+    // Defaults button: reset sound sliders and cursor prefs to defaults
+    const defaultsBtn = document.getElementById('options-defaults-btn');
+    function resetToDefaults() {
+        // sound defaults
+        masterVolume = 1.0;
+        musicVolume = 1.0;
+        sfxVolume = 1.0;
+        // per-effect defaults: set to 1.0 (slider 100) but UI expectation is 50==1.0,
+        // to preserve current audible level mapping we'll set sliders to 50 while
+        // treating their multiplier as 1.0 in code.
+        shotVolume = 1.0;
+        explosionVolume = 1.0;
+        ricochetVolume = 1.0;
+        hitVolume = 1.0;
+        dashVolume = 1.0;
+        burningVolume = 1.0;
+        // cursor defaults
+        try { localStorage.setItem('shape_shot_cursor', 'reticle'); localStorage.setItem('shape_shot_color', '#ffd86b'); } catch (e) {}
+        if (cursorSelect) cursorSelect.value = 'reticle';
+        if (cursorColorInput) cursorColorInput.value = '#ffd86b';
+        applyCursorStyle('reticle', '#ffd86b');
+        // persist volumes and update UI
+        saveVolumesToStorage();
+        applyVolumeSlidersToUI();
+    }
+    if (defaultsBtn) {
+        defaultsBtn.addEventListener('click', function() {
+            resetToDefaults();
+        });
+    }
+
+    // Cursor style selection: apply saved preference and wire change handler
+    const cursorSelect = document.getElementById('cursor-style');
+    const cursorColorInput = document.getElementById('cursor-color');
+    const canvasEl = document.getElementById('game');
+    function applyCursorStyle(style, colorHex) {
+        const c = (colorHex || '#ffd86b').replace('#','%23');
+        if (!canvasEl) return;
+        if (style === 'reticle') {
+            canvasEl.style.cursor = "url('data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"32\" viewBox=\"0 0 32 32\"><g fill=\"none\" stroke=\""+c+"\" stroke-width=\"1.8\"><circle cx=\"16\" cy=\"16\" r=\"7.2\"/></g><g stroke=\""+c+"\" stroke-width=\"1.6\"><path d=\"M16 2v4\"/><path d=\"M16 30v-4\"/><path d=\"M2 16h4\"/><path d=\"M30 16h-4\"/></g></svg>') 16 16, crosshair";
+        } else if (style === 'crosshair') {
+            // Use a small colored SVG crosshair so it respects the chosen color (fallback to system crosshair)
+            canvasEl.style.cursor = "url('data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\"><g fill=\"none\" stroke=\""+c+"\" stroke-width=\"1.6\"><path d=\"M12 0v5\"/><path d=\"M12 24v-5\"/><path d=\"M0 12h5\"/><path d=\"M24 12h-5\"/></g></svg>') 12 12, crosshair";
+        } else if (style === 'dot') {
+            canvasEl.style.cursor = "url('data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 16 16\"><circle cx=\"8\" cy=\"8\" r=\"2\" fill=\""+c+"\"/></svg>') 8 8, auto";
+        } else if (style === 'bigdot') {
+            canvasEl.style.cursor = "url('data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"32\" viewBox=\"0 0 32 32\"><circle cx=\"16\" cy=\"16\" r=\"5\" fill=\""+c+"\"/></svg>') 16 16, auto";
+        } else if (style === 'scope') {
+            // scope: outer ring + inner dot + small crosshair
+            canvasEl.style.cursor = "url('data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"40\" viewBox=\"0 0 40 40\"><g fill=\"none\" stroke=\""+c+"\" stroke-width=\"1.6\"><circle cx=\"20\" cy=\"20\" r=\"10\"/></g><circle cx=\"20\" cy=\"20\" r=\"3\" fill=\""+c+"\" /><g stroke=\""+c+"\" stroke-width=\"1.2\"><path d=\"M20 2v6\"/><path d=\"M20 38v-6\"/><path d=\"M2 20h6\"/><path d=\"M38 20h-6\"/></g></svg>') 20 20, crosshair";
+        } else {
+            canvasEl.style.cursor = 'auto';
+        }
+    }
+    try {
+        const saved = localStorage.getItem('shape_shot_cursor') || 'reticle';
+        const savedColor = localStorage.getItem('shape_shot_color') || '#ffd86b';
+        if (cursorSelect) { cursorSelect.value = saved; }
+        if (cursorColorInput) { cursorColorInput.value = savedColor; }
+        applyCursorStyle(saved, savedColor);
+    } catch (e) {}
+    if (cursorSelect) {
+        cursorSelect.addEventListener('change', function(e) {
+            try { localStorage.setItem('shape_shot_cursor', e.target.value); } catch (err) {}
+            const color = (cursorColorInput && cursorColorInput.value) ? cursorColorInput.value : '#ffd86b';
+            applyCursorStyle(e.target.value, color);
+        });
+    }
+    if (cursorColorInput) {
+        cursorColorInput.addEventListener('input', function(e) {
+            try { localStorage.setItem('shape_shot_color', e.target.value); } catch (err) {}
+            const style = (cursorSelect && cursorSelect.value) ? cursorSelect.value : 'reticle';
+            applyCursorStyle(style, e.target.value);
+        });
+    }
     if (backBtn && optionsModal) {
         backBtn.addEventListener('click', function() {
             optionsModal.style.display = 'none';
@@ -6185,11 +7919,13 @@ document.addEventListener('DOMContentLoaded', function() {
     function updateMaster(val) { masterVolume = val / 100; if (masterVal) masterVal.innerText = Math.round(val); }
     function updateMusic(val) { musicVolume = val / 100; if (musicVal) musicVal.innerText = Math.round(val); }
     function updateSfx(val) { sfxVolume = val / 100; if (sfxVal) sfxVal.innerText = Math.round(val); }
-    function updateShot(val) { shotVolume = val / 100; const el = document.getElementById('shot-vol-val'); if (el) el.innerText = Math.round(val); }
-    function updateExplosion(val) { explosionVolume = val / 100; const el = document.getElementById('explosion-vol-val'); if (el) el.innerText = Math.round(val); }
-    function updateRicochet(val) { ricochetVolume = val / 100; const el = document.getElementById('ricochet-vol-val'); if (el) el.innerText = Math.round(val); }
-    function updateHit(val) { hitVolume = val / 100; const el = document.getElementById('hit-vol-val'); if (el) el.innerText = Math.round(val); }
-    function updateDash(val) { dashVolume = val / 100; const el = document.getElementById('dash-vol-val'); if (el) el.innerText = Math.round(val); }
+    // Slider mapping: slider value 50 corresponds to multiplier 1.0
+    function updateShot(val) { shotVolume = val / 50; const el = document.getElementById('shot-vol-val'); if (el) el.innerText = Math.round(val); }
+    function updateExplosion(val) { explosionVolume = val / 50; const el = document.getElementById('explosion-vol-val'); if (el) el.innerText = Math.round(val); }
+    function updateRicochet(val) { ricochetVolume = val / 50; const el = document.getElementById('ricochet-vol-val'); if (el) el.innerText = Math.round(val); }
+    function updateHit(val) { hitVolume = val / 50; const el = document.getElementById('hit-vol-val'); if (el) el.innerText = Math.round(val); }
+    function updateDash(val) { dashVolume = val / 50; const el = document.getElementById('dash-vol-val'); if (el) el.innerText = Math.round(val); }
+    function updateBurning(val) { burningVolume = val / 50; const el = document.getElementById('burning-vol-val'); if (el) el.innerText = Math.round(val); }
 
     if (masterSlider) masterSlider.addEventListener('input', e => updateMaster(e.target.value));
     if (musicSlider) musicSlider.addEventListener('input', e => updateMusic(e.target.value));
@@ -6205,6 +7941,8 @@ document.addEventListener('DOMContentLoaded', function() {
     if (hitSlider) hitSlider.addEventListener('input', e => updateHit(e.target.value));
     const dashSlider = document.getElementById('dash-vol');
     if (dashSlider) dashSlider.addEventListener('input', e => updateDash(e.target.value));
+    const burningSlider = document.getElementById('burning-vol');
+    if (burningSlider) burningSlider.addEventListener('input', e => updateBurning(e.target.value));
 
     // initialize displayed slider values
     applyVolumeSlidersToUI();
@@ -6216,11 +7954,13 @@ document.addEventListener('DOMContentLoaded', function() {
         const btnRic = document.getElementById('preview-ricochet');
         const btnHit = document.getElementById('preview-hit');
         const btnDash = document.getElementById('preview-dash');
+        const btnBurning = document.getElementById('preview-burning');
         if (btnShot) btnShot.addEventListener('click', (e) => { e.stopPropagation(); try { playGunShot(); } catch (ex) {} });
         if (btnExpl) btnExpl.addEventListener('click', (e) => { e.stopPropagation(); try { playExplosion(); } catch (ex) {} });
         if (btnRic) btnRic.addEventListener('click', (e) => { e.stopPropagation(); try { playRicochet(); } catch (ex) {} });
         if (btnHit) btnHit.addEventListener('click', (e) => { e.stopPropagation(); try { playHit(); } catch (ex) {} });
         if (btnDash) btnDash.addEventListener('click', (e) => { e.stopPropagation(); try { playDashWoosh(0.28, 1.0); } catch (ex) {} });
+        if (btnBurning) btnBurning.addEventListener('click', (e) => { e.stopPropagation(); try { playBurning(1.0); } catch (ex) {} });
     } catch (e) { /* ignore if elements missing */ }
 
     // Inject subtle CSS for preview buttons to keep them visually light
@@ -6394,7 +8134,7 @@ function loadSavedMapByKey(key) {
     obstacles = [];
     const editorW = selectedMap.width || 780;
     const editorH = selectedMap.height || 420;
-    const scaleX = CANVAS_W / editorW;
+    const scaleX = window.CANVAS_W / editorW;
     const scaleY = CANVAS_H / editorH;
     for (const s of selectedMap.squares || []) {
         const x = s.x * scaleX;
@@ -6541,7 +8281,7 @@ devForm.addEventListener('submit', function(e) {
             bullets = [];
             explosions = [];
             generateObstacles();
-            positionPlayersSafely();
+            window.positionPlayersSafely();
             waitingForCard = false;
             logDev('Map refreshed (obstacles regenerated, players repositioned).');
             devInput.value = '';
@@ -6649,7 +8389,7 @@ devInput.addEventListener('keydown', function(e) {
                     infestationTimer = 0;
                 } catch (e) {}
                 generateObstacles();
-                positionPlayersSafely();
+                window.positionPlayersSafely();
                 waitingForCard = false;
                 logDev('Map refreshed (obstacles regenerated, players repositioned). World-mod transient entities cleared.');
                 devInput.value = '';

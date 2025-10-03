@@ -6,7 +6,8 @@
     <style>
         html, body { height: 100%; margin: 0; overflow: hidden; }
         body { background: #181c23; display: flex; justify-content: center; align-items: center; }
-        canvas { background: #232832; display: block; border: 2px solid #333; }
+    /* Custom reticle cursor for gameplay: SVG data URI with crosshair; falls back to system crosshair */
+    canvas { background: #232832; display: block; border: 2px solid #333; cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><g fill="none" stroke="%23ffd86b" stroke-width="1.8"><circle cx="16" cy="16" r="7.2"/></g><g stroke="%23ffd86b" stroke-width="1.6"><path d="M16 2v4"/><path d="M16 30v-4"/><path d="M2 16h4"/><path d="M30 16h-4"/></g></svg>') 16 16, crosshair; }
         #card-choices, #setup-overlay {
             position: absolute;
             left: 50%; top: 50%;
@@ -94,7 +95,10 @@
             opacity: 0.7;
             pointer-events: none;
         }
-
+            /* Teal accent for checkboxes and sliders in all browsers */
+        input[type="checkbox"], input[type="range"] {
+            accent-color: #0c7760;
+        }
         #setup-overlay {
             display: flex;
             flex-direction: column;
@@ -142,6 +146,24 @@
         }
         #setup-overlay button:hover {
             background: #56ff7a;
+        }
+        /* smaller, inline setup buttons used only for the "Manage Powerups/Mods" controls */
+        #setup-overlay .setup-mini-button {
+            padding: 6px 10px;
+            font-size: 0.95em;
+            border-radius: 6px;
+            min-width: 0;
+            line-height: 1;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        /* disabled look for management buttons when the feature is turned off */
+        #setup-overlay .setup-mini-button.disabled {
+            opacity: 0.5;
+            filter: grayscale(60%);
+            cursor: not-allowed;
+            box-shadow: none;
+            transform: none;
         }
         #setup-overlay .desc {
             color: #b7b7b7;
@@ -286,7 +308,7 @@
     </div>
     <div id="setup-overlay">
         <h2>Game Setup</h2>
-        <div class="desc">Choose obstacle density and size, then start the battle!</div>
+        <div class="desc">Shots</div>
         <div class="setup-row" style="margin-bottom:10px;">
             <label style="font-weight:bold; color:#65c6ff; margin-bottom:4px;">World Master Mode:</label>
             <div id="wm-toggle-row" style="display:flex; align-items:center; gap:12px;">
@@ -351,12 +373,21 @@
             <button id="delete-saved-map" style="margin-left:8px;">Delete</button>
             <button id="open-map-editor" style="margin-left:6px;">Map Editor</button>
         </div>
+        <!-- world modifier interval moved to World Modifier management modal -->
         <div class="setup-row">
-            <div class="setting-row">
-                <div class="setting-help" title="How many rounds between world modifier selections. World modifiers affect the entire game environment.">i</div>
-                <label for="world-modifier-interval" style="margin-bottom:0;">World Modifier Interval:</label>
-                <input type="range" id="world-modifier-interval" min="1" max="10" value="3" style="width:120px; margin-left:10px;">
-                <span id="world-modifier-value" class="slider-value">3</span>
+            <div class="setting-row" style="width:100%; align-items:center;">
+                <div class="setting-help" title="Choose which powerups and world modifiers can appear this match.">i</div>
+                <label style="font-weight:bold; color:#fff; margin-bottom:6px;">Card Availability:</label>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:nowrap; margin-top:6px;">
+                <button id="setup-manage-mods" class="setup-mini-button" style="border: 2px solid #915c91;background:#4a3357;color:#fff;">World Mods</button>
+                <label style="display:inline-flex; align-items:center; gap:6px; margin:0 8px 0 6px;">
+                    <input type="checkbox" id="setup-enable-worldmods" checked />
+                </label>
+                <button id="setup-manage-powerups" class="setup-mini-button" style="border: 2px solid #ffa148;background:#965212;color:#fff;">Powerups</button>
+                <label style="display:inline-flex; align-items:center; gap:6px; margin:0 0 0 6px;">
+                    <input type="checkbox" id="setup-enable-powerups" checked />
+                </label>
             </div>
         </div>
         <div class="setup-row">
@@ -420,36 +451,58 @@
             <div style="margin-bottom:8px; font-size:0.95em; color:#cfd8e3;">Per-effect volumes</div>
             <div style="margin-bottom:8px; display:flex; align-items:center; gap:8px;"><div style="flex:1 1 0;">
                 <label style="display:block;">Shot Volume: <span id="shot-vol-val" style="color:#ffda72; margin-left:8px;">100</span></label>
-                <input id="shot-vol" type="range" min="0" max="100" value="100" style="width:100%;" />
+                <input id="shot-vol" type="range" min="0" max="100" value="50" style="width:100%;" />
                 </div>
                 <button class="sfx-preview" id="preview-shot" title="Preview Shot" style="width:30px; height:24px;">▶</button>
             </div>
             <div style="margin-bottom:8px; display:flex; align-items:center; gap:8px;"><div style="flex:1 1 0;">
                 <label style="display:block;">Explosion Volume: <span id="explosion-vol-val" style="color:#ffda72; margin-left:8px;">100</span></label>
-                <input id="explosion-vol" type="range" min="0" max="100" value="100" style="width:100%;" />
+                <input id="explosion-vol" type="range" min="0" max="100" value="50" style="width:100%;" />
                 </div>
                 <button class="sfx-preview" id="preview-explosion" title="Preview Explosion" style="width:30px; height:24px;">▶</button>
             </div>
             <div style="margin-bottom:8px; display:flex; align-items:center; gap:8px;"><div style="flex:1 1 0;">
                 <label style="display:block;">Ricochet Volume: <span id="ricochet-vol-val" style="color:#ffda72; margin-left:8px;">100</span></label>
-                <input id="ricochet-vol" type="range" min="0" max="100" value="100" style="width:100%;" />
+                <input id="ricochet-vol" type="range" min="0" max="100" value="50" style="width:100%;" />
                 </div>
                 <button class="sfx-preview" id="preview-ricochet" title="Preview Ricochet" style="width:30px; height:24px;">▶</button>
             </div>
             <div style="margin-bottom:12px; display:flex; align-items:center; gap:8px;"><div style="flex:1 1 0;">
                 <label style="display:block;">Hit Volume: <span id="hit-vol-val" style="color:#ffda72; margin-left:8px;">100</span></label>
-                <input id="hit-vol" type="range" min="0" max="100" value="100" style="width:100%;" />
+                <input id="hit-vol" type="range" min="0" max="100" value="50" style="width:100%;" />
                 </div>
                 <button class="sfx-preview" id="preview-hit" title="Preview Hit" style="width:30px; height:24px;">▶</button>
             </div>
             <div style="margin-bottom:12px; display:flex; align-items:center; gap:8px;"><div style="flex:1 1 0;">
                 <label style="display:block;">Dash Volume: <span id="dash-vol-val" style="color:#ffda72; margin-left:8px;">100</span></label>
-                <input id="dash-vol" type="range" min="0" max="100" value="100" style="width:100%;" />
+                <input id="dash-vol" type="range" min="0" max="100" value="50" style="width:100%;" />
                 </div>
                 <button class="sfx-preview" id="preview-dash" title="Preview Dash" style="width:30px; height:24px;">▶</button>
             </div>
+            <div style="margin-bottom:12px; display:flex; align-items:center; gap:8px;"><div style="flex:1 1 0;">
+                <label style="display:block;">Burning Volume: <span id="burning-vol-val" style="color:#ffda72; margin-left:8px;">100</span></label>
+                <input id="burning-vol" type="range" min="0" max="100" value="50" style="width:100%;" />
+                </div>
+                <button class="sfx-preview" id="preview-burning" title="Preview Burning" style="width:30px; height:24px;">▶</button>
+            </div>
             <div style="display:flex; gap:8px; justify-content:flex-end;">
+                <button id="options-defaults-btn" title="Reset to defaults" style="background:#3d4351;color:#fff;border:none;padding:6px 10px;border-radius:6px;">Defaults</button>
                 <button id="options-back-btn">Back</button>
+            </div>
+            <div style="margin-top:10px; font-size:0.95em; color:#cfd8e3;">
+                <label style="display:block; margin-bottom:6px;">Cursor Style:</label>
+                <select id="cursor-style" style="width:100%; padding:6px; background:#13161a; color:#fff; border:1px solid #2f3440;">
+                    <option value="reticle">Reticle (default)</option>
+                    <option value="crosshair">Crosshair</option>
+                    <option value="dot">Dot</option>
+                    <option value="bigdot">Big Dot</option>
+                    <option value="scope">Scope</option>
+                    <option value="none">None (system)</option>
+                </select>
+            </div>
+            <div style="margin-top:8px; font-size:0.95em; color:#cfd8e3;">
+                <label style="display:block; margin-bottom:6px;">Cursor Color:</label>
+                <input id="cursor-color" type="color" value="#ffd86b" style="width:100%; height:34px; border-radius:6px; border:1px solid #2f3440; background:#13161a;" />
             </div>
         </div>
     </div>
@@ -515,6 +568,8 @@
     });
     </script>
     <script src="GameEventSystem.js"></script>
+    <script src="constants.js"></script>
+    <script src="utils.js"></script>
     <!-- WorldMaster mode scripts (must load before main.js) -->
     <script src="WorldMaster/WorldMaster.js"></script>
     <script src="WorldMaster/WorldMasterUI.js"></script>
@@ -526,6 +581,7 @@
     <script src="classes/infested-chunk.js"></script>
     <script src="classes/firestorm.js"></script>
     <script src="classes/explosion.js"></script>
+    <script src="classes/healer.js"></script>
     <script src="classes/bullet.js"></script>
     <script src="main.js"></script>
     <style>
