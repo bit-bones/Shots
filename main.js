@@ -6,8 +6,18 @@ window.gameWorldMaster.syncCardDecksFromNet = function(data) {
     if (data.cardType === 'mod') {
         if (data.enabled) {
             window.gameWorldMasterInstance.availableWorldMods.add(data.name);
+            // Sync activeWorldModifiers for joiner so badge updates
+            if (typeof window.activeWorldModifiers !== 'undefined' && Array.isArray(window.activeWorldModifiers)) {
+                if (!window.activeWorldModifiers.includes(data.name)) {
+                    window.activeWorldModifiers.push(data.name);
+                }
+            }
         } else {
             window.gameWorldMasterInstance.availableWorldMods.delete(data.name);
+            // Remove from activeWorldModifiers for joiner
+            if (typeof window.activeWorldModifiers !== 'undefined' && Array.isArray(window.activeWorldModifiers)) {
+                window.activeWorldModifiers = window.activeWorldModifiers.filter(m => m !== data.name);
+            }
         }
     } else if (data.cardType === 'powerup') {
         if (data.enabled) {
@@ -69,7 +79,13 @@ window.gameWorldMaster.syncCardDecksFromNet = function(data) {
             if (spreadChecks > MAX_SPREAD_CHECKS || newIgnited >= MAX_NEW_IGNITED) break;
         }
     }
-    if (window.gameWorldMasterInstance.ui) window.gameWorldMasterInstance.ui.updateCardDecks && window.gameWorldMasterInstance.ui.updateCardDecks();
+    // Always force badge/effects UI to update for joiner
+    if (window.gameWorldMasterInstance.ui) {
+        window.gameWorldMasterInstance.ui.updateCardDecks && window.gameWorldMasterInstance.ui.updateCardDecks();
+        if (typeof window.gameWorldMasterInstance.ui.renderActiveEffects === 'function') {
+            window.gameWorldMasterInstance.ui.renderActiveEffects();
+        }
+    }
 };
 window.gameWorldMaster.syncControlStateFromNet = function(data) {
     // data: { type: 'worldmaster-control', effectName }
@@ -207,6 +223,329 @@ let worldMasterPlayerIndex = null; // null = none, 0 = host, 1 = joiner1, 2 = jo
 let isMultiplayer = false;
 let lobbyPlayers = [];
 
+// --- Fighter Roster & Lifecycle Managers ---
+const playerRoster = (() => {
+    try {
+        if (window.playerRoster instanceof PlayerRoster) return window.playerRoster;
+        const roster = new PlayerRoster({ maxSlots: 4 });
+        window.playerRoster = roster;
+        return roster;
+    } catch (err) {
+        console.error('[Roster] Failed to bootstrap PlayerRoster', err);
+        const fallback = {
+            getSlots: () => [],
+            assignHuman: () => null,
+            assignBot: () => null,
+            clearSlot: () => null,
+            on: () => () => {},
+            ensureLobbyDefaults: () => null,
+            getActiveBotCount: () => 0,
+            describeSlot: () => ({ body: 'Unavailable', subtext: '', classes: ['empty'], fighter: null }),
+            toggleSlotState: () => ({ action: 'noop', fighter: null })
+        };
+        window.playerRoster = fallback;
+        return fallback;
+    }
+})();
+
+const matchLifecycleManager = (() => {
+    try {
+        if (window.matchLifecycleManager instanceof MatchLifecycleManager) return window.matchLifecycleManager;
+        const mgr = new MatchLifecycleManager({ roster: playerRoster });
+        window.matchLifecycleManager = mgr;
+        return mgr;
+    } catch (err) {
+        console.warn('[Lifecycle] Failed to initialize MatchLifecycleManager', err);
+        return null;
+    }
+})();
+
+const cardDraftManager = (() => {
+    try {
+        if (window.cardDraftManager instanceof CardDraftManager) return window.cardDraftManager;
+        const mgr = new CardDraftManager({ roster: playerRoster });
+        window.cardDraftManager = mgr;
+        return mgr;
+    } catch (err) {
+        console.warn('[Draft] Failed to initialize CardDraftManager', err);
+        return null;
+    }
+})();
+
+let rosterUIBound = false;
+let rosterInitialized = false;
+let localFighterId = null;
+
+const HOST_PLAYER_COLOR = '#65c6ff';
+const JOINER_PLAYER_COLORS = ['#ff5a5a', '#f7a945', '#9c6dfb'];
+const BOT_PLAYER_COLOR = '#f48f3a';
+
+function getJoinerColor(joinerIndex) {
+    const idx = Math.max(0, Math.floor(joinerIndex || 0));
+    return JOINER_PLAYER_COLORS[idx] || JOINER_PLAYER_COLORS[JOINER_PLAYER_COLORS.length - 1];
+}
+
+function getRosterFighterColor(slotIndex, fighter) {
+    if (fighter && fighter.metadata && typeof fighter.metadata.color === 'string' && fighter.metadata.color.trim().length) {
+        return fighter.metadata.color;
+    }
+    if (fighter && fighter.metadata && fighter.metadata.isHost) {
+        return HOST_PLAYER_COLOR;
+    }
+    if (slotIndex === 0) {
+        return HOST_PLAYER_COLOR;
+    }
+    if (fighter && fighter.metadata && typeof fighter.metadata.joinerIndex === 'number') {
+        return getJoinerColor(fighter.metadata.joinerIndex);
+    }
+    if (slotIndex > 0) {
+        return getJoinerColor(slotIndex - 1);
+    }
+    // For bots, prefer slot-derived color (host/joiner). If none available, use BOT_PLAYER_COLOR as fallback.
+    if (fighter && fighter.kind === 'bot') {
+        return BOT_PLAYER_COLOR;
+    }
+    return '';
+}
+
+function getRosterSlotsDetailed() {
+    try {
+        return playerRoster.getSlots({ includeDetails: true });
+    } catch (err) {
+        return [];
+    }
+}
+
+function getActiveBotCount() {
+    try {
+        return typeof playerRoster.getActiveBotCount === 'function'
+            ? playerRoster.getActiveBotCount({ includeUnassigned: false })
+            : 0;
+    } catch (err) {
+        return 0;
+    }
+}
+
+function updateEnemyFlagsFromRoster() {
+    const bots = getActiveBotCount();
+    window.activeBotCount = bots;
+    const mappedCount = bots > 0 ? Math.min(bots, 2) : 0;
+    if (typeof enemyCount !== 'undefined') {
+        enemyCount = mappedCount;
+    }
+    window.enemyCount = mappedCount;
+    const disabled = bots === 0;
+    if (typeof enemyDisabled !== 'undefined') {
+        enemyDisabled = disabled;
+    }
+    window.enemyDisabled = disabled;
+}
+
+function ensureRosterDefaults() {
+    if (!playerRoster || typeof playerRoster.getSlots !== 'function') return;
+    const isHostContext = (typeof NET === 'undefined') || !NET || !NET.connected || NET.role === 'host';
+    if (!isHostContext) {
+        rosterInitialized = true;
+        updateEnemyFlagsFromRoster();
+        return;
+    }
+    const nameInput = document.getElementById('display-name');
+    const hostName = (nameInput && nameInput.value && nameInput.value.trim()) || (nameInput && nameInput.placeholder) || 'Player 1';
+    try {
+        const hostId = typeof playerRoster.ensureLobbyDefaults === 'function'
+            ? playerRoster.ensureLobbyDefaults({ hostName, isMultiplayer, hostMetadata: { color: HOST_PLAYER_COLOR } })
+            : null;
+        if (hostId !== null && hostId !== undefined) {
+            localFighterId = hostId;
+        }
+    } catch (err) {
+        console.warn('[Roster] ensureLobbyDefaults failed', err);
+    } finally {
+        rosterInitialized = true;
+        updateEnemyFlagsFromRoster();
+    }
+}
+
+function describeRosterSlot(slotIndex) {
+    if (!playerRoster || typeof playerRoster.describeSlot !== 'function') {
+        return {
+            title: `Slot ${slotIndex + 1}`,
+            body: 'Unassigned',
+            subtext: slotIndex === 0 ? 'Local player' : 'Click to assign',
+            classes: ['empty']
+        };
+    }
+    return playerRoster.describeSlot(slotIndex, { includeFighter: true });
+}
+
+function onRosterSlotClicked(event) {
+    if (!canEditRoster()) return;
+    const el = event.currentTarget;
+    if (!el || typeof el.getAttribute !== 'function') return;
+    const slotIndex = parseInt(el.getAttribute('data-slot'), 10);
+    if (Number.isNaN(slotIndex)) return;
+    if (slotIndex === 0) return; // local slot fixed
+    try {
+        if (typeof playerRoster.toggleSlotState === 'function') {
+            playerRoster.toggleSlotState(slotIndex);
+        }
+    } catch (err) {
+        console.warn('[Roster] Slot toggle failed', err);
+    }
+}
+
+function canEditRoster() {
+    if (typeof NET === 'undefined' || !NET.connected) return true;
+    return NET.role === 'host';
+}
+
+function renderRosterUI() {
+    const grid = document.getElementById('roster-grid');
+    if (!grid) return;
+    ensureRosterDefaults();
+    const slots = getRosterSlotsDetailed();
+    const buttons = grid.querySelectorAll('.roster-slot');
+    buttons.forEach((btn) => {
+        const slotIndex = parseInt(btn.getAttribute('data-slot'), 10);
+        const data = slots[slotIndex] || {};
+        const desc = describeRosterSlot(slotIndex);
+        const fighter = (desc && desc.fighter) || data.fighter;
+        const titleEl = btn.querySelector('.slot-title');
+        const bodyEl = btn.querySelector('.slot-body');
+        const subEl = btn.querySelector('.slot-subtext');
+        const chipWrap = btn.querySelector('.slot-actions');
+        btn.classList.remove('empty', 'human', 'bot', 'worldmaster');
+        desc.classes.forEach(cls => btn.classList.add(cls));
+        if (titleEl) titleEl.textContent = `Slot ${slotIndex + 1}`;
+        if (bodyEl) {
+            bodyEl.textContent = desc.body;
+            const displayColor = getRosterFighterColor(slotIndex, fighter);
+            if (displayColor) {
+                bodyEl.style.color = displayColor;
+            } else if (bodyEl.style) {
+                bodyEl.style.removeProperty('color');
+            }
+        }
+        if (subEl) subEl.textContent = desc.subtext;
+        if (chipWrap) {
+            chipWrap.innerHTML = '';
+            if (fighter && fighter.metadata && fighter.metadata.isWorldMaster) {
+                const chip = document.createElement('span');
+                chip.className = 'slot-chip worldmaster';
+                chip.textContent = 'World Master';
+                chipWrap.appendChild(chip);
+            } else if (fighter && fighter.kind === 'bot') {
+                const chip = document.createElement('span');
+                chip.className = 'slot-chip bot';
+                chip.textContent = 'Bot';
+                chipWrap.appendChild(chip);
+            }
+        }
+        if (!canEditRoster() || slotIndex === 0 || (fighter && fighter.kind === 'human' && !(fighter.metadata && fighter.metadata.placeholder))) {
+            btn.disabled = true;
+            btn.classList.remove('selected');
+        } else {
+            btn.disabled = false;
+        }
+    });
+    const noteEl = document.getElementById('roster-note');
+    if (noteEl) {
+        noteEl.textContent = canEditRoster()
+            ? 'Click a slot to cycle between open seat and AI bot. Slot 1 is your local character.'
+            : 'Roster is managed by the host. Joiners view assignments here.';
+    }
+    updateEnemyFlagsFromRoster();
+}
+
+function getJoinerExternalId(joinerIndex) {
+    return `net-joiner-${Math.max(0, Math.floor(joinerIndex || 0))}`;
+}
+
+function getJoinerSlotIndex(joinerIndex) {
+    const fallbackSlots = (typeof playerRoster.getSlotCount === 'function') ? playerRoster.getSlotCount() : 4;
+    const maxSlots = Math.max(2, fallbackSlots);
+    const desired = Math.max(1, Math.floor(joinerIndex || 0) + 1);
+    return Math.min(maxSlots - 1, desired);
+}
+
+function assignRemoteJoinerToRoster(joinerIndex, displayName, metadataExtras = {}) {
+    try {
+        if (!playerRoster || typeof playerRoster.assignHuman !== 'function') return;
+        const slotIndex = getJoinerSlotIndex(joinerIndex);
+        const color = (metadataExtras && metadataExtras.color) || getJoinerColor(joinerIndex);
+        const descriptor = {
+            name: displayName || `Joiner ${joinerIndex + 1}`,
+            externalId: getJoinerExternalId(joinerIndex),
+            metadata: Object.assign({ control: 'remote', joinerIndex, color }, metadataExtras || {})
+        };
+        playerRoster.assignHuman(slotIndex, descriptor);
+    } catch (err) {
+        console.warn('[Roster] Failed to assign remote joiner', joinerIndex, err);
+    }
+}
+
+function clearRemoteJoinerFromRoster(joinerIndex) {
+    try {
+        if (!playerRoster) return;
+        const externalId = getJoinerExternalId(joinerIndex);
+        if (typeof playerRoster.getFighterByExternalId === 'function') {
+            const fighter = playerRoster.getFighterByExternalId(externalId);
+            if (fighter && typeof playerRoster.removeFighterById === 'function') {
+                playerRoster.removeFighterById(fighter.id, { forgetExternal: true });
+                return;
+            }
+        }
+        if (typeof playerRoster.clearSlot === 'function') {
+            const slotIndex = getJoinerSlotIndex(joinerIndex);
+            playerRoster.clearSlot(slotIndex, { removeFighter: true, forgetExternal: true });
+        }
+    } catch (err) {
+        console.warn('[Roster] Failed to clear remote joiner slot', joinerIndex, err);
+    }
+}
+
+function broadcastRosterSnapshot() {
+    try {
+        if (typeof NET === 'undefined' || !NET || NET.role !== 'host' || !NET.connected) return;
+        if (!window.ws || window.ws.readyState !== WebSocket.OPEN) return;
+        if (!playerRoster || typeof playerRoster.toSerializable !== 'function') return;
+        const rosterSnap = playerRoster.toSerializable({ includeEntity: false });
+        window.ws.send(JSON.stringify({
+            type: 'relay',
+            data: {
+                type: 'roster-sync',
+                roster: rosterSnap,
+                emittedAt: Date.now()
+            }
+        }));
+    } catch (err) {
+        /* non-fatal: roster sync is best-effort */
+    }
+}
+
+function bindRosterUI() {
+    if (rosterUIBound) return;
+    const grid = document.getElementById('roster-grid');
+    if (!grid) return;
+    ensureRosterDefaults();
+    grid.querySelectorAll('.roster-slot').forEach(btn => {
+        btn.addEventListener('click', onRosterSlotClicked);
+    });
+    if (typeof playerRoster.on === 'function') {
+        playerRoster.on(PlayerRoster.EVENTS.ROSTER_UPDATED, () => {
+            renderRosterUI();
+            if (typeof NET !== 'undefined' && NET && NET.role === 'host') {
+                if (typeof broadcastSetup === 'function') {
+                    try { broadcastSetup(); } catch (e) {}
+                }
+                try { broadcastRosterSnapshot(); } catch (e) {}
+            }
+        });
+    }
+    rosterUIBound = true;
+    renderRosterUI();
+}
+
 // --- WorldMaster Integration ---
 window.gameWorldMasterInstance = null;
 
@@ -299,10 +638,15 @@ function destroyWorldMasterInstance() {
 function getLobbyPlayers() {
     // Dummy implementation: replace with actual lobby player retrieval
     // For now, just return host and up to 2 joiners
-    let players = [{ id: 0, name: 'Host' }];
-    if (typeof NET !== 'undefined' && NET.joiners) {
+    const hostLabel = (typeof NET !== 'undefined')
+        ? (NET.role === 'host' ? (NET.myName || 'Host') : (NET.hostName || NET.peerName || 'Host'))
+        : 'Host';
+    const players = [{ id: 0, name: hostLabel }];
+    if (typeof NET !== 'undefined' && Array.isArray(NET.joiners)) {
         for (let i = 0; i < NET.joiners.length; ++i) {
-            players.push({ id: i + 1, name: NET.joiners[i].name || `Joiner ${i + 1}` });
+            const entry = NET.joiners[i];
+            if (!entry) continue;
+            players.push({ id: i + 1, name: entry.name || `Joiner ${i + 1}` });
         }
     }
     return players;
@@ -620,6 +964,19 @@ function updateWorldMasterRoleBanner() {
 
 // Call this after DOMContentLoaded and whenever lobby/connection state changes
 document.addEventListener('DOMContentLoaded', () => {
+    // Options button opens options modal
+    const optionsBtn = document.getElementById('open-options-btn');
+    const optionsModal = document.getElementById('options-overlay');
+    if (optionsBtn && optionsModal) {
+        optionsBtn.addEventListener('click', function() {
+            // Hide setup/roster modal if visible
+            var setupModal = document.getElementById('setup-overlay');
+            if (setupModal && setupModal.style.display !== 'none') {
+                setupModal.style.display = 'none';
+            }
+            optionsModal.style.display = 'block';
+        });
+    }
     // --- Prevent browser menus and stuck movement when clicking outside canvas ---
     // Prevent right-click context menu anywhere
     document.addEventListener('contextmenu', function(e) {
@@ -1812,6 +2169,10 @@ function handleLocalReadyForStart(roundStartPayload) {
 const NET = {
     role: null, // 'host' | 'joiner'
     connected: false,
+    hostName: '',
+    joiners: [],
+    joinerIndex: null,
+    pendingName: '',
     inputSeq: 0,
     lastInputSentAt: 0,
     lastSnapshotSentAt: 0,
@@ -1836,7 +2197,48 @@ const NET = {
     // Joiner-side smoothing targets
     joinerTargets: { p0: null, p1: null, healers: new Map() },
     myName: '', // local player's display name
-    peerName: '', // remote player's display name (host stores joiner name)
+    peerName: '', // first remote player's display name (legacy fallback)
+    resetSessionState() {
+        this.joiners = [];
+        this.joinerIndex = null;
+        this.peerName = '';
+        this.hostName = '';
+        this.pendingName = '';
+    },
+    updateJoinerName(index, name, meta = {}) {
+        if (!Number.isInteger(index) || index < 0) return;
+        while (this.joiners.length <= index) this.joiners.push(null);
+        const current = this.joiners[index] || { index };
+        const cleaned = (name || '').toString().slice(0, 32);
+        current.index = index;
+        if (cleaned.length) current.name = cleaned;
+        const mergedMeta = Object.assign({}, current.meta || {}, meta || {});
+        if (!mergedMeta.color) {
+            mergedMeta.color = getJoinerColor(index);
+        }
+        current.meta = mergedMeta;
+        this.joiners[index] = current;
+        if (this.role === 'host') {
+            if (!this.peerName || index === 0) {
+                this.peerName = current.name || this.peerName || '';
+            }
+        }
+    },
+    getJoinerName(index) {
+        if (!Number.isInteger(index) || index < 0) return '';
+        const entry = this.joiners[index];
+        return entry && entry.name ? entry.name : '';
+    },
+    removeJoiner(index) {
+        if (!Number.isInteger(index) || index < 0) return;
+        if (index < this.joiners.length) {
+            this.joiners[index] = null;
+        }
+        if (this.role === 'host' && index === 0) {
+            const next = this.joiners.find(entry => entry && entry.name);
+            this.peerName = next ? next.name : '';
+        }
+    },
     setRole(role) {
         this.role = role;
         this.updateEventSystem();
@@ -2203,11 +2605,12 @@ const NET = {
         // Close ws gracefully
         try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.close(); } catch (e) {}
         this.setConnected(false);
+        this.resetSessionState();
         // Reset latches
         this.remoteShootQueued = false; this.remoteDashQueued = false;
         // Revert colors to single-player default
-        if (player) player.color = '#65c6ff';
-        if (enemy) enemy.color = '#ff5a5a';
+    if (player) player.color = HOST_PLAYER_COLOR;
+    if (enemy) enemy.color = getJoinerColor(0);
         // Stop current game loop and show setup so both players are forced back to lobby
         try { stopGame(); } catch (e) {}
         // Show reconnect button to allow the user to attempt to reconnect to the same session
@@ -2216,6 +2619,35 @@ const NET = {
         try { console.warn('Multiplayer disconnected:', reason); } catch (e) {}
     }
 };
+
+function isEnemySuppressedForGameplay() {
+    if (!enemyDisabled) return false;
+    if (NET && NET.connected) {
+        if (NET.role === 'host') {
+            return !(Array.isArray(NET.joiners) && NET.joiners.some(entry => entry && entry.index === 0));
+        }
+        if (NET.role === 'joiner') {
+            return false;
+        }
+    }
+    return true;
+}
+
+function sendLocalDisplayName(extra = {}) {
+    if (!window.ws || window.ws.readyState !== WebSocket.OPEN) return;
+    const name = (NET.myName || '').toString().slice(0, 32);
+    const payload = Object.assign({}, extra || {}, {
+        type: 'set-name',
+        name,
+        role: NET.role
+    });
+    if (NET.role === 'joiner' && Number.isInteger(NET.joinerIndex)) {
+        payload.joinerIndex = NET.joinerIndex;
+    }
+    try {
+        window.ws.send(JSON.stringify({ type: 'relay', data: payload }));
+    } catch (e) {}
+}
 
 
 // === Effect Processing Functions for Joiner-Side Visuals ===
@@ -2530,6 +2962,7 @@ function getEntityForRole(role) {
 // --- Procedural Obstacle Generation ---
 function generateObstacles() {
     obstacles = [];
+    const enemySuppressed = isEnemySuppressedForGameplay();
     let tries = 0;
     while (obstacles.length < OBSTACLE_COUNT && tries < 100) {
         tries++;
@@ -2546,7 +2979,7 @@ function generateObstacles() {
         } else {
             if (dist(centerX, centerY, window.CANVAS_W/3, CANVAS_H/2) <= 110) safe = false;
         }
-        if (!enemyDisabled && typeof enemy !== 'undefined' && enemy) {
+        if (!enemySuppressed && typeof enemy !== 'undefined' && enemy) {
             let minDist = Math.max(w, h) * 0.6 + enemy.radius + 12;
             if (dist(centerX, centerY, enemy.x, enemy.y) <= minDist) safe = false;
         } else {
@@ -2590,6 +3023,7 @@ function spawnDynamicObstacle() {
     if (activeCount >= OBSTACLE_COUNT) return;
 
     let tries = 0;
+    const enemySuppressed = isEnemySuppressedForGameplay();
     while (tries < 60) {
         tries++;
         let size = rand(OBSTACLE_MIN_SIZE, OBSTACLE_MAX_SIZE);
@@ -2605,7 +3039,7 @@ function spawnDynamicObstacle() {
         }
         if (!safe) continue;
     if (dist(centerX, centerY, player.x, player.y) <= 90) safe = false;
-    if (!enemyDisabled && dist(centerX, centerY, enemy.x, enemy.y) <= 90) safe = false;
+    if (!enemySuppressed && dist(centerX, centerY, enemy.x, enemy.y) <= 90) safe = false;
         if (!safe) continue;
         // Prefer to reuse a destroyed slot so array length doesn't grow
         let replaced = false;
@@ -2734,6 +3168,8 @@ function update(dt) {
     // --- Multiplayer Sync (host-authoritative) ---
     NET.onFrame(dt);
     const simulateLocally = !NET.connected || NET.role === 'host';
+    const enemySuppressed = isEnemySuppressedForGameplay();
+    const activeEnemy = enemy && !enemySuppressed;
     // Joiner: smooth positions toward latest snapshot targets and tick timers locally
     if (NET.connected && NET.role === 'joiner') {
         const s = 25; // smoothing rate (higher = snappier)
@@ -2810,7 +3246,7 @@ function update(dt) {
         player.updateBurning(dt);
         if (typeof player.update === 'function') player.update(dt);
     }
-    if (!enemyDisabled && enemy) {
+    if (activeEnemy) {
         enemy.updateBurning(dt);
         if (typeof enemy.update === 'function') enemy.update(dt);
     }
@@ -3170,7 +3606,7 @@ function update(dt) {
     // Update infested chunks
     for (let ic of infestedChunks) {
         if (ic.active) {
-            ic.update(dt, [player].concat(enemyDisabled ? [] : [enemy]));
+            ic.update(dt, [player].concat(enemySuppressed ? [] : [enemy]));
         }
     }
     infestedChunks = infestedChunks.filter(ic => ic.active);
@@ -3193,8 +3629,8 @@ function update(dt) {
     if (keys['d']) input.x += 1;
     // use top-level getDashSettings(p)
     // Suppress local player controls when host is driving blue as AI (joiner is WM and Enemy AI enabled)
-    const joinerIsWM_AI_On = !!(NET.connected && NET.role === 'host' && worldMasterEnabled && (worldMasterPlayerIndex|0) === 1 && !enemyDisabled);
-    const hostIsWM_AI_On = !!(NET.connected && NET.role === 'host' && worldMasterEnabled && (worldMasterPlayerIndex|0) === 0 && !enemyDisabled);
+    const joinerIsWM_AI_On = !!(NET.connected && NET.role === 'host' && worldMasterEnabled && (worldMasterPlayerIndex|0) === 1 && !enemySuppressed);
+    const hostIsWM_AI_On = !!(NET.connected && NET.role === 'host' && worldMasterEnabled && (worldMasterPlayerIndex|0) === 0 && !enemySuppressed);
     if (simulateLocally && player.dash && !joinerIsWM_AI_On && !hostIsWM_AI_On) {
         if (keys['shift'] && !player.dashActive && player.dashCooldown <= 0) {
             let dashVec = { x: 0, y: 0 };
@@ -3218,7 +3654,7 @@ function update(dt) {
         if (player.dashActive) {
             let dashSet = getDashSettings(player);
             if (isTeledashEnabled(player)) {
-                const blockers = { obstacles, others: enemyDisabled ? [] : [enemy] };
+                const blockers = { obstacles, others: enemySuppressed ? [] : [enemy] };
                 const aimProvider = () => ({ x: mouse.x, y: mouse.y });
                 updateTeledashWarmup(player, dt, dashSet, aimProvider, blockers);
             } else {
@@ -3231,7 +3667,7 @@ function update(dt) {
                 player.y = clamp(player.y, player.radius, CANVAS_H-player.radius);
                 let collided = false;
                 // First: check collision with the enemy (characters) so ramming hits players/enemies directly in open space
-                if (!enemyDisabled && player.ram && dist(player.x, player.y, enemy.x, enemy.y) < player.radius + enemy.radius) {
+                if (activeEnemy && player.ram && dist(player.x, player.y, enemy.x, enemy.y) < player.radius + enemy.radius) {
                     let dmg = 18 + (player.ramStacks || 0) * 6; // damage scales per ram stack
                     enemy._lastAttacker = player;
                     enemy.takeDamage(dmg);
@@ -3328,7 +3764,7 @@ function update(dt) {
             tickLocalTeledashWarmup(player, dt);
         }
     } catch (e) {}
-    if (simulateLocally && !enemyDisabled && enemy.dash && !NET.connected) {
+    if (simulateLocally && !enemySuppressed && enemy.dash && !NET.connected) {
         if (!enemy.dashActive && Math.random() < 0.003 && enemy.dashCooldown <= 0) {
             let dx = enemy.x - player.x, dy = enemy.y - player.y;
             let norm = Math.hypot(dx, dy);
@@ -3618,7 +4054,7 @@ function update(dt) {
         // No movement/AI here
     }
     // Check if blue AI is controlling player to avoid double increment
-    const blueAIActive = !!(NET.connected && NET.role === 'host' && worldMasterEnabled && !enemyDisabled && 
+    const blueAIActive = !!(NET.connected && NET.role === 'host' && worldMasterEnabled && !enemySuppressed && 
         ((worldMasterPlayerIndex === 0) || (worldMasterPlayerIndex === 1)));
     if (simulateLocally && !blueAIActive) player.timeSinceShot += dt;
     if (simulateLocally && !blueAIActive && player.shootQueued && player.timeSinceShot >= player.shootInterval) {
@@ -3645,7 +4081,7 @@ function update(dt) {
     }
     // Disable enemy AI entirely when multiplayer is active; only run in solo
     // --- AI Logic: Support WorldMaster mode (2 AI fight each other) ---
-    if (simulateLocally && !enemyDisabled && !NET.connected) {
+    if (simulateLocally && !enemySuppressed && !NET.connected) {
         // WorldMaster mode: host is world master, 2 AI fight each other
         if (window.localPlayerIndex === -1 && window.aiCount === 2) {
             // Ensure both AI exist
@@ -3773,7 +4209,7 @@ function update(dt) {
         const twoPlayers = (Array.isArray(NET.joiners) ? NET.joiners.length === 1 : true);
         // Host drives blue AI when: (1) host is WM, or (2) joiner is WM and Enemy AI is on
         
-        const shouldDriveBlueAI = !!(worldMasterEnabled && !enemyDisabled && 
+        const shouldDriveBlueAI = !!(worldMasterEnabled && !enemySuppressed && 
             ((worldMasterPlayerIndex === 0) || (worldMasterPlayerIndex === 1)));
         
         if (twoPlayers && shouldDriveBlueAI) {
@@ -3893,7 +4329,7 @@ function update(dt) {
         // Host drives red AI when joiner is WM and Enemy AI is enabled
         const twoPlayers = (Array.isArray(NET.joiners) ? NET.joiners.length === 1 : true);
         
-        const shouldDriveRedAI = !!(worldMasterEnabled && !enemyDisabled && (worldMasterPlayerIndex === 1));
+    const shouldDriveRedAI = !!(worldMasterEnabled && !enemySuppressed && (worldMasterPlayerIndex === 1));
         
         if (twoPlayers && shouldDriveRedAI) {
             // From host perspective: enemy is red (joiner), player is blue (host). We want red to be AI, blue is human.
@@ -4057,7 +4493,7 @@ function update(dt) {
     }
     for (let o of obstacles) o.update(dt);
     // Always update explosion visuals. Only apply damage/chunk updates on the authoritative side (host or single-player).
-    const explosionPlayers = [player].concat(enemyDisabled ? [] : [enemy]);
+    const explosionPlayers = [player].concat(enemySuppressed ? [] : [enemy]);
     const explosionHealers = (healersActive && healers.length) ? healers.filter(h => h && h.active) : [];
     for (let e of explosions) {
         if (!e.done) e.update(dt, obstacles, explosionPlayers, simulateLocally, explosionHealers);
@@ -4070,7 +4506,7 @@ function update(dt) {
         if (!b.active) continue;
         let victim = null;
         if (b.owner === player) {
-            victim = enemyDisabled ? null : enemy;
+            victim = activeEnemy ? enemy : null;
         } else {
             victim = player;
         }
@@ -4813,10 +5249,11 @@ function draw() {
     if (firestormInstance) {
         firestormInstance.draw(ctx);
     }
+    const enemySuppressedNow = isEnemySuppressedForGameplay();
     // Draw local 'player' entity unless it's the blue character in WM-without-AI (host view)
     if (typeof player !== 'undefined' && player) {
         const hostIsWMNow_A = NET.connected && worldMasterEnabled && ((((worldMasterPlayerIndex|0) === 0)) || (NET.role === 'host' && window.localPlayerIndex === -1));
-        const hidePlayerBlue = hostIsWMNow_A && worldMasterEnabled && enemyDisabled && (NET.role === 'host');
+        const hidePlayerBlue = hostIsWMNow_A && worldMasterEnabled && enemySuppressedNow && (NET.role === 'host');
         if (!hidePlayerBlue) drawPlayer(player);
     }
     // Determine which character should be hidden based on WM mode and Enemy AI
@@ -4824,8 +5261,8 @@ function draw() {
     const joinerIsWM = NET.connected && worldMasterEnabled && (worldMasterPlayerIndex === 1);
     
     // Host=blue, Joiner=red. Hide the non-WM character when Enemy AI is disabled
-    const hideBlueChar = hostIsWM && enemyDisabled;
-    const hideRedChar = joinerIsWM && enemyDisabled;
+    const hideBlueChar = hostIsWM && enemySuppressedNow;
+    const hideRedChar = joinerIsWM && enemySuppressedNow;
     
     // Draw enemy unless it should be hidden
     if (!((NET.role === 'host' && hideRedChar) || (NET.role === 'joiner' && hideBlueChar))) {
@@ -4855,9 +5292,9 @@ function draw() {
         
         // Determine WM status
         
-        const hostIsWM = !!(worldMasterEnabled && (worldMasterPlayerIndex === 0));
-        const joinerIsWM = !!(worldMasterEnabled && (worldMasterPlayerIndex === 1));
-        const aiEnabled = !enemyDisabled;
+    const hostIsWM = !!(worldMasterEnabled && (worldMasterPlayerIndex === 0));
+    const joinerIsWM = !!(worldMasterEnabled && (worldMasterPlayerIndex === 1));
+    const aiEnabled = !enemySuppressedNow;
         
         
         // Draw blue header (host)
@@ -6036,9 +6473,9 @@ function updateCardsUI() {
     // Apply World Master logic according to exact specification
     
     if (NET.connected && worldMasterEnabled) {
-        const hostIsWM = (worldMasterPlayerIndex === 0);
-        const joinerIsWM = (worldMasterPlayerIndex === 1);
-        const aiEnabled = !enemyDisabled;
+    const hostIsWM = (worldMasterPlayerIndex === 0);
+    const joinerIsWM = (worldMasterPlayerIndex === 1);
+    const aiEnabled = !isEnemySuppressedForGameplay();
         
         
         if (hostIsWM) {
@@ -6340,6 +6777,7 @@ function setupOverlayInit() {
                         } else if (eff === 'Dynamic' || eff === 'Dynamic-Spawn' || eff === 'Dynamic-Despawn') {
                             // Equal in/out behavior: keep total live obstacles constant
                             try {
+                                const enemySuppressed = isEnemySuppressedForGameplay();
                                 // Destroy helper
                                 const destroyIdx = (idx) => {
                                     const o = obstacles[idx]; if (!o || o.destroyed) return false;
@@ -6368,7 +6806,7 @@ function setupOverlayInit() {
                                         }
                                         if (!safe) continue;
                                         if (dist(centerX, centerY, player.x, player.y) <= 90) safe = false;
-                                        if (!enemyDisabled && dist(centerX, centerY, enemy.x, enemy.y) <= 90) safe = false;
+                                        if (!enemySuppressed && dist(centerX, centerY, enemy.x, enemy.y) <= 90) safe = false;
                                         if (!safe) continue;
                                         return candidate;
                                     }
@@ -6473,32 +6911,102 @@ function setupOverlayInit() {
         window.ws.onmessage = function(event) {
             let msg;
             try { msg = JSON.parse(event.data); } catch (e) { return; }
+            if (msg.type === 'error') {
+                const message = (msg && msg.message) ? msg.message : 'An error occurred while communicating with the server.';
+                alert(message);
+                return;
+            }
             if (msg.type === 'hosted') {
                 if (mpSessionCode) mpSessionCode.value = msg.code;
                 if (typeof setMpSessionDisplay === 'function') setMpSessionDisplay(msg.code);
-                try { if (typeof setLobbyPlayers === 'function') setLobbyPlayers(NET.myName || 'Player 1', NET.peerName || 'Player 2'); } catch (e) {}
+                window.wsSession = msg.code;
+                if (!NET.hostName) NET.hostName = NET.myName || 'Host';
+                try {
+                    if (typeof setLobbyPlayers === 'function') {
+                        setLobbyPlayers(NET.myName || 'Player 1', NET.getJoinerName(0) || NET.peerName || 'Player 2');
+                    }
+                } catch (e) {}
                 try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
                 try { updateWorldMasterSetupUI(); } catch (e) {}
             } else if (msg.type === 'joined') {
                 hideMpModal();
                 alert('Joined session: ' + msg.code);
+                window.wsSession = msg.code;
                 if (mpSessionCode) mpSessionCode.value = msg.code;
                 if (typeof setMpSessionDisplay === 'function') setMpSessionDisplay(msg.code);
-                try { if (typeof setLobbyPlayers === 'function') setLobbyPlayers(NET.peerName || 'Player 1', NET.myName || 'Player 2'); } catch (e) {}
-                try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
-                try { updateWorldMasterSetupUI(); } catch (e) {}
-            } else if (msg.type === 'peer-joined') {
-                hideMpModal();
-                alert('A player has joined your session!');
-                try { if (typeof setLobbyPlayers === 'function') setLobbyPlayers(NET.myName || 'Player 1', NET.peerName || 'Player 2'); } catch (e) {}
-                try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
-                try { updateWorldMasterSetupUI(); } catch (e) {}
-                // If we're the host, immediately send our display name to the newly joined peer
+                const idx = (typeof msg.joinerIndex === 'number' && msg.joinerIndex >= 0) ? msg.joinerIndex : null;
+                NET.joinerIndex = idx;
+                if (idx !== null) {
+                    const localName = NET.pendingName || NET.myName || '';
+                    if (localName) {
+                        NET.updateJoinerName(idx, localName, { control: 'local' });
+                    }
+                }
+                if (NET.pendingName) {
+                    NET.myName = NET.pendingName;
+                    NET.pendingName = '';
+                }
+                sendLocalDisplayName();
                 try {
-                    if (NET.role === 'host' && NET.myName && window.ws && window.ws.readyState === WebSocket.OPEN) {
-                        window.ws.send(JSON.stringify({ type: 'relay', data: { type: 'set-name', name: NET.myName } }));
+                    if (typeof setLobbyPlayers === 'function') {
+                        const hostLabel = NET.hostName || NET.peerName || 'Host';
+                        setLobbyPlayers(hostLabel, NET.myName || 'Player 2');
                     }
                 } catch (e) {}
+                try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
+                try { updateWorldMasterSetupUI(); } catch (e) {}
+                try { renderRosterUI(); } catch (e) {}
+            } else if (msg.type === 'peer-joined') {
+                hideMpModal();
+                const idx = (typeof msg.joinerIndex === 'number' && msg.joinerIndex >= 0) ? msg.joinerIndex : 0;
+                if (NET.role === 'host') {
+                    alert('A player has joined your session!' + (Number.isInteger(idx) ? ` (Slot ${idx + 2})` : ''));
+                    const existingName = NET.getJoinerName(idx);
+                    const placeholder = existingName || `Joiner ${idx + 1}`;
+                    NET.updateJoinerName(idx, placeholder, { control: 'remote' });
+                    assignRemoteJoinerToRoster(idx, placeholder, { isPending: true });
+                    sendLocalDisplayName();
+                    try { broadcastRosterSnapshot(); } catch (e) {}
+                } else {
+                    if (idx !== NET.joinerIndex) {
+                        const existingName = NET.getJoinerName(idx);
+                        NET.updateJoinerName(idx, existingName || `Joiner ${idx + 1}`, { control: 'remote' });
+                    }
+                }
+                try {
+                    if (typeof setLobbyPlayers === 'function') {
+                        const hostLabel = NET.role === 'host' ? (NET.myName || 'Host') : (NET.hostName || NET.peerName || 'Host');
+                        const joinerLabel = NET.role === 'host' ? (NET.getJoinerName(0) || NET.peerName || 'Joiner') : (NET.myName || 'Player 2');
+                        setLobbyPlayers(hostLabel, joinerLabel);
+                    }
+                } catch (e) {}
+                try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
+                try { updateWorldMasterSetupUI(); } catch (e) {}
+                try { renderRosterUI(); } catch (e) {}
+            } else if (msg.type === 'peer-left') {
+                const idx = (typeof msg.joinerIndex === 'number' && msg.joinerIndex >= 0) ? msg.joinerIndex : null;
+                if (idx !== null) {
+                    if (NET.role === 'host') {
+                        try { clearRemoteJoinerFromRoster(idx); } catch (e) {}
+                        try { broadcastRosterSnapshot(); } catch (e) {}
+                    }
+                    NET.removeJoiner(idx);
+                }
+                try {
+                    if (typeof setLobbyPlayers === 'function') {
+                        const hostLabel = NET.role === 'host' ? (NET.myName || 'Host') : (NET.hostName || NET.peerName || 'Host');
+                        const joinerLabel = NET.role === 'host' ? (NET.getJoinerName(0) || NET.peerName || 'Joiner') : (NET.myName || 'Player 2');
+                        setLobbyPlayers(hostLabel, joinerLabel);
+                    }
+                } catch (e) {}
+                try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
+                try { updateWorldMasterSetupUI(); } catch (e) {}
+                try { renderRosterUI(); } catch (e) {}
+            } else if (msg.type === 'host-left') {
+                if (NET.role === 'joiner') {
+                    alert('Host left the session. You have been disconnected.');
+                    NET.handleDisconnect('Host left the session');
+                }
             } else if (msg.type === 'relay') {
                 // New routing: input from joiner to host, snapshots from host to joiner
                 const data = msg.data;
@@ -6521,19 +7029,85 @@ function setupOverlayInit() {
                     }
                 } else if (data && data.type === 'snapshot' && NET.role === 'joiner') {
                     NET.applySnapshot(data.snap);
-                } else if (data && data.type === 'set-name' && NET.role === 'host') {
-                    // Joiner sent their display name
-                    try { NET.peerName = (data.name||'').toString().slice(0,32); } catch(e) { NET.peerName = ''; }
-                    try { if (NET.role === 'host' && NET.connected) NET.sendSnapshot(); } catch(e) {}
+                } else if (data && data.type === 'set-name') {
+                    const rawName = (data.name || '').toString();
+                    const name = rawName.slice(0, 32);
+                    const joinerIdx = (typeof data.joinerIndex === 'number' && data.joinerIndex >= 0) ? data.joinerIndex : null;
+                    if (data.role === 'host') {
+                        NET.hostName = name || 'Host';
+                        NET.peerName = NET.hostName;
+                        if (NET.role === 'host') {
+                            try { broadcastRosterSnapshot(); } catch (e) {}
+                        }
+                    } else if (data.role === 'joiner') {
+                        if (joinerIdx !== null) {
+                            NET.updateJoinerName(joinerIdx, name || `Joiner ${joinerIdx + 1}`, { control: 'remote' });
+                            if (NET.role === 'host') {
+                                assignRemoteJoinerToRoster(joinerIdx, name || `Joiner ${joinerIdx + 1}`);
+                                try { broadcastRosterSnapshot(); } catch (e) {}
+                            }
+                            if (NET.role === 'joiner' && joinerIdx === NET.joinerIndex) {
+                                NET.myName = name || NET.myName;
+                            }
+                        }
+                    } else {
+                        if (NET.role === 'host') {
+                            const idx = joinerIdx === null ? 0 : joinerIdx;
+                            NET.updateJoinerName(idx, name || `Joiner ${idx + 1}`, { control: 'remote' });
+                            if (NET.role === 'host') {
+                                try { broadcastRosterSnapshot(); } catch (e) {}
+                            }
+                        } else {
+                            NET.hostName = name || NET.hostName;
+                            NET.peerName = name || NET.peerName;
+                            if (NET.role === 'host') {
+                                try { broadcastRosterSnapshot(); } catch (e) {}
+                            }
+                        }
+                    }
+                    try {
+                        if (typeof setLobbyPlayers === 'function') {
+                            const hostLabel = NET.role === 'host' ? (NET.myName || 'Host') : (NET.hostName || 'Host');
+                            const joinerLabel = NET.role === 'host' ? (NET.getJoinerName(0) || NET.peerName || 'Joiner') : (NET.myName || 'Player 2');
+                            setLobbyPlayers(hostLabel, joinerLabel);
+                        }
+                    } catch (e) {}
                     try { updateCardsUI(); } catch (e) {}
-                    try { if (typeof setLobbyPlayers === 'function') setLobbyPlayers(NET.myName || 'Player 1', NET.peerName || 'Player 2'); } catch (e) {}
                     try { updateWorldMasterSetupUI(); } catch (e) {}
-                } else if (data && data.type === 'set-name' && NET.role === 'joiner') {
-                    // Host sent their display name; store as peerName on joiner
-                    try { NET.peerName = (data.name||'').toString().slice(0,32); } catch(e) { NET.peerName = ''; }
-                    try { updateCardsUI(); } catch (e) {}
-                    try { if (typeof setLobbyPlayers === 'function') setLobbyPlayers(NET.peerName || 'Player 1', NET.myName || 'Player 2'); } catch (e) {}
-                    try { updateWorldMasterSetupUI(); } catch (e) {}
+                    try { renderRosterUI(); } catch (e) {}
+                } else if (data && data.type === 'roster-sync' && data.roster) {
+                    const rosterData = data.roster;
+                    if (NET.role === 'joiner' && playerRoster && typeof playerRoster.importSerializable === 'function') {
+                        try {
+                            playerRoster.importSerializable(rosterData, { preserveExternalIds: true });
+                        } catch (e) {}
+                        try {
+                            if (Array.isArray(rosterData.fighters)) {
+                                rosterData.fighters.forEach((fighter) => {
+                                    if (!fighter) return;
+                                    const meta = fighter.metadata || {};
+                                    if (typeof meta.joinerIndex === 'number') {
+                                        NET.updateJoinerName(meta.joinerIndex, fighter.name || `Joiner ${meta.joinerIndex + 1}`, meta);
+                                    }
+                                    if (meta.isHost) {
+                                        NET.hostName = fighter.name || NET.hostName;
+                                        NET.peerName = NET.hostName;
+                                    }
+                                });
+                            }
+                        } catch (e) {}
+                        try { renderRosterUI(); } catch (e) {}
+                        try { updateWorldMasterSetupUI(); } catch (e) {}
+                        try {
+                            if (typeof setLobbyPlayers === 'function') {
+                                const hostLabel = NET.hostName || 'Host';
+                                const joinerLabel = (typeof NET.joinerIndex === 'number')
+                                    ? (NET.getJoinerName(NET.joinerIndex) || NET.myName || 'Player 2')
+                                    : (NET.myName || 'Player 2');
+                                setLobbyPlayers(hostLabel, joinerLabel);
+                            }
+                        } catch (e) {}
+                    }
                 } else if (data && data.type === 'setup' && NET.role === 'joiner') {
                     // Update the joiner's setup UI live
                     applyIncomingSetup(data.data);
@@ -7045,6 +7619,8 @@ function setupOverlayInit() {
         if (oldConnectWebSocket) oldConnectWebSocket(role, code);
         else {
             if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.close();
+            NET.resetSessionState();
+            NET.setConnected(false);
             window.wsRole = role;
             window.wsSession = normalizeJoinCode(code);
             try {
@@ -7059,31 +7635,42 @@ function setupOverlayInit() {
                 } else if (role === 'joiner') {
                     window.ws.send(JSON.stringify({ type: 'join', code: window.wsSession }));
                 }
-                // Read local display-name and inform peer (host or joiner) immediately so lobby UIs update
-                try {
-                    const nameInput = document.getElementById('display-name');
-                    const myName = nameInput ? (nameInput.value || nameInput.placeholder || '') : '';
-                    if (myName) {
-                        try { NET.myName = myName.toString().slice(0,32); } catch(e) { NET.myName = myName; }
-                        // persist locally
-                        try { localStorage.setItem('shape_shot_display_name', NET.myName); } catch(e) {}
-                        // send to peer so they can update lobby UI
-                        try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type: 'relay', data: { type: 'set-name', name: NET.myName } })); } catch(e) {}
-                        // refresh our local UIs
-                        try { if (typeof setLobbyPlayers === 'function') setLobbyPlayers(NET.role === 'host' ? NET.myName : NET.peerName, NET.role === 'host' ? NET.peerName : NET.myName); } catch(e) {}
-                        try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch(e) {}
-                    }
-                } catch (e) {}
-                // Set NET role and mark connected; enforce consistent colors (host=blue, joiner=red)
                 NET.setRole(role);
                 NET.setConnected(true);
+                NET.joinerIndex = null;
                 try { hideReconnectButton(); } catch (e) {}
-                if (role === 'host') {
-                    if (player) player.color = '#65c6ff';
-                    if (enemy) enemy.color = '#ff5a5a';
+                let myName = '';
+                try {
+                    const nameInput = document.getElementById('display-name');
+                    myName = nameInput ? (nameInput.value || nameInput.placeholder || '') : '';
+                } catch (e) { myName = ''; }
+                if (myName) {
+                    try { NET.myName = myName.toString().slice(0, 32); } catch (e) { NET.myName = myName; }
+                    try { localStorage.setItem('shape_shot_display_name', NET.myName); } catch (e) {}
                 } else {
-                    if (player) player.color = '#ff5a5a';
-                    if (enemy) enemy.color = '#65c6ff';
+                    NET.myName = myName || '';
+                }
+                if (role === 'host') {
+                    NET.hostName = NET.myName || 'Host';
+                    sendLocalDisplayName();
+                } else {
+                    NET.pendingName = NET.myName || '';
+                }
+                try {
+                    if (typeof setLobbyPlayers === 'function') {
+                        const hostLabel = NET.role === 'host' ? (NET.myName || 'Host') : (NET.hostName || NET.peerName || 'Host');
+                        const joinerLabel = NET.role === 'host' ? (NET.getJoinerName(0) || '') : (NET.myName || '');
+                        setLobbyPlayers(hostLabel, joinerLabel);
+                    }
+                } catch (e) {}
+                try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
+                if (role === 'host') {
+                    if (player) player.color = HOST_PLAYER_COLOR;
+                    if (enemy) enemy.color = getJoinerColor(0);
+                } else {
+                    const myJoinerIdx = Number.isInteger(NET.joinerIndex) ? NET.joinerIndex : 0;
+                    if (player) player.color = getJoinerColor(myJoinerIdx);
+                    if (enemy) enemy.color = HOST_PLAYER_COLOR;
                 }
             };
             patchWsOnMessage();
@@ -7099,6 +7686,22 @@ function setupOverlayInit() {
         setTimeout(patchWsOnMessage, 200);
     };
     const overlay = document.getElementById('setup-overlay');
+    const setupWrapper = document.getElementById('setup-wrapper');
+
+    function showSetupUI() {
+        if (!rosterUIBound) {
+            try { bindRosterUI(); } catch (e) {}
+        }
+        if (setupWrapper) setupWrapper.style.display = 'flex';
+        if (overlay) overlay.style.display = 'flex';
+        try { ensureRosterDefaults(); } catch (e) {}
+        try { renderRosterUI(); } catch (e) {}
+    }
+
+    function hideSetupUI() {
+        if (overlay) overlay.style.display = 'none';
+        if (setupWrapper) setupWrapper.style.display = 'none';
+    }
     const densitySlider = document.getElementById('obstacle-density');
     const densityValue = document.getElementById('density-value');
     const sizeSlider = document.getElementById('obstacle-size');
@@ -7261,7 +7864,7 @@ function setupOverlayInit() {
                 enemyDisabled = false;
             }
         } catch (e) { enemyCount = 1; enemyDisabled = false; }
-        overlay.style.display = "none";
+    hideSetupUI();
         // Save chosen display name and populate NET.myName
         try {
             const nameInput = document.getElementById('display-name');
@@ -7475,8 +8078,10 @@ function setupOverlayInit() {
     function setLobbyPlayers(hostName, joinerName) {
         try {
             if (lobbyPlayersRow) lobbyPlayersRow.style.display = 'block';
-            if (lobbyHostName) lobbyHostName.textContent = hostName || (NET.myName || 'Player 1');
-            if (lobbyJoinerName) lobbyJoinerName.textContent = joinerName || (NET.peerName || 'Player 2');
+            const defaultHost = (NET.role === 'host') ? (NET.myName || 'Player 1') : (NET.hostName || NET.peerName || 'Player 1');
+            const defaultJoiner = (NET.role === 'host') ? (NET.getJoinerName(0) || NET.peerName || 'Player 2') : (NET.myName || 'Player 2');
+            if (lobbyHostName) lobbyHostName.textContent = hostName || defaultHost;
+            if (lobbyJoinerName) lobbyJoinerName.textContent = joinerName || defaultJoiner;
         } catch (e) {}
     }
 
@@ -7491,7 +8096,7 @@ function setupOverlayInit() {
                 dynamic: !!dynamicCheckbox.checked,
                 dynamicRate: parseFloat(dynamicRateSlider.value),
                 mapBorder: !!mapBorderCheckbox.checked,
-                worldModInterval: parseInt(worldModifierSlider.value),
+                worldModInterval: worldModifierSlider ? parseInt(worldModifierSlider.value) : worldModifierRoundInterval,
                 // Include WorldMaster mode fields
                 wmEnabled: !!worldMasterEnabled,
                 wmPlayerIndex: (typeof worldMasterPlayerIndex === 'number' ? worldMasterPlayerIndex : null),
@@ -7499,6 +8104,11 @@ function setupOverlayInit() {
                 enemyAI: (function(){ try { const el = document.getElementById('enemy-ai'); return !!(el && el.checked); } catch(e) { return true; } })()
             }
         };
+        try {
+            if (playerRoster && typeof playerRoster.toSerializable === 'function') {
+                setup.data.roster = playerRoster.toSerializable({ includeEntity: false });
+            }
+        } catch (e) {}
         window.ws.send(JSON.stringify({ type: 'relay', data: setup }));
     }
     // Also broadcast when Enemy AI is toggled; update local flags so UI can reflect immediately
@@ -7547,6 +8157,10 @@ function setupOverlayInit() {
             try { updateWorldMasterSetupUI(); } catch (e) {}
             // Re-assign local roles and configure WM instance/UI as needed
             try { assignPlayersAndAI(); } catch (e) {}
+            // Apply roster snapshot from host so joiner sees accurate seating
+            if (s.roster && playerRoster && typeof playerRoster.importSerializable === 'function') {
+                try { playerRoster.importSerializable(s.roster, { preserveExternalIds: true }); renderRosterUI(); } catch (err) {}
+            }
             // Refresh cards UI so labels/rows reflect the new setup immediately on joiner
             try { updateCardsUI(); } catch (e) {}
         } catch (e) {}
@@ -7559,7 +8173,7 @@ function setupOverlayInit() {
 }
 
 function showSetupOverlay() {
-    document.getElementById('setup-overlay').style.display = "flex";
+    showSetupUI();
     resetMultiplayerReadyState();
     stopGame();
 }
@@ -7649,32 +8263,20 @@ function startGame() {
         }
     }
     window.positionPlayersSafely();
-    // Ensure colors and display names are right for current mode
-    if (!NET.connected) {
-        if (player) player.color = '#65c6ff';
-        if (enemy) enemy.color = '#ff5a5a';
-    } else {
-        // Multiplayer: host is always blue, joiner is always red
-        if (NET.role === 'host') {
-            if (player) player.color = '#65c6ff';
-            if (enemy) enemy.color = '#ff5a5a';
-            if (player) player.displayName = NET.myName || 'Player 1';
-            if (enemy) enemy.displayName = NET.peerName || 'Player 2';
-        } else if (NET.role === 'joiner') {
-            if (player) player.color = '#ff5a5a';
-            if (enemy) enemy.color = '#65c6ff';
-            if (player) player.displayName = NET.myName || 'Player 2';
-            if (enemy) enemy.displayName = NET.peerName || 'Player 1';
-        }
+    // Ensure colors are right for current mode
+    if (typeof NET === 'undefined' || !NET || !NET.connected) {
+        if (player) player.color = HOST_PLAYER_COLOR;
+        if (enemy) enemy.color = getJoinerColor(0);
+    } else if (NET.role === 'host') {
+        if (player) player.color = HOST_PLAYER_COLOR;
+        if (enemy) enemy.color = getJoinerColor(0);
+    } else if (NET.role === 'joiner') {
+        const myJoinerIdx = Number.isInteger(NET.joinerIndex) ? NET.joinerIndex : 0;
+        if (player) player.color = getJoinerColor(myJoinerIdx);
+        if (enemy) enemy.color = HOST_PLAYER_COLOR;
     }
     // Ensure enemy existence and disabled flag according to selection
-    if (!enemy) {
-        if (NET.connected && NET.role === 'joiner') {
-            enemy = new Player(false, "#65c6ff", window.CANVAS_W*0.33, CANVAS_H/2);
-        } else {
-            enemy = new Player(false, "#ff5a5a", window.CANVAS_W*0.66, CANVAS_H/2);
-        }
-    }
+    if (!enemy) enemy = new Player(false, "#ff5a5a", window.CANVAS_W*0.66, CANVAS_H/2);
     enemyDisabled = (enemyCount <= 0);
     
     lastTimestamp = 0;
@@ -7811,6 +8413,8 @@ function applyVolumeSlidersToUI() {
     } catch (e) {}
 
 document.addEventListener('DOMContentLoaded', function() {
+    try { bindRosterUI(); } catch (e) {}
+    try { renderRosterUI(); } catch (e) {}
     try { assignPlayersAndAI(); } catch (e) {}
     const openBtn = document.getElementById('open-options-btn');
     const optionsModal = document.getElementById('options-overlay');
@@ -7825,8 +8429,7 @@ document.addEventListener('DOMContentLoaded', function() {
     if (openBtn && optionsModal) {
         openBtn.addEventListener('click', function() {
             // show options modal and hide setup overlay
-            const setup = document.getElementById('setup-overlay');
-            if (setup) setup.style.display = 'none';
+            hideSetupUI();
             optionsModal.style.display = 'block';
             applyVolumeSlidersToUI();
         });
@@ -7910,9 +8513,44 @@ document.addEventListener('DOMContentLoaded', function() {
     if (backBtn && optionsModal) {
         backBtn.addEventListener('click', function() {
             optionsModal.style.display = 'none';
-            const setup = document.getElementById('setup-overlay');
-            if (setup) setup.style.display = 'flex';
+            // Show both setup overlay and setup wrapper for full menu
+            var setupOverlay = document.getElementById('setup-overlay');
+            var setupWrapper = document.getElementById('setup-wrapper');
+            if (setupOverlay) setupOverlay.style.display = 'flex';
+            if (setupWrapper) setupWrapper.style.display = 'flex';
+            showSetupUI();
             saveVolumesToStorage();
+        });
+    }
+
+    const displayNameInput = document.getElementById('display-name');
+    if (displayNameInput) {
+        const onNameChange = () => {
+            const raw = displayNameInput.value ? displayNameInput.value.trim() : (displayNameInput.placeholder || '');
+            const sanitized = raw ? raw.toString().slice(0, 32) : '';
+            NET.myName = sanitized;
+            if (NET.role === 'host') {
+                NET.hostName = sanitized || 'Host';
+            } else if (NET.role === 'joiner' && Number.isInteger(NET.joinerIndex)) {
+                NET.updateJoinerName(NET.joinerIndex, sanitized || `Joiner ${NET.joinerIndex + 1}`, { control: 'local' });
+            }
+            try { localStorage.setItem('shape_shot_display_name', sanitized); } catch (e) {}
+            if (NET.connected) {
+                sendLocalDisplayName();
+            }
+            try { ensureRosterDefaults(); } catch (e) {}
+            try { renderRosterUI(); } catch (e) {}
+            if (typeof NET !== 'undefined' && NET && NET.role === 'host') {
+                try { broadcastSetup(); } catch (e) {}
+            }
+            try { if (typeof setLobbyPlayers === 'function') setLobbyPlayers(); } catch (e) {}
+        };
+        displayNameInput.addEventListener('change', onNameChange);
+        displayNameInput.addEventListener('blur', onNameChange);
+        displayNameInput.addEventListener('input', () => {
+            // live update local UI but avoid spamming network until commit events
+            try { ensureRosterDefaults(); } catch (e) {}
+            try { renderRosterUI(); } catch (e) {}
         });
     }
 
