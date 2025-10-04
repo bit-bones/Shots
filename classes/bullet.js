@@ -14,6 +14,8 @@
             this.angle = angle;
             this.damage = owner.bulletDamage;
             this.pierce = owner.pierce || false;
+            this.pierceStacks = owner.pierceStacks || 0;
+            this.pierceLimit = this.pierce ? (30 + this.pierceStacks) : 0;
             this.obliterator = owner.obliterator || false;
             this.obliteratorStacks = owner.obliteratorStacks || 0;
             this.explosive = owner.explosive || false;

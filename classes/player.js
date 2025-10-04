@@ -346,6 +346,7 @@
 			this.lifeStealPct = 0;
 			this.doubleShot = false;
 			this.pierce = false;
+			this.pierceStacks = 0;
 			this.dash = true;
 			this.dashCooldown = 0;
 			this.dashActive = false;

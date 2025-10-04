@@ -89,7 +89,7 @@ window.POWERUPS = [
     { name: "Attack Speed+", desc: "Reduces shot cooldown.", effect: p => p.shootInterval *= 0.85 },
     { name: "Life Steal", desc: "Heal for 30% of damage you deal.", effect: p => p.lifeStealPct = (p.lifeStealPct||0) + 0.3 },
     { name: "Spread+", desc: "+1 projectile per shot.", effect: p => p.spread = (p.spread || 0) + 1 },
-    { name: "Piercing Shot", desc: "Shots pass through obstacles. Attack speed is reduced.", effect: p => { p.pierce = true; p.shootInterval *= 1.25; } },
+    { name: "Piercing Shot", desc: "Shots pass through a limited number of obstacles. Each stack increases the limit.", effect: p => { p.pierce = true; p.pierceStacks = (p.pierceStacks||0) + 1; p.shootInterval *= 1.25; } },
     { name: "Dash+", desc: "Dash is faster and goes farther.", effect: p => { p.dashRangeMult = (p.dashRangeMult || 1) * 1.18; p.dashSpeedMult = (p.dashSpeedMult || 1) * 1.12; }},
     { name: "Big Shot", desc: "Your next shot after dashing is larger but slower. Dash cooldown +25%.", effect: p => { p.bigShot = true; p.bigShotSizeMult = (p.bigShotSizeMult || 2); p.bigShotSpeedMult = (p.bigShotSpeedMult || 0.5); p.dashCooldownMult = (p.dashCooldownMult || 1) * 1.25; } },
     { name: "Ram", desc: "Deal damage and knockback to anyone/anything you dash into. Dash cooldown +25%.", effect: p => { p.ram = true; p.ramStacks = (p.ramStacks||0) + 1; p.dashCooldownMult = (p.dashCooldownMult || 1) * 1.25; } },

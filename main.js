@@ -4801,6 +4801,29 @@ function update(dt) {
                         }
                     }
                 }
+            } else if (b.pierce) {
+                // Piercing bullets: check for collision with chunks and decrement pierce limit
+                let collidedChunk = null;
+                for (const c of o.chunks) {
+                    if (c.destroyed) continue;
+                    let cx = clamp(b.x, c.x, c.x + c.w);
+                    let cy = clamp(b.y, c.y, c.y + c.h);
+                    let dx = b.x - cx, dy = b.y - cy;
+                    if ((dx*dx + dy*dy) < b.radius * b.radius) {
+                        collidedChunk = c;
+                        break;
+                    }
+                }
+                if (collidedChunk) {
+                    b.pierceLimit--;
+                    if (b.pierceLimit <= 0) {
+                        if (b.explosive) {
+                            triggerExplosion(b, b.x, b.y, o);
+                        }
+                        b.active = false;
+                        break;
+                    }
+                }
             }
         }
     }
