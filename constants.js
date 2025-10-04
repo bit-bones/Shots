@@ -81,7 +81,7 @@ window.WORLD_MODIFIERS = [
 // Powerups
 window.POWERUPS = [
     { name: "Shot Controller", desc: "Shots follow your cursor.", effect: p => { p.shotController = true; } },
-    { name: "Sniper", desc: "Shot speed/damage greatly increased, reduced shot size and attack speed.", effect: p => { p.bulletSpeed *= 1.65; p.bulletDamage *= 1.65; p.bulletRadius *= 0.7; p.shootInterval *= 1.5; } },
+    { name: "Sniper", desc: "Shot speed/damage greatly increased, reduced shot size and attack speed.", effect: p => { p.bulletSpeed *= 1.7; p.bulletDamage *= 1.7; p.bulletRadius *= 0.7; p.shootInterval *= 1.5; } },
     { name: "Shot Speed+", desc: "Shots travel faster.", effect: p => p.bulletSpeed *= 1.08 },
     { name: "Shot Size+", desc: "Shots are bigger.", effect: p => p.bulletRadius *= 1.35 },
     { name: "Shot Dmg+", desc: "Shots deal more damage. Attack speed is reduced.", effect: p => { p.bulletDamage += 6; p.shootInterval *= 1.15; } },
@@ -97,7 +97,7 @@ window.POWERUPS = [
     { name: "Obliterator", desc: "Shots destroy more obstacle chunks. Each stack increases destruction.", effect: p => { p.obliterator = true; p.obliteratorStacks = (p.obliteratorStacks||0) + 1 } },
     { name: "Ricochet", desc: "+1 shot ricochet.", effect: p => p.ricochet = (p.ricochet|0) + 1 },
     { name: "Explosive Shots", desc: "Shots explode on impact. Attack speed is reduced.", effect: p => { p.explosive = true; p.explosiveStacks = (p.explosiveStacks||0) + 1; p.shootInterval *= 1.25; } },
-    { name: "Gunner", desc: "Fire extremely quickly, but move slower.", effect: p => { p.shootInterval *= 0.65; p.speed *= 0.8; } },
+    { name: "Gunner", desc: "Fire extremely quickly, but move slower.", effect: p => { p.shootInterval *= 0.6; p.speed *= 0.65; } },
     { name: "Health+", desc: "Max health increased by 10 per stack.", effect: p => { p.healthMax = (p.healthMax || window.HEALTH_MAX) + 10; } },
     { name: "Lightweight", desc: "Dash and move speed increased. Max health -10.", effect: p => { p.healthMax = (p.healthMax || window.HEALTH_MAX) - 10; p.speed *= 1.20; p.dashSpeedMult = (p.dashSpeedMult || 1) * 1.12; } },
     { name: "Fire Shot", desc: "Shots apply fire damage. Attack speed is greatly reduced.", effect: p => { p.fireshot = true; p.fireshotStacks = (p.fireshotStacks||0) + 1; p.shootInterval *= 1.5; } },

@@ -27,6 +27,8 @@
             // Shot Controller support
             this.shotController = owner.shotController || false;
             this.playerControlActive = this.shotController ? true : false;
+            // Delay (seconds) before shot-controller homing begins so spread formation is visible
+            this.homingDelay = (typeof owner.shotControllerHomingDelay === 'number') ? owner.shotControllerHomingDelay : 0.12;
             this.isLocalPlayerBullet = false; // Set by main.js based on network role
             // Stable ID for host-authoritative snapshots (assigned on host when fired)
             this.id = null;
@@ -34,6 +36,10 @@
         update(dt) {
             // If Shot Controller is active and playerControlActive, steer toward cursor
             if (this.shotController && this.playerControlActive && this.isLocalPlayerBullet && typeof window !== 'undefined' && window.mouse) {
+                // Count down homing delay first so bullets maintain initial spread for a short time
+                if (this.homingDelay > 0) {
+                    this.homingDelay -= dt;
+                } else {
                 let dx = window.mouse.x - this.x;
                 let dy = window.mouse.y - this.y;
                 let distToCursor = Math.hypot(dx, dy);
@@ -50,6 +56,7 @@
                     } else {
                         this.angle = steerAngle;
                     }
+                }
                 }
             }
             this.x += Math.cos(this.angle) * this.speed * dt;

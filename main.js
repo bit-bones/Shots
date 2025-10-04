@@ -2562,16 +2562,23 @@ const NET = {
     // Shoot: continuous while held. Use keyboard state or legacy player.shootQueued as a fallback.
     const spacePressed = !!keys[' '] || !!keys['space'] || !!player.shootQueued;
     const shootPressed = !!spacePressed;
-        // Dash edge trigger: true exactly once when shift (or mapped right-click) is pressed
-        const dashPressed = !!keys['shift'];
-        const dashNow = dashPressed && !this.dashLatch;
+        // Dash: triggers only on transition from not-held to held, not repeatedly while held
+        const dashHeld = !!keys['shift'];
+        let dashTrigger = false;
+        if (player.dash && dashHeld && !this.dashLatch && !player.dashActive && player.dashCooldown <= 0) {
+            dashTrigger = true;
+            this.dashLatch = true;
+        }
+        if (!dashHeld) {
+            this.dashLatch = false;
+        }
         const out = {
             up: !!keys['w'],
             down: !!keys['s'],
             left: !!keys['a'],
             right: !!keys['d'],
             shoot: shootPressed,
-            dash: !!(player.dash && dashNow),
+            dash: dashTrigger,
             aimX: mouse.x,
             aimY: mouse.y
         };
@@ -2598,7 +2605,7 @@ const NET = {
         } catch (e) {}
     // Update latch state (used for local edge-detection elsewhere like dash)
     this.shootLatch = !!spacePressed;
-        this.dashLatch = !!dashPressed;
+    this.dashLatch = !!dashHeld;
         return out;
     },
     handleDisconnect(reason) {
@@ -2888,6 +2895,7 @@ function applySoundEffectEvent(data) {
     if (!data || !data.name) return;
     try {
         switch (data.name) {
+            case 'gunshot': if (typeof playGunShot === 'function') playGunShot(); break;
             case 'explosion': if (typeof playExplosion === 'function') playExplosion(); break;
             case 'soft-poof': if (typeof playSoftPoof === 'function') playSoftPoof(); break;
             case 'hit': if (typeof playHit === 'function') playHit(); break;
@@ -3884,16 +3892,24 @@ function update(dt) {
         let vy = (ri.down?1:0) - (ri.up?1:0);
         if (!enemy.dashActive) {
             if (vx || vy) {
+                // Axis-separated movement to allow smooth sliding along obstacle surfaces
                 let norm = Math.hypot(vx, vy);
-                vx /= norm; vy /= norm;
-                let speed = enemy.speed;
-                let oldx = enemy.x, oldy = enemy.y;
+                vx = norm ? (vx / norm) : 0; 
+                vy = norm ? (vy / norm) : 0;
+                const speed = enemy.speed;
+                // Move X, resolve collisions on X only
+                const oldX = enemy.x;
                 enemy.x += vx * speed * dt;
+                enemy.x = clamp(enemy.x, enemy.radius, window.CANVAS_W - enemy.radius);
+                for (let o of obstacles) {
+                    if (o.circleCollide(enemy.x, enemy.y, enemy.radius)) { enemy.x = oldX; break; }
+                }
+                // Move Y, resolve collisions on Y only
+                const oldY = enemy.y;
                 enemy.y += vy * speed * dt;
-                enemy.x = clamp(enemy.x, enemy.radius, window.CANVAS_W-enemy.radius);
-                enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H-enemy.radius);
-                for(let o of obstacles) {
-                    if(o.circleCollide(enemy.x, enemy.y, enemy.radius)) { enemy.x = oldx; enemy.y = oldy; }
+                enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H - enemy.radius);
+                for (let o of obstacles) {
+                    if (o.circleCollide(enemy.x, enemy.y, enemy.radius)) { enemy.y = oldY; break; }
                 }
             }
         }
