@@ -1,7 +1,7 @@
 ;(function(root) {
     const globalObj = root || (typeof globalThis !== 'undefined' ? globalThis : this);
 
-    const DEFAULT_MAX_SLOTS = 4;
+    const DEFAULT_MAX_SLOTS = 5;
 
     const EVENT_NAMES = {
         ROSTER_UPDATED: 'roster-updated',
@@ -653,7 +653,8 @@
         }
 
         _defaultColorForSlot(slotIndex) {
-            const palette = ['#65c6ff', '#ff5a5a', '#ffe066', '#9b59b6'];
+            // New palette for 5-slot roster: blue, red, yellow, green, purple
+            const palette = ['#65c6ff', '#ff5a5a', '#ffe066', '#2ecc71', '#9b59b6'];
             return palette[slotIndex % palette.length];
         }
 

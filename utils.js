@@ -153,8 +153,8 @@ window.positionPlayersSafely = function() {
         pStart = { x: Math.max(120, window.CANVAS_W * 0.25), y: window.CANVAS_H/2 };
         eStart = { x: Math.min(window.CANVAS_W - 120, window.CANVAS_W * 0.75), y: window.CANVAS_H/2 };
     }
-    if (!player) player = new Player(true, "#65c6ff", pStart.x, pStart.y);
-    if (!enemy) enemy = new Player(false, "#ff5a5a", eStart.x, eStart.y);
+    if (!player) player = new Player(true, (typeof HOST_PLAYER_COLOR !== 'undefined' ? HOST_PLAYER_COLOR : "#65c6ff"), pStart.x, pStart.y);
+    if (!enemy) enemy = new Player(false, (typeof getJoinerColor === 'function' ? getJoinerColor(0) : "#ff5a5a"), eStart.x, eStart.y);
     // If enemyDisabled, mark enemy to skip AI/draw but keep object for compatibility
     if (enemyDisabled) enemy.disabled = true; else enemy.disabled = false;
     let pPos = window.findNearestClearPosition(pStart.x, pStart.y, player.radius);

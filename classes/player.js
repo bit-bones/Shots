@@ -126,45 +126,49 @@
 			let baseColor = this.color;
 			if (this.damageFlash > 0) {
 				let t = Math.min(1, this.damageFlash / 0.25);
-				// Determine tint based on actual color (blueish vs reddish) rather than isPlayer flag.
-				function _isColorBlueish(col) {
-					if (!col || typeof col !== 'string') return true;
-					col = col.trim().toLowerCase();
-					// hex format
-					if (col[0] === '#') {
-						if (col.length === 4) {
-							// expand #rgb to #rrggbb
-							col = '#' + col[1] + col[1] + col[2] + col[2] + col[3] + col[3];
-						}
-						if (col.length === 7) {
-							const r = parseInt(col.substr(1,2), 16) || 0;
-							const g = parseInt(col.substr(3,2), 16) || 0;
-							const b = parseInt(col.substr(5,2), 16) || 0;
-							return b >= r;
-						}
-					}
-					// rgb(...) format
-					const m = col.match(/rgba?\(([^)]+)\)/);
-					if (m) {
-						const parts = m[1].split(',').map(p => parseFloat(p));
-						if (parts.length >= 3) {
-							const r = parts[0] || 0; const g = parts[1] || 0; const b = parts[2] || 0;
-							return b >= r;
-						}
-					}
-					// default to blueish
-					return true;
-				}
-				const isBlueish = _isColorBlueish(this.color);
-				if (this.burning) {
-					// Fire-damage highlight: warm orange/red tint
-					baseColor = isBlueish ? "#ffd9b3" : "#ffd0c0";
-					ctx.shadowColor = "rgba(255,130,40,0.95)";
+				// Only show white flash for non-host/joiner slots (green/yellow etc)
+				// Host/joiner (blue/red) can keep their tint, others get white only
+				const isPrimary = (this.color === '#65c6ff' || this.color === '#ff5a5a');
+				if (!isPrimary) {
+					baseColor = '#fff';
+					ctx.shadowColor = '#fff';
 					ctx.shadowBlur = 30 * t;
 				} else {
-					baseColor = isBlueish ? "#9af9ff" : "#ffc9c9";
-					ctx.shadowColor = "#fff";
-					ctx.shadowBlur = 30 * t;
+					// original logic for host/joiner
+					function _isColorBlueish(col) {
+						if (!col || typeof col !== 'string') return true;
+						col = col.trim().toLowerCase();
+						if (col[0] === '#') {
+							if (col.length === 4) {
+								col = '#' + col[1] + col[1] + col[2] + col[2] + col[3] + col[3];
+							}
+							if (col.length === 7) {
+								const r = parseInt(col.substr(1,2), 16) || 0;
+								const g = parseInt(col.substr(3,2), 16) || 0;
+								const b = parseInt(col.substr(5,2), 16) || 0;
+								return b >= r;
+							}
+						}
+						const m = col.match(/rgba?\(([^)]+)\)/);
+						if (m) {
+							const parts = m[1].split(',').map(p => parseFloat(p));
+							if (parts.length >= 3) {
+								const r = parts[0] || 0; const g = parts[1] || 0; const b = parts[2] || 0;
+								return b >= r;
+							}
+						}
+						return true;
+					}
+					const isBlueish = _isColorBlueish(this.color);
+					if (this.burning) {
+						baseColor = isBlueish ? "#ffd9b3" : "#ffd0c0";
+						ctx.shadowColor = "rgba(255,130,40,0.95)";
+						ctx.shadowBlur = 30 * t;
+					} else {
+						baseColor = isBlueish ? "#9af9ff" : "#ffc9c9";
+						ctx.shadowColor = "#fff";
+						ctx.shadowBlur = 30 * t;
+					}
 				}
 			} else {
 				ctx.shadowColor = this.color;
@@ -507,6 +511,10 @@
 		}
 
 		takeDamage(dmg) {
+			// Defensive: ignore damage if this entity is marked inactive/disabled
+			try {
+				if (typeof isEntityActive === 'function' && !isEntityActive(this)) return;
+			} catch (e) {}
 			// Respect invincibility toggle (dev command)
 			if (this.invincible) {
 				// Small visual feedback that damage was blocked

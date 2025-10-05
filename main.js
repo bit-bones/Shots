@@ -175,28 +175,18 @@ function showWorldModifierCards() {
         card.onclick = () => {
             Array.from(div.children).forEach(c => c.classList.remove('selected', 'centered'));
             card.classList.add('selected', 'centered');
+            // Immediately broadcast highlight to joiners
+            try {
+                if (NET && NET.role === 'host' && NET.connected && window.ws && window.ws.readyState === WebSocket.OPEN) {
+                    window.ws.send(JSON.stringify({ type: 'relay', data: { type: 'card-apply', pickerRole: NET.role, card: opt.name, highlight: true } }));
+                }
+            } catch (e) {}
             setTimeout(() => {
-                // Check if already picked and handle accordingly
+                // ...existing code...
                 if (usedWorldModifiers[opt.name]) {
-                    // Second pick: either disable or apply special logic
-                    if (opt.name === "Dynamic") {
-                        // Dynamic has special toggle logic
-                        opt.effect();
-                    } else {
-                        // For other modifiers, disable them
-                        if (opt.name === "Infestation") {
-                            infestationActive = false;
-                        } else if (opt.name === "Spontaneous") {
-                            spontaneousActive = false;
-                        }
-                        // Remove from active modifiers
-                        activeWorldModifiers = activeWorldModifiers.filter(m => m !== opt.name);
-                    }
+                    // ...existing code...
                 } else {
-                    // First pick: apply effect and mark as used
-                    opt.effect();
-                    usedWorldModifiers[opt.name] = true;
-                    activeWorldModifiers.push(opt.name);
+                    // ...existing code...
                 }
                 div.style.display = "none";
                 div.innerHTML = '';
@@ -227,7 +217,7 @@ let lobbyPlayers = [];
 const playerRoster = (() => {
     try {
         if (window.playerRoster instanceof PlayerRoster) return window.playerRoster;
-        const roster = new PlayerRoster({ maxSlots: 4 });
+    const roster = new PlayerRoster({ maxSlots: 5 });
         window.playerRoster = roster;
         return roster;
     } catch (err) {
@@ -272,12 +262,765 @@ const cardDraftManager = (() => {
     }
 })();
 
+const roundFlowState = {
+    eliminationQueue: [],
+    processedEliminations: new Set(),
+    awaitingCardSelection: false,
+    awaitingCardFighterId: null,
+    awaitingCardEntity: null,
+    awaitingCardChooserRole: null,
+    awaitingCardSlotIndex: null,
+    roundTransitionActive: false,
+    eliminationOrder: [],
+    nextRoundTimeout: null,
+    pendingWorldModOffer: null
+};
+
+function resetRoundFlowState(options = {}) {
+    roundFlowState.eliminationQueue.length = 0;
+    roundFlowState.processedEliminations.clear();
+    roundFlowState.awaitingCardSelection = false;
+    roundFlowState.awaitingCardFighterId = null;
+    roundFlowState.awaitingCardEntity = null;
+    roundFlowState.awaitingCardChooserRole = null;
+    roundFlowState.awaitingCardSlotIndex = null;
+    roundFlowState.eliminationOrder = [];
+    roundFlowState.pendingWorldModOffer = null;
+    if (!options.keepTransition) {
+        roundFlowState.roundTransitionActive = false;
+    }
+    if (roundFlowState.nextRoundTimeout) {
+        clearTimeout(roundFlowState.nextRoundTimeout);
+        roundFlowState.nextRoundTimeout = null;
+    }
+}
+
+function collectRosterEntries(options = {}) {
+    if (!playerRoster || typeof playerRoster.getFighters !== 'function') {
+        return [];
+    }
+    const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+    const includeEliminated = options.includeEliminated === true;
+    const entries = [];
+    for (const fighter of fighters) {
+        if (!fighter) continue;
+        if (!includeEliminated && fighter.isAlive === false) continue;
+        if (fighter.metadata && fighter.metadata.isWorldMaster) continue;
+        let entity = null;
+        try {
+            entity = playerRoster.getEntityReference(fighter.id) || fighter.entity || null;
+        } catch (err) {
+            entity = fighter.entity || null;
+        }
+        if (!entity) continue;
+        entries.push({ fighter, entity });
+    }
+    return entries;
+}
+
+function getFighterRecordForEntity(entity) {
+    if (!entity || !playerRoster || typeof playerRoster.getFighters !== 'function') return null;
+    const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+    for (const fighter of fighters) {
+        const ref = (() => {
+            try {
+                return playerRoster.getEntityReference(fighter.id) || fighter.entity || null;
+            } catch (err) {
+                return fighter.entity || null;
+            }
+        })();
+        if (ref === entity) return fighter;
+    }
+    return null;
+}
+
+function inferRoleForEntity(entity, options = {}) {
+    if (!entity) return options.defaultRole || null;
+    try {
+        const netAvailable = (typeof NET !== 'undefined' && NET);
+        if (!netAvailable || !NET.connected) {
+            return entity.isPlayer ? 'host' : 'joiner';
+        }
+        const localRole = NET.role;
+        if (localRole === 'host') {
+            if (entity === player) return 'host';
+            if (entity === enemy) return 'joiner';
+        } else if (localRole === 'joiner') {
+            if (entity === player) return 'joiner';
+            if (entity === enemy) return 'host';
+        }
+        const fighterRecord = getFighterRecordForEntity(entity);
+        if (fighterRecord && typeof fighterRecord.slotIndex === 'number') {
+            return resolveChooserRoleForSlot(fighterRecord.slotIndex);
+        }
+    } catch (err) {
+        console.warn('[Card Flow] Failed to infer role for entity', err);
+    }
+    return options.defaultRole || null;
+}
+
+function resolveChooserRoleForSlot(slotIndex) {
+    if (slotIndex === 0) return 'host';
+    if (slotIndex === 1) return 'joiner';
+    return 'host';
+}
+
+function getEntityForFighterId(fighterId) {
+    if (fighterId === null || fighterId === undefined) return null;
+    const normalizedId = String(fighterId);
+    try {
+        if (playerRoster && typeof playerRoster.getEntityReference === 'function') {
+            const direct = playerRoster.getEntityReference(normalizedId) || playerRoster.getEntityReference(fighterId);
+            if (direct) return direct;
+        }
+    } catch (e) {}
+    const entries = collectRosterEntries({ includeEliminated: true });
+    for (const entry of entries) {
+        if (entry && entry.fighter && String(entry.fighter.id) === normalizedId) {
+            return entry.entity || null;
+        }
+    }
+    return null;
+}
+
+function isEntityActive(entity, options = {}) {
+    if (!entity) return false;
+    if (entity.disabled) return false;
+    if (typeof entity.health === 'number' && entity.health <= 0) return false;
+    if (options.skipRosterLookup) return true;
+    const fighterRecord = getFighterRecordForEntity(entity);
+    if (fighterRecord && fighterRecord.isAlive === false) return false;
+    return true;
+}
+
+function beginRoundLifecycle(reason) {
+    resetRoundFlowState();
+    try {
+        if (cardDraftManager && typeof cardDraftManager.cancelDraft === 'function' && cardDraftManager.hasActiveDraft && cardDraftManager.hasActiveDraft()) {
+            cardDraftManager.cancelDraft({ reason: reason || 'round-reset' });
+        }
+    } catch (err) {
+        console.warn('[Draft] Failed to cancel draft during round reset', err);
+    }
+    try {
+        if (playerRoster && typeof playerRoster.resetRoundState === 'function') {
+            playerRoster.resetRoundState({ clearScores: false });
+        }
+    } catch (err) {
+        console.warn('[Roster] Failed to reset round state', err);
+    }
+    try {
+        if (matchLifecycleManager && typeof matchLifecycleManager.beginRound === 'function') {
+            matchLifecycleManager.beginRound({ info: reason || null });
+        }
+    } catch (err) {
+        console.warn('[Lifecycle] Failed to begin round', err);
+    }
+}
+
+function queueEliminationForEntry(entry, context = {}) {
+    if (!entry || !entry.fighter || !entry.entity) return;
+    const fighterId = entry.fighter.id;
+    if (!fighterId) return;
+    if (roundFlowState.processedEliminations.has(fighterId)) return;
+    roundFlowState.processedEliminations.add(fighterId);
+    roundFlowState.eliminationQueue.push({
+        fighterId,
+        entity: entry.entity,
+        fighter: entry.fighter || null,
+        slotIndex: typeof entry.fighter.slotIndex === 'number' ? entry.fighter.slotIndex : null,
+        context: Object.assign({
+            timestamp: Date.now(),
+            round: matchLifecycleManager && typeof matchLifecycleManager.getState === 'function'
+                ? matchLifecycleManager.getState().roundNumber
+                : null,
+            reason: 'health-zero'
+        }, context || {})
+    });
+}
+
+function startCardDraftForElimination(entity, fighterId, context = {}, options = {}) {
+    if (!entity || !fighterId) return;
+    const opts = options || {};
+    let slotIndex = typeof opts.slotIndex === 'number' ? opts.slotIndex : null;
+    let chooserRole = opts.chooserRole || null;
+    const fighterIdStr = String(fighterId);
+
+    if ((slotIndex === null || chooserRole === null) && playerRoster && typeof playerRoster.getFighterById === 'function') {
+        try {
+            const rec = playerRoster.getFighterById(fighterId);
+            if (rec) {
+                if (slotIndex === null && typeof rec.slotIndex === 'number') slotIndex = rec.slotIndex;
+                if (chooserRole === null) chooserRole = resolveChooserRoleForSlot(rec.slotIndex);
+            }
+        } catch (e) {}
+    }
+
+    if (slotIndex === null) {
+        try {
+            const record = getFighterRecordForEntity(entity);
+            if (record && typeof record.slotIndex === 'number') {
+                slotIndex = record.slotIndex;
+            }
+        } catch (err) {}
+    }
+
+    if (slotIndex === null) {
+        try {
+            if (typeof NET === 'undefined' || !NET || !NET.connected) {
+                slotIndex = entity && entity.isPlayer ? 0 : 1;
+            } else if (NET.role === 'host') {
+                if (entity === player) slotIndex = 0;
+                else if (entity === enemy) slotIndex = 1;
+            } else if (NET.role === 'joiner') {
+                if (entity === player) {
+                    const joinerIdx = Number.isInteger(NET.joinerIndex) ? NET.joinerIndex : 0;
+                    if (typeof getJoinerSlotIndex === 'function') slotIndex = getJoinerSlotIndex(joinerIdx);
+                    else slotIndex = joinerIdx + 1;
+                } else if (entity === enemy) {
+                    slotIndex = 0;
+                }
+            }
+        } catch (err) {}
+    }
+
+    if (chooserRole === null && slotIndex !== null) {
+        chooserRole = resolveChooserRoleForSlot(slotIndex);
+    }
+
+    if (chooserRole === null) {
+        chooserRole = inferRoleForEntity(entity);
+    }
+
+    let sharedChoices = [];
+    try {
+        sharedChoices = buildPowerupChoices(entity, 5);
+    } catch (err) {
+        sharedChoices = [];
+    }
+
+    roundFlowState.awaitingCardChooserRole = chooserRole;
+    roundFlowState.awaitingCardSlotIndex = typeof slotIndex === 'number' ? slotIndex : null;
+
+    try {
+        if (cardDraftManager && typeof cardDraftManager.startDraft === 'function') {
+            const metadata = Object.assign({ reason: 'elimination' }, context.metadata || {});
+            const startPayload = {
+                participants: [fighterIdStr],
+                roundNumber: (matchLifecycleManager && matchLifecycleManager.getState) ? matchLifecycleManager.getState().roundNumber : 0,
+                metadata
+            };
+            if (Array.isArray(sharedChoices) && sharedChoices.length) {
+                startPayload.cardsByFighter = { [fighterIdStr]: sharedChoices.slice() };
+            }
+            cardDraftManager.startDraft(startPayload);
+        }
+    } catch (err) {
+        console.warn('[Draft] Failed to start elimination draft', err);
+    }
+    // If we're host, broadcast the card offer so joiners show the same UI
+    try {
+        if (typeof NET !== 'undefined' && NET && NET.connected && NET.role === 'host' && typeof window.ws !== 'undefined' && window.ws && window.ws.readyState === WebSocket.OPEN) {
+            let choiceNames = [];
+            if (Array.isArray(sharedChoices) && sharedChoices.length) {
+                choiceNames = sharedChoices.map(c => (c && (c.name || c.id)) ? (c.name || c.id) : null).filter(Boolean);
+            }
+            if (!choiceNames.length) {
+                try {
+                    const cards = cardDraftManager && typeof cardDraftManager.getCardsForFighter === 'function' ? cardDraftManager.getCardsForFighter(fighterIdStr) : [];
+                    if (Array.isArray(cards)) choiceNames = cards.map(c => (c && (c.name || c.id)) ? (c.name || c.id) : null).filter(Boolean);
+                } catch (e) { choiceNames = []; }
+            }
+            if (!choiceNames.length) {
+                logDev('[CARD FLOW] No card choices available to broadcast for fighter ' + fighterIdStr + '; skipping relay.');
+            }
+            try {
+                if (choiceNames.length) {
+                    window.ws.send(JSON.stringify({
+                        type: 'relay',
+                        data: {
+                            type: 'card-offer',
+                            choices: choiceNames,
+                            chooserRole,
+                            fighterId: fighterIdStr,
+                            slotIndex: typeof slotIndex === 'number' ? slotIndex : null
+                        }
+                    }));
+                    logDev('[CARD FLOW] Broadcast card-offer to ' + chooserRole + ' with choices: [' + choiceNames.join(', ') + '] (fighter ' + fighterIdStr + ')');
+                }
+            } catch (e) {}
+        }
+    } catch (e) {}
+    try {
+        showPowerupCards(entity, {
+            choices: Array.isArray(sharedChoices) ? sharedChoices : [],
+            chooserRole,
+            fighterId: fighterIdStr,
+            slotIndex: typeof slotIndex === 'number' ? slotIndex : (context && typeof context.slotIndex === 'number' ? context.slotIndex : null)
+        });
+    } catch (err) {
+        console.warn('[Cards] Failed to show powerup cards for eliminated fighter', err);
+        // Fail-safe: if UI cannot render, immediately resume flow
+        setTimeout(() => notifyPowerupSelectionComplete(entity, null), 0);
+    }
+}
+
+function processNextElimination() {
+    if (roundFlowState.awaitingCardSelection || roundFlowState.roundTransitionActive) return;
+    const next = roundFlowState.eliminationQueue.shift();
+    if (!next) return;
+    const { fighterId, entity, context, slotIndex, fighter } = next;
+    const resolvedSlotIndex = typeof slotIndex === 'number'
+        ? slotIndex
+        : (fighter && typeof fighter.slotIndex === 'number' ? fighter.slotIndex : null);
+    const chooserRole = resolveChooserRoleForSlot(resolvedSlotIndex);
+    try {
+        if (matchLifecycleManager && typeof matchLifecycleManager.markEliminated === 'function') {
+            matchLifecycleManager.markEliminated(fighterId, context || { reason: 'health-zero' });
+        } else if (playerRoster && typeof playerRoster.markEliminated === 'function') {
+            playerRoster.markEliminated(fighterId, context || { reason: 'health-zero' });
+        }
+    } catch (err) {
+        console.warn('[Lifecycle] Failed to mark fighter eliminated', err);
+    }
+    if (entity) {
+        try {
+            entity.disabled = true;
+            entity.dashActive = false;
+            entity.teledashWarmupActive = false;
+            entity.teledashPendingTeleport = false;
+        } catch (err) {}
+    }
+    roundFlowState.eliminationOrder.push(fighterId);
+    roundFlowState.awaitingCardSelection = true;
+    roundFlowState.awaitingCardFighterId = fighterId;
+    roundFlowState.awaitingCardEntity = entity;
+    roundFlowState.awaitingCardChooserRole = chooserRole;
+    roundFlowState.awaitingCardSlotIndex = resolvedSlotIndex;
+    waitingForCard = true;
+    startCardDraftForElimination(entity, fighterId, context || {}, { chooserRole, slotIndex: resolvedSlotIndex });
+}
+
+function notifyPowerupSelectionComplete(loserEntity, selectedCardName) {
+    const fighterRecord = getFighterRecordForEntity(loserEntity);
+    const expectedId = roundFlowState.awaitingCardFighterId;
+    const fighterIdForBroadcast = fighterRecord && fighterRecord.id ? fighterRecord.id : expectedId;
+    const chooserRoleForBroadcast = roundFlowState.awaitingCardChooserRole || (fighterRecord ? resolveChooserRoleForSlot(fighterRecord.slotIndex) : null);
+    const slotIndexForBroadcast = (() => {
+        if (fighterRecord && typeof fighterRecord.slotIndex === 'number') return fighterRecord.slotIndex;
+        if (typeof roundFlowState.awaitingCardSlotIndex === 'number') return roundFlowState.awaitingCardSlotIndex;
+        return null;
+    })();
+    let shouldBroadcastSelection = false;
+    if (typeof NET !== 'undefined' && NET && NET.connected && NET.role === 'host') {
+        // Joiner selections are already broadcast via host confirmation flow
+        if (chooserRoleForBroadcast !== 'joiner') {
+            shouldBroadcastSelection = true;
+        }
+    }
+    if (fighterRecord && fighterRecord.id && fighterRecord.id === expectedId) {
+        try {
+            if (cardDraftManager && typeof cardDraftManager.hasActiveDraft === 'function' && cardDraftManager.hasActiveDraft()) {
+                const selection = selectedCardName ? { id: selectedCardName, name: selectedCardName } : null;
+                cardDraftManager.recordSelection(String(fighterRecord.id), selection, { source: 'powerup-ui' });
+                cardDraftManager.cancelDraft({ reason: 'selection-complete' });
+            }
+        } catch (err) {
+            console.warn('[Draft] Failed to finalize card selection', err);
+        }
+    }
+    roundFlowState.awaitingCardSelection = false;
+    roundFlowState.awaitingCardFighterId = null;
+    roundFlowState.awaitingCardEntity = null;
+    roundFlowState.awaitingCardChooserRole = null;
+    roundFlowState.awaitingCardSlotIndex = null;
+    waitingForCard = false;
+    if (shouldBroadcastSelection && typeof window !== 'undefined' && window.ws && window.ws.readyState === WebSocket.OPEN) {
+        try {
+            window.ws.send(JSON.stringify({
+                type: 'relay',
+                data: {
+                    type: 'card-apply',
+                    pickerRole: chooserRoleForBroadcast || 'host',
+                    card: selectedCardName || null,
+                    fighterId: fighterIdForBroadcast != null ? String(fighterIdForBroadcast) : null,
+                    slotIndex: typeof slotIndexForBroadcast === 'number' ? slotIndexForBroadcast : null
+                }
+            }));
+        } catch (e) {}
+    }
+    if (roundFlowState.eliminationQueue.length > 0) {
+        processNextElimination();
+        return;
+    }
+    processPostSelectionRoundState();
+}
+
+function processPostSelectionRoundState() {
+    if (roundFlowState.roundTransitionActive) return;
+    const livingEntries = collectRosterEntries({ includeEliminated: false }).filter(entry => {
+        if (!entry || !entry.fighter || !entry.entity) return false;
+        if (entry.fighter.isAlive === false) return false;
+        const hp = typeof entry.entity.health === 'number' ? entry.entity.health : entry.entity.healthMax;
+        return hp > 0;
+    });
+    if (livingEntries.length <= 1) {
+        handleRoundVictory(livingEntries.length === 1 ? livingEntries[0] : null);
+    }
+}
+
+function handleRoundVictory(winnerEntry) {
+    if (roundFlowState.roundTransitionActive) return;
+    roundFlowState.roundTransitionActive = true;
+    let winnerId = null;
+    if (winnerEntry && winnerEntry.fighter) {
+        winnerId = winnerEntry.fighter.id || null;
+    }
+    if (winnerId && matchLifecycleManager && typeof matchLifecycleManager.registerScore === 'function') {
+        try {
+            matchLifecycleManager.registerScore(winnerId, 1);
+        } catch (err) {
+            console.warn('[Lifecycle] Failed to register round score', err);
+        }
+    }
+    if (winnerEntry && winnerEntry.entity && winnerId) {
+        try {
+            const rosterRecord = playerRoster && typeof playerRoster.getFighterById === 'function'
+                ? playerRoster.getFighterById(winnerId)
+                : null;
+            const updatedScore = rosterRecord && typeof rosterRecord.score === 'number' ? rosterRecord.score : winnerEntry.entity.score || 0;
+            winnerEntry.entity.score = updatedScore;
+        } catch (err) {
+            /* non-fatal */
+        }
+    }
+    try {
+        if (matchLifecycleManager && typeof matchLifecycleManager.completeRound === 'function') {
+            matchLifecycleManager.completeRound({
+                winners: winnerId ? [winnerId] : [],
+                eliminations: roundFlowState.eliminationOrder.slice(),
+                reason: 'last-fighter-standing'
+            });
+        }
+    } catch (err) {
+        console.warn('[Lifecycle] Failed to complete round summary', err);
+    }
+    scheduleNextRoundTransition(winnerEntry);
+}
+
+function scheduleNextRoundTransition(winnerEntry) {
+    const delayMs = 1350;
+    if (roundFlowState.nextRoundTimeout) {
+        clearTimeout(roundFlowState.nextRoundTimeout);
+    }
+    roundFlowState.nextRoundTimeout = setTimeout(() => {
+        resetArenaForNextRound(winnerEntry);
+    }, delayMs);
+}
+
+function resetArenaForNextRound(winnerEntry) {
+    // Preserve winner reference for spawn ordering
+
+    const orderedEntries = collectRosterEntries({ includeEliminated: true }).sort((a, b) => {
+        const ai = (a && a.fighter && typeof a.fighter.slotIndex === 'number') ? a.fighter.slotIndex : 99;
+        const bi = (b && b.fighter && typeof b.fighter.slotIndex === 'number') ? b.fighter.slotIndex : 99;
+        return ai - bi;
+    });
+
+    // Clear burning state for all fighters before respawn
+    for (const entry of orderedEntries) {
+        if (entry && entry.entity && entry.entity.burning) {
+            entry.entity.burning = null;
+        }
+        if (entry && entry.entity && Array.isArray(entry.entity.flameParticles)) {
+            entry.entity.flameParticles = [];
+        }
+    }
+
+    bullets = [];
+    explosions = [];
+    try { waitingForCard = false; } catch (err) {}
+    try { window._pendingWorldModOffer = null; } catch (err) {}
+    try {
+        infestedChunks = [];
+        firestormInstance = null;
+        firestormTimer = 0;
+        spontaneousTimer = 0;
+        infestationTimer = 0;
+        if (typeof burningEntities !== 'undefined') burningEntities = new Set();
+    } catch (err) {
+        /* defensive */
+    }
+    try {
+        if (healersActive && Array.isArray(healers) && healers.length) {
+            healers.length = 0;
+            healerPendingRespawn = true;
+            healerRespawnTimer = 0;
+            setNextHealerRespawnDelay();
+        }
+    } catch (err) {}
+
+    try {
+        const sel = document.getElementById('saved-maps');
+        if (sel && sel.value) {
+            if (sel.value === '__RANDOM__') {
+                const key = pickRandomSavedMapKey();
+                if (key) {
+                    loadSavedMapByKey(key);
+                } else {
+                    generateObstacles();
+                }
+            } else {
+                loadSavedMapByKey(sel.value);
+            }
+        } else {
+            generateObstacles();
+        }
+    } catch (err) {
+        console.warn('[Arena] Failed to regenerate map for new round', err);
+        try { generateObstacles(); } catch (err2) {}
+    }
+
+    // If we're the host in a multiplayer match, broadcast the new obstacle layout
+    // and (optional) spawn positions so joiners render the same map visuals.
+    try {
+        if (NET && NET.role === 'host' && NET.connected && window.ws && window.ws.readyState === WebSocket.OPEN) {
+            const payload = {
+                type: 'round-reset',
+                obstacles: serializeObstacles(),
+                // include authoritative positions/scores so joiners can mirror spawn placement
+                hostPos: (enemy && typeof enemy.x === 'number') ? { x: enemy.x, y: enemy.y, hp: enemy.health|0 } : null,
+                joinerPos: (player && typeof player.x === 'number') ? { x: player.x, y: player.y, hp: player.health|0 } : null,
+                scores: {
+                    host: (enemy && typeof enemy.score === 'number') ? enemy.score|0 : 0,
+                    joiner: (player && typeof player.score === 'number') ? player.score|0 : 0
+                }
+            };
+            try { window.ws.send(JSON.stringify({ type: 'relay', data: payload })); } catch (e) {}
+        }
+    } catch (e) {}
+
+    try { window.positionPlayersSafely && window.positionPlayersSafely(); } catch (err) {}
+
+    const centerX = window.CANVAS_W / 2;
+    const centerY = window.CANVAS_H / 2;
+    const radius = Math.min(window.CANVAS_W, window.CANVAS_H) * 0.32;
+    const total = orderedEntries.length || 1;
+
+    // Compute spawn positions with separation to avoid overlapping spawns
+    const placed = [];
+    // Helper: find a clear spot near x0,y0 that doesn't overlap obstacles or any already-placed fighters
+    function findClearAvoidingPlaced(x0, y0, cr, opts = {}) {
+        const maxRadius = opts.maxRadius || 420;
+        const step = opts.step || 12;
+        const angleStep = opts.angleStep || 0.6;
+        // If a fast helper exists and the raw candidate is clear, use it
+        if (typeof window.isCircleClear === 'function' && window.isCircleClear(x0, y0, cr)) {
+            // Still ensure not too close to placed
+            let tooClose = false;
+            for (const p of placed) {
+                const req = (cr + (p.r || cr) + 12);
+                if (window.dist(x0, y0, p.x, p.y) < req) { tooClose = true; break; }
+            }
+            if (!tooClose) return { x: x0, y: y0 };
+        }
+        // Start radial search expanding outward
+        for (let r = step; r <= maxRadius; r += step) {
+            for (let a = 0; a < Math.PI*2; a += angleStep) {
+                const nx = x0 + Math.cos(a) * r;
+                const ny = y0 + Math.sin(a) * r;
+                if (typeof window.isCircleClear === 'function' && !window.isCircleClear(nx, ny, cr)) continue;
+                // ensure not overlapping previously placed fighters
+                let ok = true;
+                for (const p of placed) {
+                    const req = (cr + (p.r || cr) + 12);
+                    if (window.dist(nx, ny, p.x, p.y) < req) { ok = false; break; }
+                }
+                if (ok) return { x: nx, y: ny };
+            }
+        }
+        // Fallback to some corner/edges used by original helper
+        const fallbackCandidates = [ {x: x0, y: 60+cr}, {x: x0, y: window.CANVAS_H-60-cr}, {x: 60+cr, y: y0}, {x: window.CANVAS_W-60-cr, y: y0}, {x: window.CANVAS_W/2, y: window.CANVAS_H/2} ];
+        for (const c of fallbackCandidates) {
+            if (typeof window.isCircleClear === 'function' && !window.isCircleClear(c.x, c.y, cr)) continue;
+            let ok = true;
+            for (const p of placed) {
+                const req = (cr + (p.r || cr) + 12);
+                if (window.dist(c.x, c.y, p.x, p.y) < req) { ok = false; break; }
+            }
+            if (ok) return { x: c.x, y: c.y };
+        }
+        return { x: x0, y: y0 };
+    }
+    orderedEntries.forEach((entry, idx) => {
+        if (!entry || !entry.entity) return;
+        let spawnX = entry.entity.x;
+        let spawnY = entry.entity.y;
+        // default min distance (pixels) between spawns
+        const entityRadius = (entry.entity && typeof entry.entity.radius === 'number') ? entry.entity.radius : 18;
+        const minSpawnDist = Math.max(96, Math.round(entityRadius * 3));
+
+        if (entry.entity !== player && entry.entity !== enemy) {
+            // initial ring placement
+            let angle = -Math.PI / 2 + (idx / total) * Math.PI * 2;
+            let baseRadius = radius;
+            // Try small angle perturbations until we find a non-colliding spot
+            let found = false;
+            for (let attempt = 0; attempt < 48; attempt++) {
+                const perturb = (Math.random() - 0.5) * 0.9 + attempt * 0.02; // gradual sweep
+                const a = angle + perturb;
+                const r = Math.round(centerX + Math.cos(a) * baseRadius);
+                const s = Math.round(centerY + Math.sin(a) * baseRadius);
+                // Skip if collides with obstacles or arena bounds
+                if (typeof window.isCircleClear === 'function') {
+                    if (!window.isCircleClear(r, s, entityRadius)) continue;
+                }
+                let ok = true;
+                for (const p of placed) {
+                    const dx = p.x - r;
+                    const dy = p.y - s;
+                    // require combined radius + small padding
+                    const req = (entityRadius + (p.r || entityRadius) + 12);
+                    if ((dx*dx + dy*dy) < (req * req)) { ok = false; break; }
+                }
+                if (ok) { spawnX = r; spawnY = s; found = true; break; }
+            }
+            // If not found, fall back to first candidate and we'll nudge later
+            if (!found) {
+                // choose the ring position and then try to find a nearby clear spot
+                let candX = Math.round(centerX + Math.cos(angle) * baseRadius);
+                let candY = Math.round(centerY + Math.sin(angle) * baseRadius);
+                if (typeof findClearAvoidingPlaced === 'function') {
+                    const best = findClearAvoidingPlaced(candX, candY, entityRadius, { maxRadius: 420, step: 16 });
+                    spawnX = Math.round(best.x);
+                    spawnY = Math.round(best.y);
+                } else if (typeof window.findNearestClearPosition === 'function') {
+                    const best = window.findNearestClearPosition(candX, candY, entityRadius, { maxRadius: 420, step: 16 });
+                    spawnX = Math.round(best.x);
+                    spawnY = Math.round(best.y);
+                } else {
+                    spawnX = candX;
+                    spawnY = candY;
+                }
+            }
+        } else {
+            // For main player/enemy, ensure they are not too close to already placed spawns.
+            // If they are, nudge them away along the vector between centers.
+            for (let attempt = 0; attempt < 24; attempt++) {
+                let conflict = null;
+                for (const p of placed) {
+                    const dx = p.x - spawnX;
+                    const dy = p.y - spawnY;
+                    const req = (entityRadius + (p.r || entityRadius) + 12);
+                    if ((dx*dx + dy*dy) < (req * req)) { conflict = p; break; }
+                }
+                if (!conflict) break;
+                // push away from conflict using combined radius as minimum separation
+                const dx = spawnX - conflict.x || (Math.random() - 0.5);
+                const dy = spawnY - conflict.y || (Math.random() - 0.5);
+                const len = Math.hypot(dx, dy) || 1;
+                const push = Math.max((entityRadius + (conflict.r || entityRadius) + 12), Math.round(len + 24));
+                spawnX = Math.round(conflict.x + (dx / len) * push);
+                spawnY = Math.round(conflict.y + (dy / len) * push);
+                // clamp to canvas
+                spawnX = clamp(spawnX, entry.entity.radius, window.CANVAS_W - entry.entity.radius);
+                spawnY = clamp(spawnY, entry.entity.radius, CANVAS_H - entry.entity.radius);
+            }
+            // If still overlapping an obstacle or placed entity, search nearby for a clear spot
+            try {
+                if (typeof window.isCircleClear === 'function' && !window.isCircleClear(spawnX, spawnY, entityRadius)) {
+                    const best = findClearAvoidingPlaced(spawnX, spawnY, entityRadius, { maxRadius: 420, step: 12 });
+                    spawnX = Math.round(best.x);
+                    spawnY = Math.round(best.y);
+                } else {
+                    // ensure not too close to placed even if clear of obstacles
+                    let tooClose = false;
+                    for (const p of placed) {
+                        const req = (entityRadius + (p.r || entityRadius) + 12);
+                        if (window.dist(spawnX, spawnY, p.x, p.y) < req) { tooClose = true; break; }
+                    }
+                    if (tooClose) {
+                        const best = findClearAvoidingPlaced(spawnX, spawnY, entityRadius, { maxRadius: 420, step: 12 });
+                        spawnX = Math.round(best.x);
+                        spawnY = Math.round(best.y);
+                    }
+                }
+            } catch (err) {}
+            // Ensure final spawn does not overlap obstacles; if it does, search nearby for a clear spot
+            try {
+                if (typeof window.isCircleClear === 'function' && !window.isCircleClear(spawnX, spawnY, entityRadius)) {
+                    if (typeof window.findNearestClearPosition === 'function') {
+                        const best = window.findNearestClearPosition(spawnX, spawnY, entityRadius, { maxRadius: 420, step: 12 });
+                        spawnX = Math.round(best.x);
+                        spawnY = Math.round(best.y);
+                    }
+                }
+            } catch (err) {}
+        }
+
+    // record the placed position to check against later entries (store radius too)
+    placed.push({ x: spawnX, y: spawnY, r: entityRadius });
+
+        if (typeof entry.entity.reset === 'function') {
+            entry.entity.reset(spawnX, spawnY);
+        } else {
+            entry.entity.x = spawnX;
+            entry.entity.y = spawnY;
+            entry.entity.health = entry.entity.healthMax || entry.entity.health || 100;
+        }
+        entry.entity.health = entry.entity.healthMax || entry.entity.health || 100;
+        entry.entity.disabled = false;
+        entry.entity.damageFlash = 0;
+        entry.entity.shakeTime = 0;
+        entry.entity.healthbarFlash = 0;
+        try {
+            if (entry.fighter && entry.fighter.id && playerRoster && typeof playerRoster.getFighterById === 'function') {
+                const updated = playerRoster.getFighterById(entry.fighter.id) || entry.fighter;
+                if (updated && typeof updated.score === 'number') {
+                    entry.entity.score = updated.score;
+                }
+            }
+        } catch (err) {}
+        try {
+            if (playerRoster && typeof playerRoster.markAlive === 'function' && entry.fighter && entry.fighter.id) {
+                playerRoster.markAlive(entry.fighter.id, { position: { x: spawnX, y: spawnY } });
+            }
+        } catch (err) {
+            console.warn('[Roster] Failed to mark fighter alive for new round', err);
+        }
+    });
+
+    resetRoundFlowState();
+    beginRoundLifecycle('next-round');
+}
+
+function hostEvaluateEliminations() {
+    if (roundFlowState.roundTransitionActive) return;
+    try {
+        if (typeof isSelectionPauseActive === 'function' && isSelectionPauseActive()) return;
+    } catch (err) {}
+    const entries = collectRosterEntries({ includeEliminated: true });
+    if (!entries.length) return;
+    for (const entry of entries) {
+        if (!entry || !entry.entity || !entry.fighter) continue;
+        if (entry.fighter.isAlive === false) continue;
+        const health = typeof entry.entity.health === 'number' ? entry.entity.health : entry.entity.healthMax;
+        if (health <= 0) {
+            queueEliminationForEntry(entry);
+        }
+    }
+    if (!roundFlowState.awaitingCardSelection) {
+        processNextElimination();
+    }
+}
+
 let rosterUIBound = false;
 let rosterInitialized = false;
 let localFighterId = null;
 
 const HOST_PLAYER_COLOR = '#65c6ff';
-const JOINER_PLAYER_COLORS = ['#ff5a5a', '#f7a945', '#9c6dfb'];
+// Joiner colors for slots 2..5: red, yellow, green, purple
+const JOINER_PLAYER_COLORS = ['#ff5a5a', '#ffe066', '#2ecc71', '#9b59b6'];
 const BOT_PLAYER_COLOR = '#f48f3a';
 
 function getJoinerColor(joinerIndex) {
@@ -288,6 +1031,10 @@ function getJoinerColor(joinerIndex) {
 function getRosterFighterColor(slotIndex, fighter) {
     if (fighter && fighter.metadata && typeof fighter.metadata.color === 'string' && fighter.metadata.color.trim().length) {
         return fighter.metadata.color;
+    }
+    // Support older code that stored color on the fighter record directly
+    if (fighter && typeof fighter.color === 'string' && fighter.color.trim().length) {
+        return fighter.color;
     }
     if (fighter && fighter.metadata && fighter.metadata.isHost) {
         return HOST_PLAYER_COLOR;
@@ -327,18 +1074,58 @@ function getActiveBotCount() {
 }
 
 function updateEnemyFlagsFromRoster() {
-    const bots = getActiveBotCount();
+    let bots = 0;
+    try {
+        bots = getActiveBotCount();
+    } catch (err) {
+        bots = 0;
+    }
     window.activeBotCount = bots;
     const mappedCount = bots > 0 ? Math.min(bots, 2) : 0;
     if (typeof enemyCount !== 'undefined') {
         enemyCount = mappedCount;
     }
     window.enemyCount = mappedCount;
-    const disabled = bots === 0;
+
+    let hasOpponent = false;
+    try {
+        if (playerRoster && typeof playerRoster.getFighters === 'function') {
+            const fighters = playerRoster.getFighters({ includeUnassigned: false }) || [];
+            const localIdx = (typeof window !== 'undefined' && typeof window.localPlayerIndex === 'number') ? window.localPlayerIndex : 0;
+            for (const fighter of fighters) {
+                if (!fighter) continue;
+                if (fighter.metadata && fighter.metadata.isWorldMaster) continue;
+                if (fighter.metadata && fighter.metadata.placeholder) continue;
+                const slotIdx = (typeof fighter.slotIndex === 'number') ? fighter.slotIndex : null;
+                if (localIdx >= 0 && slotIdx === localIdx) continue;
+                hasOpponent = true;
+                break;
+            }
+        }
+    } catch (err) {}
+
+    if (!hasOpponent) {
+        try {
+            if (NET && NET.connected) {
+                if (NET.role === 'host') {
+                    if (Array.isArray(NET.joiners) && NET.joiners.some(entry => entry && entry.connected !== false)) {
+                        hasOpponent = true;
+                    }
+                } else if (NET.role === 'joiner') {
+                    hasOpponent = true;
+                }
+            }
+        } catch (err) {}
+    }
+
+    const disabled = !hasOpponent;
     if (typeof enemyDisabled !== 'undefined') {
         enemyDisabled = disabled;
     }
     window.enemyDisabled = disabled;
+    if (typeof enemy !== 'undefined' && enemy) {
+        enemy.disabled = !!disabled;
+    }
 }
 
 function ensureRosterDefaults() {
@@ -462,7 +1249,7 @@ function getJoinerExternalId(joinerIndex) {
 }
 
 function getJoinerSlotIndex(joinerIndex) {
-    const fallbackSlots = (typeof playerRoster.getSlotCount === 'function') ? playerRoster.getSlotCount() : 4;
+    const fallbackSlots = (typeof playerRoster.getSlotCount === 'function') ? playerRoster.getSlotCount() : 5;
     const maxSlots = Math.max(2, fallbackSlots);
     const desired = Math.max(1, Math.floor(joinerIndex || 0) + 1);
     return Math.min(maxSlots - 1, desired);
@@ -551,7 +1338,7 @@ window.gameWorldMasterInstance = null;
 
 function setupWorldMasterInstance(isLocal) {
     // Prefer Integration API to avoid duplicate instances
-    try {
+        try {
         if (window.WorldMasterIntegration && typeof window.WorldMasterIntegration.enableWorldMasterMode === 'function') {
             window.WorldMasterIntegration.enableWorldMasterMode(!!isLocal);
             // Pull the instance reference
@@ -1939,6 +2726,9 @@ if (typeof window !== 'undefined') {
 
 function beginDash(p, dashVec, dashSet, opts = {}) {
     if (!p) return;
+    try {
+        if (typeof isEntityActive === 'function' && !isEntityActive(p)) return;
+    } catch (e) {}
     const dir = dashVec ? { x: dashVec.x, y: dashVec.y } : { x: 0, y: 0 };
     const teledash = isTeledashEnabled(p);
     p.dashActive = true;
@@ -2043,6 +2833,12 @@ let cardState = { active: false, player: null, callback: null };
 function isSelectionPauseActive() {
     if (cardState && cardState.active) return true;
     if (waitingForCard) return true;
+    try {
+        if (roundFlowState && (roundFlowState.awaitingCardSelection || roundFlowState.roundTransitionActive)) return true;
+    } catch (e) {}
+    try {
+        if (cardDraftManager && typeof cardDraftManager.hasActiveDraft === 'function' && cardDraftManager.hasActiveDraft()) return true;
+    } catch (e) {}
     try {
         if (window._pendingWorldModOffer) return true;
     } catch (e) {}
@@ -2195,7 +2991,7 @@ const NET = {
     dashLatch: false,
     bulletCounter: 1,
     // Joiner-side smoothing targets
-    joinerTargets: { p0: null, p1: null, healers: new Map() },
+    joinerTargets: { p0: null, p1: null, healers: new Map(), rosterBots: new Map() },
     myName: '', // local player's display name
     peerName: '', // first remote player's display name (legacy fallback)
     resetSessionState() {
@@ -2329,7 +3125,7 @@ const NET = {
                 serializePlayer(player),
                 serializePlayer(enemy)
             ],
-            bullets: bullets.map(b => ({ id: b.id, x: b.x, y: b.y, angle: b.angle, speed: b.speed, r: b.radius, dmg: b.damage, bnc: b.bouncesLeft, obl: !!b.obliterator, ex: !!b.explosive, ownerRole: (b.owner === player ? 'host' : 'joiner') })),
+            bullets: bullets.map(b => ({ id: b.id, x: b.x, y: b.y, angle: b.angle, speed: b.speed, r: b.radius, dmg: b.damage, bnc: b.bouncesLeft, obl: !!b.obliterator, ex: !!b.explosive, ownerRole: ((b.owner && b.owner._isRosterBot) ? 'host' : (b.owner === player ? 'host' : 'joiner')), ownerFighterId: (b.owner && b.owner._rosterFighterId) ? b.owner._rosterFighterId : null })),
             healersActive: !!healersActive,
             healers: (healersActive ? healers.filter(h => h && h.active).map(h => ({
                 id: h.id,
@@ -2353,6 +3149,23 @@ const NET = {
                 timer: firestormPreSpawnTimer,
                 delay: firestormPreSpawnDelay
             }
+            ,
+            // Host includes roster-assigned bot state so joiners can be driven by host
+            rosterBots: (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') ? (function(){
+                try {
+                    const out = [];
+                    const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+                    for (const f of fighters) {
+                        if (!f || f.kind !== 'bot') continue;
+                        const ent = playerRoster.getEntityReference(f.id) || f.entity || null;
+                        if (!ent) continue;
+                        const s = serializePlayer(ent);
+                        s.fighterId = f.id;
+                        out.push(s);
+                    }
+                    return out;
+                } catch (e) { return []; }
+            })() : []
         };
         return snap;
     },
@@ -2537,7 +3350,14 @@ const NET = {
                     }
                 } else {
                     // Map ownerRole from snapshot to a local entity so visual owner/color is correct
-                    const owner = (typeof sb.ownerRole === 'string') ? getEntityForRole(sb.ownerRole) : player;
+                    let owner = (typeof sb.ownerRole === 'string') ? getEntityForRole(sb.ownerRole) : player;
+                    // If snapshot includes an ownerFighterId (roster bot), try to map to the local entity reference
+                    try {
+                        if (sb.ownerFighterId && typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getEntityReference === 'function') {
+                            const ref = playerRoster.getEntityReference(sb.ownerFighterId);
+                            if (ref) owner = ref;
+                        }
+                    } catch (e) {}
                     const nb = new Bullet(owner, sb.x, sb.y, sb.angle);
                     nb.id = sb.id; nb.speed = sb.speed; nb.radius = sb.r; nb.damage = sb.dmg;
                     nb.bouncesLeft = sb.bnc; nb.obliterator = !!sb.obl; nb.explosive = !!sb.ex;
@@ -2551,6 +3371,61 @@ const NET = {
                     bullets.push(nb);
                 }
             }
+
+            // Apply roster bot state (joiner: smooth toward host-provided targets)
+            try {
+                const roster = snap.rosterBots || [];
+                if (NET.role === 'joiner' && Array.isArray(roster) && roster.length) {
+                    // Build a quick map of existing roster entities by fighterId
+                    const existingMap = new Map();
+                    if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+                        const fighters = playerRoster.getFighters({ includeUnassigned: true, includeEntity: true }) || [];
+                        for (const f of fighters) {
+                            if (!f) continue;
+                            existingMap.set(f.id, f.entity || null);
+                        }
+                    }
+                    for (const rb of roster) {
+                        if (!rb || typeof rb.fighterId === 'undefined') continue;
+                        const fid = rb.fighterId;
+                        let ent = existingMap.get(fid) || null;
+                        if (!ent) {
+                            // Create a visual-only entity for this roster bot
+                            ent = new Player(false, '#ff5a5a', rb.x || 0, rb.y || 0);
+                            ent.displayName = rb.displayName || rb.name || `Bot ${fid}`;
+                            // Register with roster if possible
+                            try { if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.setEntityReference === 'function') playerRoster.setEntityReference(fid, ent); } catch (e) {}
+                        }
+                        // Mark as roster-driven so joiner doesn't run local AI
+                        ent._isRosterBot = true;
+                        // Store smoothing target
+                        if (NET.joinerTargets && NET.joinerTargets.rosterBots) {
+                            NET.joinerTargets.rosterBots.set(fid, { x: rb.x, y: rb.y });
+                        }
+                        // Apply authoritative stats immediately (health, cooldowns)
+                        if (typeof rb.hp === 'number') ent.health = rb.hp;
+                        if (typeof rb.ts === 'number') ent.timeSinceShot = rb.ts;
+                        if (typeof rb.si === 'number') ent.shootInterval = rb.si;
+                        if (typeof rb.dc === 'number') ent.dashCooldown = rb.dc;
+                        ent.dashActive = !!rb.da;
+                        ent.teledash = !!rb.td;
+                        ent.teledashWarmupActive = !!rb.tdA;
+                    }
+                } else if (NET.role === 'host') {
+                    // Host: ensure any roster bot entries map to local entities and mark them as roster bots
+                    const roster = snap.rosterBots || [];
+                    for (const rb of roster) {
+                        if (!rb || typeof rb.fighterId === 'undefined') continue;
+                        const fid = rb.fighterId;
+                        try {
+                            if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getEntityReference === 'function') {
+                                const ent = playerRoster.getEntityReference(fid) || null;
+                                if (ent) ent._isRosterBot = true;
+                            }
+                        } catch (e) {}
+                    }
+                }
+            } catch (e) {}
         } catch (e) { /* ignore snapshot errors to avoid crashing */ }
     },
     // Assign an id to a newly created bullet (host only)
@@ -2559,6 +3434,9 @@ const NET = {
     },
     // Read local input (joiner). We map to existing variables.
     collectLocalInput() {
+    // If player entity is not active (eliminated/disabled), return neutral input
+    try { if (!isEntityActive(player)) return { up: false, down: false, left: false, right: false, shoot: false, dash: false, aimX: 0, aimY: 0 }; } catch (e) {}
+
     // Shoot: continuous while held. Use keyboard state or legacy player.shootQueued as a fallback.
     const spacePressed = !!keys[' '] || !!keys['space'] || !!player.shootQueued;
     const shootPressed = !!spacePressed;
@@ -2692,12 +3570,17 @@ function applyInfestationDieEvent(data) {
 
 function applyDamageFlashEvent(data) {
     // Find entity by ID and apply visual damage flash
-    if (!data || typeof data.entityId === 'undefined') return;
+    if (!data) return;
     let entity = null;
-    if (player && player.id === data.entityId) entity = player;
-    else if (enemy && enemy.id === data.entityId) entity = enemy;
-    else if (Array.isArray(healers)) {
-        entity = healers.find(h => h && h.id === data.entityId) || null;
+    if (data.fighterId != null) {
+        entity = getEntityForFighterId(data.fighterId);
+    }
+    if (!entity && typeof data.entityId !== 'undefined') {
+        if (player && player.id === data.entityId) entity = player;
+        else if (enemy && enemy.id === data.entityId) entity = enemy;
+    }
+    if (!entity && Array.isArray(healers)) {
+        entity = healers.find(h => h && (h.id === data.entityId || h.id === data.fighterId)) || null;
     }
     if (entity && typeof entity.applyDamageFlash === 'function') {
         entity.applyDamageFlash(data.damage, data.isBurning);
@@ -2936,7 +3819,13 @@ function createSyncedChunkUpdate(obstacleIndex, chunkUpdates) {
 
 function createSyncedDamageFlash(targetEntity, damage, isBurning = false) {
     try {
-        const data = { entityId: (targetEntity && targetEntity.id) ? targetEntity.id : null, damage, isBurning };
+        const fighterRecord = getFighterRecordForEntity(targetEntity);
+        const data = {
+            entityId: (targetEntity && targetEntity.id) ? targetEntity.id : null,
+            fighterId: fighterRecord && fighterRecord.id ? fighterRecord.id : null,
+            damage,
+            isBurning
+        };
         // Only sync to joiner - host already applied visuals in takeDamage
         syncToJoiner('damage-flash', data);
     } catch (e) {}
@@ -3219,6 +4108,21 @@ function update(dt) {
                 }
             }
         }
+        // Smooth roster bot positions (joiner)
+        if (NET.joinerTargets && NET.joinerTargets.rosterBots) {
+            try {
+                const fighters = (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') ? playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) : [];
+                for (const f of (fighters || [])) {
+                    if (!f || !f.entity) continue;
+                    const ent = f.entity;
+                    const target = NET.joinerTargets.rosterBots.get(f.id);
+                    if (target && typeof ent.x === 'number' && typeof ent.y === 'number') {
+                        ent.x = lerp(ent.x, target.x, t);
+                        ent.y = lerp(ent.y, target.y, t);
+                    }
+                }
+            } catch (e) {}
+        }
         // Smooth healer positions
         if (NET.joinerTargets && NET.joinerTargets.healers) {
             for (const healer of healers) {
@@ -3250,14 +4154,24 @@ function update(dt) {
         } catch (e) { /* non-fatal */ }
 
     // --- Burning Damage Over Time ---
-    if (player) {
-        player.updateBurning(dt);
-        if (typeof player.update === 'function') player.update(dt);
-    }
-    if (activeEnemy) {
-        enemy.updateBurning(dt);
-        if (typeof enemy.update === 'function') enemy.update(dt);
-    }
+        // Update burning for all living fighters (not just host/joiner)
+        if (playerRoster && typeof playerRoster.getFighters === 'function') {
+            const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+            for (const fighter of fighters) {
+                if (!fighter || fighter.isAlive === false) continue;
+                const entity = fighter.entity || (playerRoster.getEntityReference && playerRoster.getEntityReference(fighter.id));
+                if (entity && typeof entity.updateBurning === 'function') {
+                    entity.updateBurning(dt);
+                }
+                if (typeof entity.update === 'function') entity.update(dt);
+            }
+        } else {
+            // Fallback for legacy two-player
+            if (player && typeof player.updateBurning === 'function') player.updateBurning(dt);
+            if (player && typeof player.update === 'function') player.update(dt);
+            if (enemy && typeof enemy.updateBurning === 'function') enemy.updateBurning(dt);
+            if (enemy && typeof enemy.update === 'function') enemy.update(dt);
+        }
     if (Array.isArray(obstacles) && obstacles.length > 0) {
         // Cap how many chunk burning updates we do per frame to avoid stalls
         let chunkChecks = 0;
@@ -3639,7 +4553,7 @@ function update(dt) {
     // Suppress local player controls when host is driving blue as AI (joiner is WM and Enemy AI enabled)
     const joinerIsWM_AI_On = !!(NET.connected && NET.role === 'host' && worldMasterEnabled && (worldMasterPlayerIndex|0) === 1 && !enemySuppressed);
     const hostIsWM_AI_On = !!(NET.connected && NET.role === 'host' && worldMasterEnabled && (worldMasterPlayerIndex|0) === 0 && !enemySuppressed);
-    if (simulateLocally && player.dash && !joinerIsWM_AI_On && !hostIsWM_AI_On) {
+    if (simulateLocally && player.dash && !joinerIsWM_AI_On && !hostIsWM_AI_On && isEntityActive(player)) {
         if (keys['shift'] && !player.dashActive && player.dashCooldown <= 0) {
             let dashVec = { x: 0, y: 0 };
             if (input.x || input.y) {
@@ -3676,10 +4590,15 @@ function update(dt) {
                 let collided = false;
                 // First: check collision with the enemy (characters) so ramming hits players/enemies directly in open space
                 if (activeEnemy && player.ram && dist(player.x, player.y, enemy.x, enemy.y) < player.radius + enemy.radius) {
-                    let dmg = 18 + (player.ramStacks || 0) * 6; // damage scales per ram stack
-                    enemy._lastAttacker = player;
-                    enemy.takeDamage(dmg);
-                    enemy._lastAttacker = null;
+                    // If enemy is inactive (eliminated/disabled), ignore ram damage
+                    if (typeof isEntityActive === 'function' && !isEntityActive(enemy)) {
+                        // skip
+                    } else {
+                        let dmg = 18 + (player.ramStacks || 0) * 6; // damage scales per ram stack
+                        enemy._lastAttacker = player;
+                        enemy.takeDamage(dmg);
+                        enemy._lastAttacker = null;
+                    }
                     // Knockback logic: shove enemy in dash direction, scaling with ram stacks, but stop at obstacles
                     if (player.dashDir) {
                         let ramStacks = player.ramStacks || 0;
@@ -3797,10 +4716,13 @@ function update(dt) {
                 let collided = false;
                 // First: check collision with player directly so enemy dash damages player in open space
                 if (enemy.ram && dist(enemy.x, enemy.y, player.x, player.y) < enemy.radius + player.radius) {
-                    let dmg = 18 + (enemy.ramStacks || 0) * 6;
-                    player._lastAttacker = enemy;
-                    player.takeDamage(dmg);
-                    player._lastAttacker = null;
+                    // Skip if player inactive
+                    if (!(typeof isEntityActive === 'function' && !isEntityActive(player))) {
+                        let dmg = 18 + (enemy.ramStacks || 0) * 6;
+                        player._lastAttacker = enemy;
+                        player.takeDamage(dmg);
+                        player._lastAttacker = null;
+                    }
                     enemy.x = oldx; enemy.y = oldy;
                     collided = true;
                 }
@@ -4069,11 +4991,115 @@ function update(dt) {
         // Joiner: suppress local enemy AI entirely; enemy state comes from snapshots
         // No movement/AI here
     }
+    // Host: also run AI for any roster-assigned bots (host is authoritative for bots in multiplayer)
+    if (simulateLocally && NET.connected && NET.role === 'host') {
+        try {
+            const aiEntities = [];
+            // include legacy enemy object if it's a bot-style entity (not remote player)
+            if (enemy && !enemyDisabled && enemy._isRosterBot) aiEntities.push(enemy);
+            // collect roster bots (includeEntity to get actual entity refs)
+            if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+                const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+                for (const f of fighters) {
+                    if (!f) continue;
+                    if (f.kind !== 'bot') continue;
+                    if (f.isAlive === false) continue;
+                    const ent = playerRoster.getEntityReference(f.id) || f.entity || null;
+                    if (!ent) continue;
+                    // don't include the main player/enemy duplicate
+                    if (ent === player || ent === enemy) continue;
+                    if (!isEntityActive(ent, { skipRosterLookup: true })) continue;
+                    aiEntities.push(ent);
+                }
+            }
+
+            // Run AI update for all collected bot entities
+            for (const ent of aiEntities) {
+                if (!ent || !isEntityActive(ent)) continue;
+                ent.timeSinceShot += dt;
+                const targetCandidates = [];
+                const enqueueTarget = (candidate) => {
+                    if (!candidate || candidate === ent) return;
+                    if (!isEntityActive(candidate)) return;
+                    if (targetCandidates.includes(candidate)) return;
+                    targetCandidates.push(candidate);
+                };
+                enqueueTarget(player);
+                enqueueTarget(enemy);
+                try {
+                    if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+                        const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+                        for (const f of fighters) {
+                            if (!f || f.isAlive === false) continue;
+                            const rosterEnt = playerRoster.getEntityReference(f.id) || f.entity || null;
+                            enqueueTarget(rosterEnt);
+                        }
+                    }
+                } catch (err) {}
+
+                // choose nearest target
+                let target = null;
+                for (const candidate of targetCandidates) {
+                    if (!candidate) continue;
+                    if (!target) { target = candidate; continue; }
+                    const candDist = dist(ent.x, ent.y, candidate.x, candidate.y);
+                    const bestDist = dist(ent.x, ent.y, target.x, target.y);
+                    if (candDist < bestDist) target = candidate;
+                }
+                if (!target) continue;
+
+                let distToTarget = dist(ent.x, ent.y, target.x, target.y);
+                let canSeeTarget = hasLineOfSight(ent.x, ent.y, target.x, target.y, obstacles);
+                let canShootDespiteBlock = ent.pierce || ent.obliterator;
+                if (
+                    ent.timeSinceShot >= ent.shootInterval &&
+                    (canSeeTarget || canShootDespiteBlock) &&
+                    distToTarget > 125 && distToTarget < 430
+                ) {
+                    let t = { x: target.x, y: target.y };
+                    ent.shootToward(t, bullets);
+                    ent.timeSinceShot = 0;
+                    // Tag bullets if host
+                    if (NET.role === 'host') {
+                        for (let i = bullets.length-1; i >= 0; i--) {
+                            if (bullets[i].owner === ent && !bullets[i].id) NET.tagBullet(bullets[i]);
+                        }
+                    }
+                }
+                // Movement / strafing similar to single-player AI
+                if (!ent.dashActive) {
+                    if (typeof ent._strafePhase === 'undefined') ent._strafePhase = Math.random() * Math.PI * 2;
+                    if (typeof ent._strafeSwitch === 'undefined') ent._strafeSwitch = (Math.random() * 1.4) + 0.6;
+                    ent._strafeSwitch -= dt;
+                    if (ent._strafeSwitch <= 0) { ent._strafeSwitch = (Math.random() * 1.6) + 0.6; ent._strafePhase += Math.PI; }
+                    const IDEAL_DIST = 240; const BAND = 36;
+                    let dx = target.x - ent.x, dy = target.y - ent.y;
+                    let r = Math.hypot(dx, dy) || 1; let radial = 0;
+                    if (r > IDEAL_DIST + BAND) radial = 1; else if (r < IDEAL_DIST - BAND) radial = -1;
+                    let rx = dx / r, ry = dy / r;
+                    ent._strafePhase += dt * (0.9 + Math.random() * 0.8);
+                    let strafeDir = Math.sign(Math.sin(ent._strafePhase)) || 1;
+                    let perpX = -ry * strafeDir; let perpY = rx * strafeDir;
+                    let distFactor = Math.max(0, 1 - Math.abs(r - IDEAL_DIST) / (IDEAL_DIST));
+                    let strafeAmp = lerp(0.35, 0.9, distFactor);
+                    let mvx = (radial * rx) + (perpX * strafeAmp); let mvy = (radial * ry) + (perpY * strafeAmp);
+                    let mlen = Math.hypot(mvx, mvy) || 1; mvx /= mlen; mvy /= mlen;
+                    let speed = ent.speed; let oldx = ent.x, oldy = ent.y;
+                    ent.x += mvx * speed * dt; ent.y += mvy * speed * dt;
+                    ent.x = clamp(ent.x, ent.radius, window.CANVAS_W - ent.radius);
+                    ent.y = clamp(ent.y, ent.radius, CANVAS_H - ent.radius);
+                    for (let o of obstacles) { if (o.circleCollide(ent.x, ent.y, ent.radius)) { ent.x = oldx; ent.y = oldy; break; } }
+                }
+            }
+        } catch (err) {
+            // defensive: if roster or other state missing, skip host-side bot AI this tick
+        }
+    }
     // Check if blue AI is controlling player to avoid double increment
     const blueAIActive = !!(NET.connected && NET.role === 'host' && worldMasterEnabled && !enemySuppressed && 
         ((worldMasterPlayerIndex === 0) || (worldMasterPlayerIndex === 1)));
     if (simulateLocally && !blueAIActive) player.timeSinceShot += dt;
-    if (simulateLocally && !blueAIActive && player.shootQueued && player.timeSinceShot >= player.shootInterval) {
+    if (simulateLocally && !blueAIActive && isEntityActive(player) && player.shootQueued && player.timeSinceShot >= player.shootInterval) {
         player.shootToward(mouse, bullets);
         // If this client is a joiner doing local prediction, mark newly fired bullets as local so Shot Controller can steer them
         if (NET.role === 'joiner') {
@@ -4102,11 +5128,13 @@ function update(dt) {
         if (window.localPlayerIndex === -1 && window.aiCount === 2) {
             // Ensure both AI exist
             if (!window.ai1) {
-                window.ai1 = new Player(false, "#ff5a5a", window.CANVAS_W/3, CANVAS_H/2);
+                const c1 = (typeof getJoinerColor === 'function') ? getJoinerColor(0) : '#ff5a5a';
+                window.ai1 = new Player(false, c1, window.CANVAS_W/3, CANVAS_H/2);
                 window.ai1.displayName = "AI 1";
             }
             if (!window.ai2) {
-                window.ai2 = new Player(false, "#65c6ff", 2*window.CANVAS_W/3, CANVAS_H/2);
+                const c2 = (typeof HOST_PLAYER_COLOR !== 'undefined') ? HOST_PLAYER_COLOR : '#65c6ff';
+                window.ai2 = new Player(false, c2, 2*window.CANVAS_W/3, CANVAS_H/2);
                 window.ai2.displayName = "AI 2";
             }
             let aiA = window.ai1, aiB = window.ai2;
@@ -4170,53 +5198,108 @@ function update(dt) {
             enemy = ai2;
         } else {
             // Normal single-player AI logic (player vs AI)
-            enemy.timeSinceShot += dt;
-            let distToPlayer = dist(enemy.x, enemy.y, player.x, player.y);
-            let canSeePlayer = hasLineOfSight(enemy.x, enemy.y, player.x, player.y, obstacles);
-            let canShootDespiteBlock = enemy.pierce || enemy.obliterator;
-            if (
-                enemy.timeSinceShot >= enemy.shootInterval &&
-                (canSeePlayer || canShootDespiteBlock) &&
-                distToPlayer > 125 && distToPlayer < 430
-            ) {
-                let target = { x: player.x, y: player.y };
-                enemy.shootToward(target, bullets);
-                enemy.timeSinceShot = 0;
-            }
-            if (!enemy.dashActive) {
-                if (typeof enemy._strafePhase === 'undefined') enemy._strafePhase = Math.random() * Math.PI * 2;
-                if (typeof enemy._strafeSwitch === 'undefined') enemy._strafeSwitch = (Math.random() * 1.4) + 0.6;
-                enemy._strafeSwitch -= dt;
-                if (enemy._strafeSwitch <= 0) {
-                    enemy._strafeSwitch = (Math.random() * 1.6) + 0.6;
-                    enemy._strafePhase += Math.PI;
+            const aiEntities = [];
+            if (enemy && !enemyDisabled && isEntityActive(enemy, { skipRosterLookup: true })) aiEntities.push(enemy);
+            // Also include any roster bot entities so multiple bots act in the match
+            try {
+                if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+                    const fighters = playerRoster.getFighters({ includeUnassigned: false }) || [];
+                    for (const f of fighters) {
+                        if (!f) continue;
+                        if (f.kind === 'bot') {
+                            if (f.isAlive === false) continue;
+                            const ent = playerRoster.getEntityReference(f.id);
+                            if (!ent) continue;
+                            if (!isEntityActive(ent, { skipRosterLookup: true })) continue;
+                            if (!aiEntities.includes(ent)) aiEntities.push(ent);
+                        }
+                    }
                 }
-                const IDEAL_DIST = 240;
-                const BAND = 36;
-                let dx = player.x - enemy.x, dy = player.y - enemy.y;
-                let r = Math.hypot(dx, dy) || 1;
-                let radial = 0;
-                if (r > IDEAL_DIST + BAND) radial = 1;
-                else if (r < IDEAL_DIST - BAND) radial = -1;
-                let rx = dx / r, ry = dy / r;
-                enemy._strafePhase += dt * (0.9 + Math.random() * 0.8);
-                let strafeDir = Math.sign(Math.sin(enemy._strafePhase)) || 1;
-                let perpX = -ry * strafeDir;
-                let perpY = rx * strafeDir;
-                let distFactor = Math.max(0, 1 - Math.abs(r - IDEAL_DIST) / (IDEAL_DIST));
-                let strafeAmp = lerp(0.35, 0.9, distFactor);
-                let mvx = (radial * rx) + (perpX * strafeAmp);
-                let mvy = (radial * ry) + (perpY * strafeAmp);
-                let mlen = Math.hypot(mvx, mvy) || 1;
-                mvx /= mlen; mvy /= mlen;
-                let speed = enemy.speed;
-                let oldx = enemy.x, oldy = enemy.y;
-                enemy.x += mvx * speed * dt;
-                enemy.y += mvy * speed * dt;
-                enemy.x = clamp(enemy.x, enemy.radius, window.CANVAS_W-enemy.radius);
-                enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H-enemy.radius);
-                for (let o of obstacles) {
-                    if (o.circleCollide(enemy.x, enemy.y, enemy.radius)) { enemy.x = oldx; enemy.y = oldy; break; }
+            } catch (e) {}
+
+            for (const ent of aiEntities) {
+                if (!isEntityActive(ent)) continue;
+                ent.timeSinceShot += dt;
+                const targetCandidates = [];
+                const enqueueTarget = (candidate) => {
+                    if (!candidate || candidate === ent) return;
+                    if (!isEntityActive(candidate)) return;
+                    if (targetCandidates.includes(candidate)) return;
+                    targetCandidates.push(candidate);
+                };
+                enqueueTarget(player);
+                enqueueTarget(enemy);
+                try {
+                    if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+                        const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+                        for (const f of fighters) {
+                            if (!f || f.isAlive === false) continue;
+                            const rosterEnt = playerRoster.getEntityReference(f.id) || f.entity || null;
+                            enqueueTarget(rosterEnt);
+                        }
+                    }
+                } catch (err) {}
+
+                let target = null;
+                for (const candidate of targetCandidates) {
+                    if (!candidate) continue;
+                    if (!target) {
+                        target = candidate;
+                        continue;
+                    }
+                    const candDist = dist(ent.x, ent.y, candidate.x, candidate.y);
+                    const bestDist = dist(ent.x, ent.y, target.x, target.y);
+                    if (candDist < bestDist) target = candidate;
+                }
+                if (!target) continue;
+
+                let distToPlayer = dist(ent.x, ent.y, target.x, target.y);
+                let canSeePlayer = hasLineOfSight(ent.x, ent.y, target.x, target.y, obstacles);
+                let canShootDespiteBlock = ent.pierce || ent.obliterator;
+                if (
+                    ent.timeSinceShot >= ent.shootInterval &&
+                    (canSeePlayer || canShootDespiteBlock) &&
+                    distToPlayer > 125 && distToPlayer < 430
+                ) {
+                    let t = { x: target.x, y: target.y };
+                    ent.shootToward(t, bullets);
+                    ent.timeSinceShot = 0;
+                }
+                if (!ent.dashActive) {
+                    if (typeof ent._strafePhase === 'undefined') ent._strafePhase = Math.random() * Math.PI * 2;
+                    if (typeof ent._strafeSwitch === 'undefined') ent._strafeSwitch = (Math.random() * 1.4) + 0.6;
+                    ent._strafeSwitch -= dt;
+                    if (ent._strafeSwitch <= 0) {
+                        ent._strafeSwitch = (Math.random() * 1.6) + 0.6;
+                        ent._strafePhase += Math.PI;
+                    }
+                    const IDEAL_DIST = 240;
+                    const BAND = 36;
+                    let dx = target.x - ent.x, dy = target.y - ent.y;
+                    let r = Math.hypot(dx, dy) || 1;
+                    let radial = 0;
+                    if (r > IDEAL_DIST + BAND) radial = 1;
+                    else if (r < IDEAL_DIST - BAND) radial = -1;
+                    let rx = dx / r, ry = dy / r;
+                    ent._strafePhase += dt * (0.9 + Math.random() * 0.8);
+                    let strafeDir = Math.sign(Math.sin(ent._strafePhase)) || 1;
+                    let perpX = -ry * strafeDir;
+                    let perpY = rx * strafeDir;
+                    let distFactor = Math.max(0, 1 - Math.abs(r - IDEAL_DIST) / (IDEAL_DIST));
+                    let strafeAmp = lerp(0.35, 0.9, distFactor);
+                    let mvx = (radial * rx) + (perpX * strafeAmp);
+                    let mvy = (radial * ry) + (perpY * strafeAmp);
+                    let mlen = Math.hypot(mvx, mvy) || 1;
+                    mvx /= mlen; mvy /= mlen;
+                    let speed = ent.speed;
+                    let oldx = ent.x, oldy = ent.y;
+                    ent.x += mvx * speed * dt;
+                    ent.y += mvy * speed * dt;
+                    ent.x = clamp(ent.x, ent.radius, window.CANVAS_W-ent.radius);
+                    ent.y = clamp(ent.y, ent.radius, CANVAS_H-ent.radius);
+                    for (let o of obstacles) {
+                        if (o.circleCollide(ent.x, ent.y, ent.radius)) { ent.x = oldx; ent.y = oldy; break; }
+                    }
                 }
             }
         }
@@ -4312,11 +5395,14 @@ function update(dt) {
                         self.y = clamp(self.y, self.radius, CANVAS_H-self.radius);
                         let collided = false;
                         if (self.ram && dist(self.x, self.y, target.x, target.y) < self.radius + target.radius) {
-                            let dmg = 18 + (self.ramStacks || 0) * 6;
-                            target._lastAttacker = self;
-                            target.takeDamage(dmg);
-                            target._lastAttacker = null;
-                            self.x = oldx; self.y = oldy; collided = true;
+                            // Skip if target inactive
+                            if (!(typeof isEntityActive === 'function' && !isEntityActive(target))) {
+                                let dmg = 18 + (self.ramStacks || 0) * 6;
+                                target._lastAttacker = self;
+                                target.takeDamage(dmg);
+                                target._lastAttacker = null;
+                                self.x = oldx; self.y = oldy; collided = true;
+                            }
                         }
                         if (!collided) {
                             for (let o of obstacles) {
@@ -4510,6 +5596,18 @@ function update(dt) {
     for (let o of obstacles) o.update(dt);
     // Always update explosion visuals. Only apply damage/chunk updates on the authoritative side (host or single-player).
     const explosionPlayers = [player].concat(enemySuppressed ? [] : [enemy]);
+    // Add roster bot entities to explosion targets
+    try {
+        if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+            const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+            for (const f of fighters) {
+                if (!f || !f.entity) continue;
+                if (f.isAlive === false) continue;
+                if (f.metadata && f.metadata.isWorldMaster) continue;
+                if (!explosionPlayers.includes(f.entity)) explosionPlayers.push(f.entity);
+            }
+        }
+    } catch (e) {}
     const explosionHealers = (healersActive && healers.length) ? healers.filter(h => h && h.active) : [];
     for (let e of explosions) {
         if (!e.done) e.update(dt, obstacles, explosionPlayers, simulateLocally, explosionHealers);
@@ -4520,55 +5618,75 @@ function update(dt) {
     // Bullet collision and effects (host only)
     if (simulateLocally) for (let b of bullets) {
         if (!b.active) continue;
-        let victim = null;
-        if (b.owner === player) {
-            victim = activeEnemy ? enemy : null;
-        } else {
-            victim = player;
-        }
-        let hit = false;
-        if (victim && dist(b.x, b.y, victim.x, victim.y) < b.radius + victim.radius) {
-            // If victim is dashing and has deflect available, reflect the bullet instead of taking damage
-            if (victim.dashActive && victim.deflect && (victim.deflectRemaining || 0) > 0) {
-                // compute normal from victim center to bullet
-                let nx = b.x - victim.x;
-                let ny = b.y - victim.y;
-                let nlen = Math.hypot(nx, ny) || 0.0001;
-                nx /= nlen; ny /= nlen;
-                // reflect bullet angle
-                let vx = Math.cos(b.angle), vy = Math.sin(b.angle);
-                let dot = vx*nx + vy*ny;
-                let rx = vx - 2 * dot * nx;
-                let ry = vy - 2 * dot * ny;
-                b.angle = Math.atan2(ry, rx);
-                // nudge out of collision
-                b.x += rx * (b.radius * 0.9);
-                b.y += ry * (b.radius * 0.9);
-                // reassign ownership to the deflector so it can hit original owner
-                b.owner = victim;
-                // decrement available deflects for this dash
-                victim.deflectRemaining = Math.max(0, (victim.deflectRemaining||0) - 1);
-                // If bullet had bounces left, consume one (optional) to match ricochet behavior
-                if ((b.bouncesLeft|0) > 0) b.bouncesLeft = Math.max(0, b.bouncesLeft - 1);
-                // ensure explosive bullets do NOT explode on deflect; keep them active
-                b.active = true;
-                try { playRicochet(); } catch (e) {}
-                hit = true;
-            } else {
-                if (b.explosive) {
-                    triggerExplosion(b, victim.x, victim.y);
-                } else {
-                    victim._lastAttacker = b.owner || null;
-                    victim.takeDamage(b.damage);
-                    victim._lastAttacker = null;
-                    // Fireshot: apply burning
-                    if (b.fireshot) {
-                        let stacks = (b.owner && b.owner.fireshotStacks) ? b.owner.fireshotStacks : 1;
-                        victim.burning = { time: 0, duration: 1.2 + 1.3 * stacks };
-                    }
+        // Collect all potential victims: player, enemy, and roster bots
+        let potentialVictims = [];
+        if (player) potentialVictims.push(player);
+        if (enemy && !enemyDisabled) potentialVictims.push(enemy);
+        // Add roster bot entities
+        try {
+            if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+                const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+                for (const f of fighters) {
+                    if (!f || !f.entity) continue;
+                    if (f.isAlive === false) continue;
+                    // Skip worldmaster placeholders
+                    if (f.metadata && f.metadata.isWorldMaster) continue;
+                    // Skip if already in list
+                    if (!potentialVictims.includes(f.entity)) potentialVictims.push(f.entity);
                 }
-                b.active = false;
-                hit = true;
+            }
+        } catch (e) {}
+
+        let hit = false;
+        for (const victim of potentialVictims) {
+            if (!victim || victim === b.owner) continue; // Don't hit self
+                    if (dist(b.x, b.y, victim.x, victim.y) < b.radius + victim.radius) {
+                        // Ignore hits on inactive/eliminated victims
+                        if (typeof isEntityActive === 'function' && !isEntityActive(victim)) continue;
+                // If victim is dashing and has deflect available, reflect the bullet instead of taking damage
+                if (victim.dashActive && victim.deflect && (victim.deflectRemaining || 0) > 0) {
+                    // compute normal from victim center to bullet
+                    let nx = b.x - victim.x;
+                    let ny = b.y - victim.y;
+                    let nlen = Math.hypot(nx, ny) || 0.0001;
+                    nx /= nlen; ny /= nlen;
+                    // reflect bullet angle
+                    let vx = Math.cos(b.angle), vy = Math.sin(b.angle);
+                    let dot = vx*nx + vy*ny;
+                    let rx = vx - 2 * dot * nx;
+                    let ry = vy - 2 * dot * ny;
+                    b.angle = Math.atan2(ry, rx);
+                    // nudge out of collision
+                    b.x += rx * (b.radius * 0.9);
+                    b.y += ry * (b.radius * 0.9);
+                    // reassign ownership to the deflector so it can hit original owner
+                    b.owner = victim;
+                    // decrement available deflects for this dash
+                    victim.deflectRemaining = Math.max(0, (victim.deflectRemaining||0) - 1);
+                    // If bullet had bounces left, consume one (optional) to match ricochet behavior
+                    if ((b.bouncesLeft|0) > 0) b.bouncesLeft = Math.max(0, b.bouncesLeft - 1);
+                    // ensure explosive bullets do NOT explode on deflect; keep them active
+                    b.active = true;
+                    try { playRicochet(); } catch (e) {}
+                    hit = true;
+                    break; // Stop checking other victims after deflect
+                } else {
+                    if (b.explosive) {
+                        triggerExplosion(b, victim.x, victim.y);
+                    } else {
+                        victim._lastAttacker = b.owner || null;
+                        victim.takeDamage(b.damage);
+                        victim._lastAttacker = null;
+                        // Fireshot: apply burning
+                        if (b.fireshot) {
+                            let stacks = (b.owner && b.owner.fireshotStacks) ? b.owner.fireshotStacks : 1;
+                            victim.burning = { time: 0, duration: 1.2 + 1.3 * stacks };
+                        }
+                    }
+                    b.active = false;
+                    hit = true;
+                    break; // Stop checking other victims after hit
+                }
             }
         }
         if (hit) continue;
@@ -4829,11 +5947,45 @@ function update(dt) {
     }
     bullets = bullets.filter(b => b.active);
 
-    [player, enemy].forEach(p => {
-        if (p.shakeTime > 0) p.shakeTime -= dt;
-        if (p.damageFlash > 0) p.damageFlash -= dt;
-        if (p.healthbarFlash > 0) p.healthbarFlash -= dt;
-    });
+    // Decrement visual timers for all active entities: player, enemy, roster bots, healers
+    try {
+        const ents = [];
+        if (player) ents.push(player);
+        if (enemy) ents.push(enemy);
+        // Add roster entity references (bots/extra fighters)
+        if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+            const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+            for (const f of fighters) {
+                if (!f || !f.entity) continue;
+                // Skip duplicates
+                if (!ents.includes(f.entity)) ents.push(f.entity);
+            }
+        }
+        // Include healers (they manage their own damageFlash too, but safe to include)
+        if (Array.isArray(healers) && healers.length) {
+            for (const h of healers) if (h && !ents.includes(h)) ents.push(h);
+        }
+        for (const p of ents) {
+            if (!p) continue;
+            if (p.shakeTime > 0) p.shakeTime = Math.max(0, p.shakeTime - dt);
+            if (p.damageFlash > 0) p.damageFlash = Math.max(0, p.damageFlash - dt);
+            if (p.healthbarFlash > 0) p.healthbarFlash = Math.max(0, p.healthbarFlash - dt);
+        }
+    } catch (e) {
+        // defensive: if something unexpected, ensure player/enemy timers still update
+        try {
+            if (player) {
+                if (player.shakeTime > 0) player.shakeTime = Math.max(0, player.shakeTime - dt);
+                if (player.damageFlash > 0) player.damageFlash = Math.max(0, player.damageFlash - dt);
+                if (player.healthbarFlash > 0) player.healthbarFlash = Math.max(0, player.healthbarFlash - dt);
+            }
+            if (enemy) {
+                if (enemy.shakeTime > 0) enemy.shakeTime = Math.max(0, enemy.shakeTime - dt);
+                if (enemy.damageFlash > 0) enemy.damageFlash = Math.max(0, enemy.damageFlash - dt);
+                if (enemy.healthbarFlash > 0) enemy.healthbarFlash = Math.max(0, enemy.healthbarFlash - dt);
+            }
+        } catch (e2) {}
+    }
 
     // --- Healers logic ---
     if (healersActive) {
@@ -4891,256 +6043,8 @@ function update(dt) {
 
     // --- Respawn, health reset, card (host-authoritative) ---
     // Run when in single-player (not connected) OR when connected as host
-    if (!waitingForCard && (!NET.connected || NET.role === 'host')) {
-        const participants = [player, enemy];
-        for (let p of participants) {
-            if (p.health <= 0) {
-                waitingForCard = true;
-                const loser = p;
-                const loserRole = (loser === player) ? 'host' : 'joiner';
-                const winner = (loser === player) ? enemy : player;
-                // Only increment score if not in continue loop
-                let allowScore = true;
-                if (window._victoryRoundsActive && window._victoryRoundsLeft === 3) {
-                    // Just resumed from continue, don't increment score again
-                    allowScore = false;
-                }
-                if (allowScore) winner.score++;
-                // Check for match victory
-                try {
-                    if (typeof ROUNDS_TO_WIN !== 'number' || ROUNDS_TO_WIN <= 0) ROUNDS_TO_WIN = 10;
-                    // Infinite continue loop logic
-                    if (window._victoryRoundsActive) {
-                        window._victoryRoundsLeft--;
-                        if (window._victoryRoundsLeft <= 0) {
-                            window._victoryRoundsActive = false;
-                            showVictoryModal((winner.displayName || (winner.isPlayer ? 'Player' : 'Enemy')), NET.role === 'host');
-                            return;
-                        }
-                    } else if (winner.score >= ROUNDS_TO_WIN) {
-                        try { logDev && logDev(`[MATCH] ${winner.displayName || (winner.isPlayer ? 'Player' : 'Enemy')} wins match (${winner.score} >= ${ROUNDS_TO_WIN}). Showing victory modal.`); } catch (e) {}
-                        // Show victory modal and broadcast match-end to clients; host controls restart
-                        showVictoryModal((winner.displayName || (winner.isPlayer ? 'Player' : 'Enemy')), NET.role === 'host');
-                        // Do not auto-restart; wait for host to press Restart
-                        return;
-                    }
-                } catch (e) {}
-                if (winner.healOnKill) {
-                    const prev = winner.health;
-                    winner.health = Math.min(winner.health + 25, winner.healthMax);
-                    const healed = winner.health - prev;
-                    if (healed > 0 && typeof winner.triggerHealingEffect === 'function') {
-                        winner.triggerHealingEffect(healed);
-                    }
-                }
-                bullets = [];
-                explosions = [];
-                // Clear transient world-mod entities so they don't persist across map refresh
-                try {
-                    infestedChunks = [];
-                    // Firestorm is a transient instance (visual + damage). Clear it.
-                    firestormInstance = null;
-                    firestormTimer = 0;
-                    // Reset spontaneous timer so immediate events don't fire right after a map load
-                    spontaneousTimer = 0;
-                    infestationTimer = 0;
-                } catch (e) {}
-                // Rebuild map for next round
-                const sel = document.getElementById('saved-maps');
-                if (sel && sel.value) {
-                    if (sel.value === '__RANDOM__') {
-                        const key = pickRandomSavedMapKey();
-                        if (key) loadSavedMapByKey(key); else generateObstacles();
-                    } else {
-                        loadSavedMapByKey(sel.value);
-                    }
-                } else {
-                    generateObstacles();
-                }
-                window.positionPlayersSafely();
-                // Reset both entities and heal them to full for the new round
-                try {
-                    // reset preserves position; ensure both start fully healed
-                    if (player && typeof player.reset === 'function') player.reset(player.x, player.y);
-                    if (enemy && typeof enemy.reset === 'function') enemy.reset(enemy.x, enemy.y);
-                    if (player) player.health = player.healthMax || 100;
-                    if (enemy) enemy.health = enemy.healthMax || 100;
-                    // Clear any ongoing burning effects so DoT doesn't carry into the next round
-                    try {
-                        // stop burning on players
-                        if (player && player.burning) {
-                            try { if (GameEvents && GameEvents.emit) GameEvents.emit('burning-stop', { entityId: player.id }); } catch (e) {}
-                            player.burning = null;
-                        }
-                        if (enemy && enemy.burning) {
-                            try { if (GameEvents && GameEvents.emit) GameEvents.emit('burning-stop', { entityId: enemy.id }); } catch (e) {}
-                            enemy.burning = null;
-                        }
-                        // stop burning on obstacle chunks
-                        if (Array.isArray(obstacles)) {
-                            for (let oi = 0; oi < obstacles.length; oi++) {
-                                const obs = obstacles[oi];
-                                if (!obs || !obs.chunks) continue;
-                                for (let ci = 0; ci < obs.chunks.length; ci++) {
-                                    const chunk = obs.chunks[ci];
-                                    if (chunk && chunk.burning) {
-                                        try { if (GameEvents && GameEvents.emit) GameEvents.emit('burning-stop', { obstacleIndex: oi, chunkIndex: ci }); } catch (e) {}
-                                        chunk.burning = null;
-                                    }
-                                }
-                            }
-                        }
-                        // reset tracking set
-                        try { if (typeof burningEntities !== 'undefined') burningEntities = new Set(); } catch (e) {}
-                    } catch (e) {}
-                } catch (e) {}
-                // Broadcast round-reset (map + scores + positions)
-                try {
-                    if (window.ws && window.ws.readyState === WebSocket.OPEN) {
-                        window.ws.send(JSON.stringify({ type:'relay', data: {
-                            type:'round-reset',
-                            obstacles: serializeObstacles(),
-                            hostPos: { x: player.x, y: player.y, hp: player.health },
-                            joinerPos: { x: enemy.x, y: enemy.y, hp: enemy.health },
-                            scores: { host: (player.score||0), joiner: (enemy.score||0) }
-                        }}));
-                    }
-                } catch (e) {}
-                // Remove existing healers completely at round end and start respawn timer
-                try {
-                    if (healersActive && Array.isArray(healers) && healers.length) {
-                        // Clear all healers from the map entirely
-                        healers.length = 0;
-                        // Start respawn timer for a fresh healer
-                        healerPendingRespawn = true;
-                        healerRespawnTimer = 0;
-                        setNextHealerRespawnDelay();
-                    }
-                } catch (e) {}
-                // Decide what selection to show
-                // Always show powerup offer (5 cards) for the loser first
-                let powerupPool = POWERUPS;
-                try {
-                    if (window.WorldMasterIntegration && typeof window.WorldMasterIntegration.getFilteredPowerups === 'function') {
-                        const filtered = window.WorldMasterIntegration.getFilteredPowerups(POWERUPS) || [];
-                        if (Array.isArray(filtered) && filtered.length >= 5) {
-                            powerupPool = filtered;
-                        } else if (Array.isArray(filtered) && filtered.length > 0 && filtered.length < 5) {
-                            console.warn('[WORLDMASTER] Only', filtered.length, 'powerup cards enabled; falling back to full deck to maintain five choices.');
-                            powerupPool = POWERUPS;
-                        }
-                    }
-                } catch (e) { console.warn('[WORLDMASTER] Failed to filter powerup deck:', e); }
-                if (!Array.isArray(powerupPool) || powerupPool.length < 5) {
-                    powerupPool = POWERUPS;
-                }
-                const sampledPowerups = randomChoice(powerupPool, Math.min(5, powerupPool.length));
-                const powerupChoices = sampledPowerups.map(c => (typeof c === 'string') ? c : (c && c.name)).filter(Boolean);
-                if (powerupChoices.length < 5 && Array.isArray(POWERUPS)) {
-                    const fallbackNames = POWERUPS.map(extra => (typeof extra === 'string') ? extra : (extra && extra.name))
-                        .filter(Boolean)
-                        .filter(name => !powerupChoices.includes(name));
-                    for (const name of fallbackNames) {
-                        powerupChoices.push(name);
-                        if (powerupChoices.length >= 5) break;
-                    }
-                }
-                if (powerupChoices.length > 0 && powerupChoices.length < 5) {
-                    const filler = powerupChoices.slice();
-                    let idx = 0;
-                    while (powerupChoices.length < 5 && filler.length) {
-                        powerupChoices.push(filler[idx % filler.length]);
-                        idx++;
-                    }
-                }
-                const powerupChooserRole = loserRole;
-                logDev(`[CARD FLOW] Player died: ${loser.isPlayer ? 'player' : 'enemy'} (${loserRole}). Offering powerup choices: [${powerupChoices.join(', ')}]`);
-                // Prepare pending world modifier offer if due
-                roundsSinceLastModifier++;
-                let pendingWorldMod = null;
-                if (roundsSinceLastModifier >= worldModifierRoundInterval) {
-                    roundsSinceLastModifier = 0;
-                    const modChooserRole = (winner === player) ? 'host' : 'joiner';
-                    // Allow Integration filter to trim mod pool if available
-                    let modPool = WORLD_MODIFIERS;
-                    try {
-                        if (window.WorldMasterIntegration && typeof window.WorldMasterIntegration.getFilteredWorldModifiers === 'function') {
-                            modPool = window.WorldMasterIntegration.getFilteredWorldModifiers(WORLD_MODIFIERS);
-                        }
-                    } catch (e) {}
-                    if (!Array.isArray(modPool) || !modPool.length) {
-                        modPool = WORLD_MODIFIERS;
-                    }
-                    let sampledMods = randomChoice(modPool, Math.min(3, modPool.length));
-                    if (sampledMods.length < 3 && Array.isArray(WORLD_MODIFIERS)) {
-                        const fallbackMods = WORLD_MODIFIERS.filter(mod => !sampledMods.includes(mod));
-                        for (const mod of fallbackMods) {
-                            sampledMods.push(mod);
-                            if (sampledMods.length >= 3) break;
-                        }
-                    }
-                    if (sampledMods.length > 0 && sampledMods.length < 3) {
-                        const filler = sampledMods.slice();
-                        let idx = 0;
-                        while (sampledMods.length < 3 && filler.length) {
-                            sampledMods.push(filler[idx % filler.length]);
-                            idx++;
-                        }
-                    }
-                    const modChoices = sampledMods.map(c => (typeof c === 'string') ? c : (c && c.name)).filter(Boolean);
-                    while (modChoices.length < 3 && Array.isArray(WORLD_MODIFIERS)) {
-                        const extra = WORLD_MODIFIERS[randInt(0, WORLD_MODIFIERS.length-1)];
-                        const name = (typeof extra === 'string') ? extra : (extra && extra.name);
-                        if (name && !modChoices.includes(name)) modChoices.push(name);
-                    }
-                    if (modChoices.length > 0 && modChoices.length < 3) {
-                        const filler = modChoices.slice();
-                        let idx = 0;
-                        while (modChoices.length < 3 && filler.length) {
-                            modChoices.push(filler[idx % filler.length]);
-                            idx++;
-                        }
-                    }
-                    // Choose a deterministic final index now on host so clients can mirror the final highlight
-                    const chosenFinalIdx = randInt(0, Math.max(0, modChoices.length - 1));
-                    pendingWorldMod = { choices: modChoices, chooserRole: modChooserRole, finalIdx: chosenFinalIdx };
-                    try {
-                        const inst = window.gameWorldMasterInstance;
-                        let autopickDisabled = !!(inst && inst.autoPick === false);
-                        try {
-                            const apEl = document.getElementById('wm-autopick');
-                            if (apEl && apEl.type === 'checkbox' && apEl.checked === false) autopickDisabled = true;
-                        } catch (e2) {}
-                        const chooserIsAssignedWM = (typeof worldMasterPlayerIndex === 'number') && (
-                            (modChooserRole === 'host' && worldMasterPlayerIndex === 0) ||
-                            (modChooserRole === 'joiner' && worldMasterPlayerIndex === 1)
-                        );
-                        const localSpectatorWM = (typeof window.localPlayerIndex === 'number' && window.localPlayerIndex === -1);
-                        if (autopickDisabled && (chooserIsAssignedWM || localSpectatorWM)) {
-                            pendingWorldMod.manual = true;
-                        }
-                    } catch (e) {}
-                    logDev(`[CARD FLOW] World modifier due! Will offer to ${modChooserRole}: [${modChoices.join(', ')}] after powerup pick. finalIdx=${chosenFinalIdx}`);
-                }
-                // Patch: show powerup, then after pick, show world mod if pending
-                window._pendingWorldModOffer = pendingWorldMod;
-                setTimeout(() => {
-                    logDev(`[CARD FLOW] Showing powerup card UI to ${powerupChooserRole} with choices: [${powerupChoices.join(', ')}]`);
-                    netShowPowerupCards(powerupChoices, powerupChooserRole);
-                    try {
-                        // remember last offered choices locally so a declined pick can re-open the UI
-                        window._lastOfferedChoices = { choices: powerupChoices, chooserRole: powerupChooserRole };
-                    } catch (e) {}
-                    try {
-                        // Only relay powerup offers to joiners if powerups are enabled for the match
-                        if (!(typeof window.setupAllowPowerups !== 'undefined' && window.setupAllowPowerups === false)) {
-                            if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-offer', choices: powerupChoices, chooserRole: powerupChooserRole } }));
-                        }
-                    } catch (e) {}
-                }, 700);
-                break;
-            }
-        }
+    if (simulateLocally) {
+        hostEvaluateEliminations();
     }
 }
 
@@ -5289,11 +6193,13 @@ function draw() {
         firestormInstance.draw(ctx);
     }
     const enemySuppressedNow = isEnemySuppressedForGameplay();
+    const playerIsActive = isEntityActive(player);
+    const enemyIsActive = isEntityActive(enemy);
     // Draw local 'player' entity unless it's the blue character in WM-without-AI (host view)
     if (typeof player !== 'undefined' && player) {
         const hostIsWMNow_A = NET.connected && worldMasterEnabled && ((((worldMasterPlayerIndex|0) === 0)) || (NET.role === 'host' && window.localPlayerIndex === -1));
         const hidePlayerBlue = hostIsWMNow_A && worldMasterEnabled && enemySuppressedNow && (NET.role === 'host');
-        if (!hidePlayerBlue) drawPlayer(player);
+    if (!hidePlayerBlue && playerIsActive) drawPlayer(player);
     }
     // Determine which character should be hidden based on WM mode and Enemy AI
     const hostIsWM = NET.connected && worldMasterEnabled && (worldMasterPlayerIndex === 0);
@@ -5305,66 +6211,83 @@ function draw() {
     
     // Draw enemy unless it should be hidden
     if (!((NET.role === 'host' && hideRedChar) || (NET.role === 'joiner' && hideBlueChar))) {
-        if (typeof enemy !== 'undefined' && enemy) drawPlayer(enemy);
+    if (typeof enemy !== 'undefined' && enemy && enemyIsActive) drawPlayer(enemy);
     }
 
-    ctx.save();
-    ctx.font = "bold 22px sans-serif";
-    // Player labels: handle single-player and multiplayer mapping cleanly
-    if (!NET.connected) {
-        // Single-player: left is local player, right is AI/enemy
-    const pName = (player && (player.displayName || NET.myName)) || (NET.myName || 'Player 1');
-    const eName = (enemy && (enemy.displayName)) || (NET.peerName || 'Shot bot');
-    ctx.fillStyle = "#65c6ff";
-    ctx.fillText(pName + ": " + ((player && typeof player.score === 'number') ? player.score : '0'), 24, 34);
-        ctx.fillStyle = "#ff5a5a";
-        if (enemy) ctx.fillText(eName + ": " + ((enemy && typeof enemy.score === 'number') ? enemy.score : '0'), window.CANVAS_W - 220, 34);
-    } else {
-        // Multiplayer: implement exact specification for WM mode
-        const isJoiner = (NET.role === 'joiner');
-        const hostEntity = isJoiner ? enemy : player;
-        const joinerEntity = isJoiner ? player : enemy;
-        
-        // Get actual names
-        const hostName = (NET.role === 'host') ? (NET.myName || 'Player 1') : (NET.peerName || 'Player 1');
-        const joinerName = (NET.role === 'host') ? (NET.peerName || 'Player 2') : (NET.myName || 'Player 2');
-        
-        // Determine WM status
-        
-    const hostIsWM = !!(worldMasterEnabled && (worldMasterPlayerIndex === 0));
-    const joinerIsWM = !!(worldMasterEnabled && (worldMasterPlayerIndex === 1));
-    const aiEnabled = !enemySuppressedNow;
-        
-        
-        // Draw blue header (host)
-        if (aiEnabled || !hostIsWM) {
-            let blueLabel;
-            if (hostIsWM && aiEnabled) {
-                // Host is WM and AI enabled: blue becomes "Shot bot"
-                blueLabel = 'Shot bot';
-            } else {
-                // Normal case: show host name
-                blueLabel = hostName;
+    // Draw additional roster-assigned entity references (bots/extra fighters)
+    try {
+        if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+            const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+            for (const f of fighters) {
+                if (!f || !f.entity) continue;
+                const ent = f.entity;
+                // Skip main player/enemy already drawn
+                if (ent === player || ent === enemy) continue;
+                // Skip worldmaster placeholders
+                if (f.metadata && f.metadata.isWorldMaster) continue;
+                // Only draw if alive and not marked disabled
+                if (f.isAlive === false) continue;
+                if (!isEntityActive(ent)) continue;
+                try { drawPlayer(ent); } catch (e) {}
             }
-            ctx.fillStyle = "#65c6ff";
-            ctx.fillText(blueLabel + ": " + ((hostEntity && typeof hostEntity.score === 'number') ? hostEntity.score : '0'), 24, 34);
         }
-        
-        // Draw red header (joiner) 
-        if (aiEnabled || !joinerIsWM) {
-            let redLabel;
-            if (joinerIsWM && aiEnabled) {
-                // Joiner is WM and AI enabled: red becomes "Shot bot"
-                redLabel = 'Shot bot';
-            } else {
-                // Normal case: show joiner name
-                redLabel = joinerName;
+    } catch (e) {}
+
+    // Draw match scoreboard for up to four roster slots (top-left, top-right, bottom-left, bottom-right)
+    function drawMatchScoreboard() {
+        try {
+            ctx.save();
+            ctx.font = "bold 22px sans-serif";
+            // If playerRoster is available prefer it; otherwise fall back to legacy player/enemy
+            const useRoster = (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getSlots === 'function');
+            if (!useRoster) {
+                // Legacy fallback for singleplayer/two-player setup
+                const pName = (player && (player.displayName || NET.myName)) || (NET.myName || 'Player 1');
+                const eName = (enemy && (enemy.displayName)) || (NET.peerName || 'Shot bot');
+                ctx.fillStyle = "#65c6ff";
+                ctx.fillText(pName + ": " + ((player && typeof player.score === 'number') ? player.score : '0'), 24, 34);
+                ctx.fillStyle = "#ff5a5a";
+                if (enemy) ctx.fillText(eName + ": " + ((enemy && typeof enemy.score === 'number') ? enemy.score : '0'), window.CANVAS_W - 220, 34);
+                ctx.restore();
+                return;
             }
-            ctx.fillStyle = "#ff5a5a";
-            if (joinerEntity) ctx.fillText(redLabel + ": " + ((joinerEntity && typeof joinerEntity.score === 'number') ? joinerEntity.score : '0'), window.CANVAS_W - 220, 34);
+
+            const slots = playerRoster.getSlots({ includeDetails: true }) || [];
+            // Positions for up to 4 visible fighters
+            const positions = [
+                { x: 24, y: 34, align: 'left' },
+                { x: window.CANVAS_W - 220, y: 34, align: 'right' },
+                { x: 24, y: window.CANVAS_H - 12, align: 'left' },
+                { x: window.CANVAS_W - 220, y: window.CANVAS_H - 12, align: 'right' }
+            ];
+
+            for (let i = 0; i < Math.min(4, slots.length); ++i) {
+                const slot = slots[i] || {};
+                const fighter = slot.fighter || null;
+                if (!fighter) continue;
+                // Skip drawing a WorldMaster metadata placeholder here
+                if (fighter.metadata && fighter.metadata.isWorldMaster) continue;
+                const pos = positions[i];
+                const name = fighter.displayName || fighter.name || (`Slot ${i+1}`);
+                const score = (typeof fighter.score === 'number') ? fighter.score : 0;
+                const color = (typeof getRosterFighterColor === 'function') ? (getRosterFighterColor(i, fighter) || '#fff') : '#fff';
+                ctx.fillStyle = color;
+                if (pos.align === 'right') {
+                    ctx.textAlign = 'right';
+                    ctx.fillText(name + ": " + score, pos.x, pos.y);
+                    ctx.textAlign = 'left';
+                } else {
+                    ctx.textAlign = 'left';
+                    ctx.fillText(name + ": " + score, pos.x, pos.y);
+                }
+            }
+            ctx.restore();
+        } catch (err) {
+            try { ctx.restore(); } catch (e) {}
         }
     }
-    ctx.restore();
+
+    drawMatchScoreboard();
 
     drawCardsUI();
 }
@@ -5465,7 +6388,51 @@ function drawPlayer(p) {
 }
 
 // --- Powerup Cards ---
-function showPowerupCards(loser) {
+function buildPowerupChoices(loser, desiredCount = 5) {
+    let powerupPool = POWERUPS;
+    try {
+        if (window.WorldMasterIntegration && typeof window.WorldMasterIntegration.getFilteredPowerups === 'function') {
+            const filtered = window.WorldMasterIntegration.getFilteredPowerups(POWERUPS) || [];
+            if (Array.isArray(filtered) && filtered.length >= desiredCount) {
+                powerupPool = filtered;
+            } else if (Array.isArray(filtered) && filtered.length > 0 && filtered.length < desiredCount) {
+                console.warn('[WORLDMASTER] Only', filtered.length, 'powerup cards enabled; using filtered list with fallback to fill chooser.');
+                powerupPool = filtered;
+            }
+        }
+    } catch (e) {
+        console.warn('[WORLDMASTER] Failed to filter powerup deck for chooser:', e);
+    }
+    if (!Array.isArray(powerupPool) || !powerupPool.length) {
+        powerupPool = POWERUPS;
+    }
+    let choices = [];
+    try {
+        const maxCount = Math.min(desiredCount, Array.isArray(powerupPool) ? powerupPool.length : desiredCount);
+        choices = randomChoice(powerupPool, maxCount);
+    } catch (err) {
+        choices = Array.isArray(powerupPool) ? powerupPool.slice(0, desiredCount) : [];
+    }
+    if (!Array.isArray(choices)) choices = [];
+    if (choices.length < desiredCount && Array.isArray(POWERUPS)) {
+        const fallbackCards = POWERUPS.filter(card => !choices.includes(card));
+        for (const card of fallbackCards) {
+            choices.push(card);
+            if (choices.length >= desiredCount) break;
+        }
+    }
+    if (choices.length > 0 && choices.length < desiredCount) {
+        const filler = choices.slice();
+        let idx = 0;
+        while (choices.length < desiredCount && filler.length) {
+            choices.push(filler[idx % filler.length]);
+            idx++;
+        }
+    }
+    return choices.slice(0, desiredCount);
+}
+
+function showPowerupCards(loser, options = {}) {
     cardState.active = true;
     cardState.player = loser;
     // Allow the setup UI to completely disable powerups for this match
@@ -5475,39 +6442,76 @@ function showPowerupCards(loser) {
             return; // do not show powerup chooser
         }
     } catch (e) {}
-    let div = document.getElementById('card-choices');
-    div.innerHTML = "";
-    let powerupPool = POWERUPS;
-    try {
-        if (window.WorldMasterIntegration && typeof window.WorldMasterIntegration.getFilteredPowerups === 'function') {
-            const filtered = window.WorldMasterIntegration.getFilteredPowerups(POWERUPS) || [];
-            if (Array.isArray(filtered) && filtered.length >= 5) {
-                powerupPool = filtered;
-            } else if (Array.isArray(filtered) && filtered.length > 0 && filtered.length < 5) {
-                console.warn('[WORLDMASTER] Only', filtered.length, 'powerup cards enabled; using filtered list with fallback to fill chooser.');
-                powerupPool = filtered;
+    const chooserRole = (options && options.chooserRole) ? options.chooserRole : (() => {
+        try { return inferRoleForEntity ? inferRoleForEntity(loser) : null; } catch (err) { return null; }
+    })();
+    const fighterIdFromOptions = (options && options.fighterId != null) ? String(options.fighterId) : null;
+    const slotIndexFromOptions = (options && typeof options.slotIndex === 'number') ? options.slotIndex : null;
+    let fighterRecord = null;
+    if (fighterIdFromOptions && playerRoster && typeof playerRoster.getFighterById === 'function') {
+        try { fighterRecord = playerRoster.getFighterById(fighterIdFromOptions, { includeEntity: true }) || null; } catch (err) { fighterRecord = null; }
+    }
+    if (!fighterRecord) {
+        try { fighterRecord = getFighterRecordForEntity(loser); } catch (err) { fighterRecord = null; }
+    }
+    const fighterMetadata = (fighterRecord && fighterRecord.metadata) ? fighterRecord.metadata : {};
+    const fighterKind = fighterRecord ? fighterRecord.kind : null;
+    const controlTag = (fighterMetadata && typeof fighterMetadata.control === 'string') ? fighterMetadata.control : null;
+    const joinerIndexMeta = (fighterMetadata && Number.isInteger(fighterMetadata.joinerIndex)) ? fighterMetadata.joinerIndex : null;
+    const resolvedSlotIndex = (slotIndexFromOptions !== null && slotIndexFromOptions !== undefined)
+        ? slotIndexFromOptions
+        : (fighterRecord && typeof fighterRecord.slotIndex === 'number' ? fighterRecord.slotIndex : null);
+    const isRemoteControlled = (() => {
+        if (controlTag === 'remote') return true;
+        if (typeof NET !== 'undefined' && NET && NET.connected) {
+            if (NET.role === 'host') {
+                if (chooserRole === 'joiner') return true;
+                if (Number.isInteger(joinerIndexMeta)) return true;
+            } else if (NET.role === 'joiner') {
+                if (chooserRole === 'host' && controlTag === 'remote-host') return true;
             }
         }
-    } catch (e) { console.warn('[WORLDMASTER] Failed to filter powerup deck for chooser:', e); }
-    if (!Array.isArray(powerupPool) || !powerupPool.length) {
-        powerupPool = POWERUPS;
-    }
-    let choices = randomChoice(powerupPool, Math.min(5, powerupPool.length));
-    if (choices.length < 5 && Array.isArray(POWERUPS)) {
-        const fallbackCards = POWERUPS.filter(card => !choices.includes(card));
-        for (const card of fallbackCards) {
-            choices.push(card);
-            if (choices.length >= 5) break;
+        return false;
+    })();
+    const isBotControlled = (() => {
+        if (fighterKind === 'bot') return true;
+        if (controlTag === 'bot' || controlTag === 'ai') return true;
+        if (!fighterRecord) {
+            if (typeof NET === 'undefined' || !NET || !NET.connected) return true;
+            if (NET.role === 'host' && chooserRole !== 'joiner') return true;
         }
+        return false;
+    })();
+    const shouldAutoPickForAI = !loser.isPlayer && isBotControlled && !isRemoteControlled;
+    const shouldShowReadOnly = !loser.isPlayer && !shouldAutoPickForAI;
+    const div = document.getElementById('card-choices');
+    if (!div) return;
+    div.innerHTML = "";
+    let choices = [];
+    if (options && Array.isArray(options.choices) && options.choices.length) {
+        choices = options.choices.slice();
+    } else {
+        choices = buildPowerupChoices(loser, 5);
     }
-    if (choices.length > 0 && choices.length < 5) {
-        const filler = choices.slice();
-        let idx = 0;
-        while (choices.length < 5 && filler.length) {
-            choices.push(filler[idx % filler.length]);
-            idx++;
-        }
+    if (!Array.isArray(choices) || !choices.length) {
+        logDev('[CARD FLOW] No powerup choices available; skipping chooser.');
+        return;
     }
+    const choiceNames = choices.map(opt => {
+        if (!opt) return null;
+        if (typeof opt === 'string') return opt;
+        if (opt && typeof opt.name === 'string') return opt.name;
+        if (opt && typeof opt.id === 'string') return opt.id;
+        return null;
+    }).filter(Boolean);
+    try {
+        window._lastOfferedChoices = {
+            choices: choiceNames,
+            chooserRole: chooserRole || null,
+            fighterId: fighterIdFromOptions || (fighterRecord && fighterRecord.id != null ? String(fighterRecord.id) : null),
+            slotIndex: resolvedSlotIndex
+        };
+    } catch (err) {}
 
     if (loser.isPlayer) {
         div.innerHTML = '';
@@ -5591,7 +6595,7 @@ function showPowerupCards(loser) {
                     div.removeAttribute('style');
                     div.classList.remove('card-bg-visible');
                     cardState.active = false;
-                    waitingForCard = false;
+                    notifyPowerupSelectionComplete(loser, opt.name);
                 }, 220);
             };
             div.appendChild(card);
@@ -5632,14 +6636,14 @@ function showPowerupCards(loser) {
             // add hover highlight so it matches player behavior if visible briefly
             card.onmouseenter = () => {
                 try {
-                    card.style.setProperty('border', '3px solid ' + loser.color, 'important');
-                    card.style.setProperty('box-shadow', '0 6px 18px ' + loser.color, 'important');
-                    card.style.setProperty('color', loser.color, 'important');
-                    const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loser.color, 'important');
+                    card.style.setProperty('border', '3px solid ' + loserColor, 'important');
+                    card.style.setProperty('box-shadow', '0 6px 18px ' + loserColor, 'important');
+                    card.style.setProperty('color', loserColor, 'important');
+                    const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loserColor, 'important');
                     if (!card._accentClass) card._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
                     if (!card._accentStyle) {
                         const styleEl = document.createElement('style');
-                        styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loser.color}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loser.color}55 0%, #0000 100%) !important; }`;
+                        styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loserColor}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loserColor}55 0%, #0000 100%) !important; }`;
                         document.head.appendChild(styleEl);
                         card._accentStyle = styleEl;
                     }
@@ -5665,6 +6669,10 @@ function showPowerupCards(loser) {
         div.style.transform = 'translate(-50%, -50%)';
         div.style.height = '320px';
         div.style.width = '900px';
+        div.classList.add('card-bg-visible');
+        if (shouldShowReadOnly) {
+            return;
+        }
         setTimeout(() => {
             let idx = randInt(0, choices.length-1);
             let card = div.childNodes[idx];
@@ -5695,8 +6703,9 @@ function showPowerupCards(loser) {
                     div.style.display = 'none';
                     div.innerHTML = '';
                     div.removeAttribute('style');
+                    div.classList.remove('card-bg-visible');
                     cardState.active = false;
-                    waitingForCard = false;
+                    notifyPowerupSelectionComplete(loser, pickedCard.name || null);
                 }, 1000);
             }, 700);
         }, 1100);
@@ -5704,7 +6713,7 @@ function showPowerupCards(loser) {
 }
 
 // Networked selection helpers (host composes choices and sends; clients display based on chooserRole)
-function netShowPowerupCards(choiceNames, chooserRole) {
+function netShowPowerupCards(choiceNames, chooserRole, opts) {
     if (matchOver) return; // suppress during match-end modal
     // Respect setup checkbox: if powerups are disabled for this match, skip showing
     try {
@@ -5713,19 +6722,75 @@ function netShowPowerupCards(choiceNames, chooserRole) {
             return;
         }
     } catch (e) {}
+    const options = opts || {};
+    const fighterId = options && options.fighterId != null ? String(options.fighterId) : null;
+    const slotIndex = (options && typeof options.slotIndex === 'number') ? options.slotIndex : null;
     // chooserRole: 'host' or 'joiner'
-    // Map role to the correct local entity so color usage is correct on clients
-    // In networked mode, use getEntityForRole which maps based on NET.role.
-    // In single-player (NET undefined or not connected) map directly to local player/enemy
-    let loser;
-    if (typeof NET === 'undefined' || !NET.connected) {
-        // chooserRole refers to the logical host/joiner; in single-player host==player, joiner==enemy
-        loser = (chooserRole === 'host') ? player : enemy;
-    } else {
-        loser = getEntityForRole(chooserRole); // chooser is the loser of the round
+    // Map to the correct local entity so color usage is correct on clients; prefer fighterId when provided
+    let loser = null;
+    if (fighterId) {
+        loser = getEntityForFighterId(fighterId);
     }
+    let loserRecord = null;
+    if (fighterId && !loserRecord) {
+        try {
+            if (playerRoster && typeof playerRoster.getFighterById === 'function') {
+                loserRecord = playerRoster.getFighterById(fighterId, { includeEntity: true }) || null;
+                if (!loser && loserRecord && loserRecord.entity) loser = loserRecord.entity;
+            }
+        } catch (err) { loserRecord = null; }
+    }
+    if (!loser && slotIndex !== null) {
+        try {
+            const inferredRole = resolveChooserRoleForSlot(slotIndex);
+            loser = getEntityForRole(inferredRole);
+        } catch (err) {}
+    }
+    if (!loser) {
+        if (typeof NET === 'undefined' || !NET.connected) {
+            // chooserRole refers to the logical host/joiner; in single-player host==player, joiner==enemy
+            loser = (chooserRole === 'host') ? player : enemy;
+        } else {
+            loser = getEntityForRole(chooserRole); // chooser is the loser of the round
+        }
+    }
+    if (!loserRecord && fighterId) {
+        try {
+            if (playerRoster && typeof playerRoster.getFighterById === 'function') {
+                loserRecord = playerRoster.getFighterById(fighterId, { includeEntity: true }) || null;
+            }
+        } catch (err) {}
+    }
+    if (!loser) {
+        try { waitingForCard = false; cardState.active = false; } catch (e) {}
+        try { logDev('[CARD FLOW] Could not resolve entity for fighterId=' + fighterId + ' chooserRole=' + chooserRole + '; skipping powerup UI.'); } catch (e) {}
+        return;
+    }
+    const slotIndexForMessage = (typeof slotIndex === 'number') ? slotIndex : (loserRecord && typeof loserRecord.slotIndex === 'number' ? loserRecord.slotIndex : null);
+    const fighterIdForMessage = (() => {
+        if (fighterId) return fighterId;
+        if (loserRecord && loserRecord.id != null) return String(loserRecord.id);
+        const fallbackRecord = getFighterRecordForEntity(loser);
+        if (fallbackRecord && fallbackRecord.id != null) return String(fallbackRecord.id);
+        return null;
+    })();
+    const loserColor = (() => {
+        if (loser && loser.color) return loser.color;
+        if (loserRecord && loserRecord.color) return loserRecord.color;
+        try {
+            if (typeof getRosterFighterColor === 'function' && loserRecord && typeof loserRecord.slotIndex === 'number') {
+                const clr = getRosterFighterColor(loserRecord.slotIndex, loserRecord);
+                if (clr) return clr;
+            }
+        } catch (err) {}
+        return '#65c6ff';
+    })();
     // Build fake POWERUPS array subset from provided names
     const choices = choiceNames.map(n => getCardByName(n)).filter(Boolean);
+    if (!choices.length) {
+        try { waitingForCard = false; cardState.active = false; } catch (e) {}
+        return;
+    }
     // prepare card container
     const div = document.getElementById('card-choices');
     if (!div) return;
@@ -5763,14 +6828,14 @@ function netShowPowerupCards(choiceNames, chooserRole) {
                     card.style.zIndex = 10;
                     card.style.transform = 'translate(-50%, -60px) scale(1.18) rotate(0deg)';
                     try {
-                        card.style.setProperty('border', '3px solid ' + loser.color, 'important');
-                        card.style.setProperty('box-shadow', '0 6px 18px ' + loser.color, 'important');
-                        card.style.setProperty('color', loser.color, 'important');
-                        const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loser.color, 'important');
+                        card.style.setProperty('border', '3px solid ' + loserColor, 'important');
+                        card.style.setProperty('box-shadow', '0 6px 18px ' + loserColor, 'important');
+                        card.style.setProperty('color', loserColor, 'important');
+                        const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loserColor, 'important');
                         if (!card._accentClass) card._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
                         if (!card._accentStyle) {
                             const styleEl = document.createElement('style');
-                            styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loser.color}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loser.color}55 0%, #0000 100%) !important; }`;
+                            styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loserColor}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loserColor}55 0%, #0000 100%) !important; }`;
                             document.head.appendChild(styleEl);
                             card._accentStyle = styleEl;
                         }
@@ -5848,14 +6913,14 @@ function netShowPowerupCards(choiceNames, chooserRole) {
                 card.style.zIndex = 10;
                 card.style.transform = 'translate(-50%, -60px) scale(1.18) rotate(0deg)';
                 try {
-                    card.style.setProperty('border', '3px solid ' + loser.color, 'important');
-                    card.style.setProperty('box-shadow', '0 6px 18px ' + loser.color, 'important');
-                    card.style.setProperty('color', loser.color, 'important');
-                    const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loser.color, 'important');
+                    card.style.setProperty('border', '3px solid ' + loserColor, 'important');
+                    card.style.setProperty('box-shadow', '0 6px 18px ' + loserColor, 'important');
+                    card.style.setProperty('color', loserColor, 'important');
+                    const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loserColor, 'important');
                     if (!card._accentClass) card._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
                     if (!card._accentStyle) {
                         const styleEl = document.createElement('style');
-                        styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loser.color}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loser.color}55 0%, #0000 100%) !important; }`;
+                        styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loserColor}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loserColor}55 0%, #0000 100%) !important; }`;
                         document.head.appendChild(styleEl);
                         card._accentStyle = styleEl;
                     }
@@ -5899,7 +6964,87 @@ function netShowPowerupCards(choiceNames, chooserRole) {
 
     // Networked clients: decide if this chooser is local
     const isMe = (chooserRole === NET.role);
+    const resolvedSlotIndex = (typeof slotIndex === 'number') ? slotIndex : (loserRecord && typeof loserRecord.slotIndex === 'number' ? loserRecord.slotIndex : null);
+    const localFighterIdStr = (() => {
+        try { return (typeof localFighterId !== 'undefined' && localFighterId !== null) ? String(localFighterId) : null; } catch (err) { return null; }
+    })();
+    const localSlotIndex = (() => {
+        try {
+            if (typeof window !== 'undefined' && window.localPlayerIndex === -1) return null;
+            if (typeof NET === 'undefined' || !NET || !NET.connected) return 0;
+            if (NET.role === 'host') return 0;
+            if (NET.role === 'joiner') {
+                const joinerIdx = Number.isInteger(NET.joinerIndex) ? NET.joinerIndex : 0;
+                if (typeof getJoinerSlotIndex === 'function') return getJoinerSlotIndex(joinerIdx);
+                return joinerIdx + 1;
+            }
+        } catch (err) {}
+        return null;
+    })();
+    const localEntityRef = (() => {
+        try {
+            if (typeof NET === 'undefined' || !NET) return player;
+            if (!NET.connected) return player;
+            return getEntityForRole(NET.role);
+        } catch (err) {
+            return player;
+        }
+    })();
+    const localExternalId = (() => {
+        try {
+            if (typeof NET === 'undefined' || !NET || !NET.connected || NET.role !== 'joiner') return null;
+            const joinerIdx = Number.isInteger(NET.joinerIndex) ? NET.joinerIndex : 0;
+            return typeof getJoinerExternalId === 'function' ? getJoinerExternalId(joinerIdx) : null;
+        } catch (err) {
+            return null;
+        }
+    })();
+    const entityMatchesLocal = !!(loser && localEntityRef && loser === localEntityRef);
+    const slotMatchesLocal = !!(localSlotIndex !== null && resolvedSlotIndex !== null && localSlotIndex === resolvedSlotIndex);
+    const fighterIdMatchesLocal = !!(localFighterIdStr && fighterId && localFighterIdStr === fighterId);
+    const externalIdMatchesLocal = !!(localExternalId && loserRecord && typeof loserRecord.externalId === 'string' && loserRecord.externalId === localExternalId);
+    const metadataSuggestsLocal = (() => {
+        if (!loserRecord || !loserRecord.metadata) return false;
+        const meta = loserRecord.metadata;
+        const control = typeof meta.control === 'string' ? meta.control : null;
+        const metaJoinerIndex = Number.isInteger(meta.joinerIndex) ? meta.joinerIndex : null;
+        if (typeof NET === 'undefined' || !NET || !NET.connected) {
+            return control === 'local';
+        }
+        if (NET.role === 'host') {
+            if (chooserRole === 'host' && control === 'local') return true;
+            return false;
+        }
+        if (NET.role === 'joiner') {
+            if (chooserRole === 'joiner' && Number.isInteger(NET.joinerIndex) && metaJoinerIndex === NET.joinerIndex) return true;
+            return false;
+        }
+        return false;
+    })();
+    let isLocalChooser = isMe || entityMatchesLocal || slotMatchesLocal || fighterIdMatchesLocal || externalIdMatchesLocal || metadataSuggestsLocal;
+    if (!isLocalChooser && typeof NET !== 'undefined' && NET && NET.role === 'joiner' && chooserRole === 'host') {
+        // Fallback: if roster record maps to our slot even though chooserRole disagrees, treat as local
+        if (localSlotIndex !== null && resolvedSlotIndex === localSlotIndex) {
+            isLocalChooser = true;
+        }
+    }
+    if (typeof NET !== 'undefined' && NET && NET.connected) {
+        if (NET.role === 'joiner' && chooserRole === 'host') {
+            isLocalChooser = false;
+        } else if (NET.role === 'host' && chooserRole === 'joiner') {
+            isLocalChooser = false;
+        }
+    }
+    try {
+        if (isLocalChooser && loserRecord && loserRecord.id != null && (typeof localFighterId === 'undefined' || localFighterId === null || fighterIdMatchesLocal === false)) {
+            localFighterId = loserRecord.id;
+        }
+    } catch (err) {}
+
     const shouldAutoResolveAsSpectator = (() => {
+        if (isLocalChooser) return false;
+        const loserIsBot = !!(loserRecord && (loserRecord.kind === 'bot' || (loserRecord.metadata && loserRecord.metadata.control === 'bot')));
+        if (!loserIsBot) return false;
         if (typeof window === 'undefined') return false;
         if (window.localPlayerIndex !== -1) return false;
         if (typeof worldMasterPlayerIndex === 'undefined' || worldMasterPlayerIndex === null) return false;
@@ -5918,7 +7063,7 @@ function netShowPowerupCards(choiceNames, chooserRole) {
         if (chooserRole === 'joiner' && worldMasterPlayerIndex === 1) return true;
         return false;
     })();
-    if (!isMe) {
+    if (!isLocalChooser) {
         // Show read-only choices (no click), highlight selection will be applied when host broadcasts pick
         cardState.active = true;
         div.innerHTML = '';
@@ -5934,15 +7079,18 @@ function netShowPowerupCards(choiceNames, chooserRole) {
             const y = Math.sin(theta) * handRadius;
             const rot = (Math.PI/2 - theta) * 28;
             Object.assign(card.style, { position:'absolute', left:`calc(50% + ${x}px)`, bottom:`calc(-10% + ${y}px)`, width:cardWidth+'px', height:cardHeight+'px', transform:`translate(-50%, 0) rotate(${rot}deg)` });
+            card.style.pointerEvents = 'none';
             div.appendChild(card);
         }
         Object.assign(div.style, { display:'flex', position:'absolute', left:'50%', top:'50%', transform:'translate(-50%, -50%)', height:'320px', width:'900px' });
         div.classList.add('card-bg-visible');
+        div.style.pointerEvents = 'none';
         return;
     }
     // Let the chooser pick and report back to host
     cardState.active = true;
     div.innerHTML = '';
+    div.style.pointerEvents = 'auto';
     const handRadius = 220, cardWidth = 170, cardHeight = 220; const baseAngle = Math.PI/2, spread = Math.PI/1.1;
     for (let i = 0; i < choices.length; ++i) {
         const opt = choices[i];
@@ -5962,14 +7110,14 @@ function netShowPowerupCards(choiceNames, chooserRole) {
                 card.style.zIndex = 10;
                 card.style.transform = 'translate(-50%, -60px) scale(1.18) rotate(0deg)';
                 try {
-                    card.style.setProperty('border', '3px solid ' + loser.color, 'important');
-                    card.style.setProperty('box-shadow', '0 6px 18px ' + loser.color, 'important');
-                    card.style.setProperty('color', loser.color, 'important');
-                    const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loser.color, 'important');
+                    card.style.setProperty('border', '3px solid ' + loserColor, 'important');
+                    card.style.setProperty('box-shadow', '0 6px 18px ' + loserColor, 'important');
+                    card.style.setProperty('color', loserColor, 'important');
+                    const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loserColor, 'important');
                     if (!card._accentClass) card._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
                     if (!card._accentStyle) {
                         const styleEl = document.createElement('style');
-                        styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loser.color}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loser.color}55 0%, #0000 100%) !important; }`;
+                        styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loserColor}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loserColor}55 0%, #0000 100%) !important; }`;
                         document.head.appendChild(styleEl);
                         card._accentStyle = styleEl;
                     }
@@ -6015,7 +7163,7 @@ function netShowPowerupCards(choiceNames, chooserRole) {
                     try { opt.effect(loser); loser.addCard(opt.name); } catch (e) {}
                     try {
                         if (window.ws && window.ws.readyState === WebSocket.OPEN) {
-                            window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name } }));
+                            window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage } }));
                         }
                     } catch (e) {}
                     closeLocalChooser();
@@ -6047,7 +7195,7 @@ function netShowPowerupCards(choiceNames, chooserRole) {
                 } else {
                     try {
                         if (window.ws && window.ws.readyState === WebSocket.OPEN) {
-                            window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-pick', pickerRole: chooserRole, card: opt.name } }));
+                            window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-pick', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage } }));
                         }
                     } catch (e) {}
                     closeLocalChooser();
@@ -6056,7 +7204,7 @@ function netShowPowerupCards(choiceNames, chooserRole) {
             }
             if (!NET.connected || (NET.role === 'host' && chooserRole === 'host')) {
                 try { opt.effect(loser); loser.addCard(opt.name); } catch (e) {}
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name } })); } catch (e) {}
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage } })); } catch (e) {}
                 div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible');
                 cardState.active = false;
                 const hadPending3 = !!window._pendingWorldModOffer;
@@ -6076,7 +7224,7 @@ function netShowPowerupCards(choiceNames, chooserRole) {
                     } catch (e) {}
                 }
             } else {
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-pick', pickerRole: chooserRole, card: opt.name } })); } catch (e) {}
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-pick', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage } })); } catch (e) {}
                 div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible');
                 // keep waitingForCard true until apply arrives
             }
@@ -6085,7 +7233,7 @@ function netShowPowerupCards(choiceNames, chooserRole) {
     }
     Object.assign(div.style, { display:'flex', position:'absolute', left:'50%', top:'50%', transform:'translate(-50%, -50%)', height:'320px', width:'900px' });
     div.classList.add('card-bg-visible');
-    if (shouldAutoResolveAsSpectator) {
+    if (shouldAutoResolveAsSpectator && !isLocalChooser) {
         const applyAutoPick = () => {
             if (!div || !div.childNodes || div.childNodes.length === 0) return;
             let idx = randInt(0, Math.max(0, div.childNodes.length - 1));
@@ -6095,14 +7243,14 @@ function netShowPowerupCards(choiceNames, chooserRole) {
                 card.classList.add('selected', 'centered');
                 card.style.zIndex = 10;
                 card.style.transform = 'translate(-50%, -60px) scale(1.18) rotate(0deg)';
-                card.style.setProperty('border', '3px solid ' + loser.color, 'important');
-                card.style.setProperty('box-shadow', '0 6px 18px ' + loser.color, 'important');
-                card.style.setProperty('color', loser.color, 'important');
-                const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loser.color, 'important');
+                card.style.setProperty('border', '3px solid ' + loserColor, 'important');
+                card.style.setProperty('box-shadow', '0 6px 18px ' + loserColor, 'important');
+                card.style.setProperty('color', loserColor, 'important');
+                const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', loserColor, 'important');
                 if (!card._accentClass) card._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
                 if (!card._accentStyle) {
                     const styleEl = document.createElement('style');
-                    styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loser.color}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loser.color}55 0%, #0000 100%) !important; }`;
+                    styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${loserColor}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${loserColor}55 0%, #0000 100%) !important; }`;
                     document.head.appendChild(styleEl);
                     card._accentStyle = styleEl;
                 }
@@ -6112,7 +7260,7 @@ function netShowPowerupCards(choiceNames, chooserRole) {
                 const opt = choices[idx];
                 if (!opt) return;
                 try { opt.effect(loser); loser.addCard(opt.name); } catch (e) {}
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name } })); } catch (e) {}
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage } })); } catch (e) {}
                 try {
                     div.style.display = 'none';
                     div.innerHTML = '';
@@ -6540,12 +7688,52 @@ function updateCardsUI() {
         }
     }
 
-    let rowsHtml = '';
-    if (topLabel1) rowsHtml += `<div class="cards-list"><span style="color:#65c6ff;font-weight:bold;">${topLabel1}</span> ${topList1}</div>`;
-    // Always show the red row (joiner) even when Enemy AI is disabled; only the blue row is removed
-    rowsHtml += `<div class="cards-list" style="margin-top:7px;"><span style="color:#ff5a5a;font-weight:bold;">${topLabel2}</span> ${topList2}</div>`;
-    rowsHtml += `<div class="cards-list" style="margin-top:7px;"><span style="color:#8f4f8f;font-weight:bold;">${worldHeader}</span> ${buildHtmlForWorldList(worldList)}</div>`;
-    cardsDiv.innerHTML = rowsHtml;
+    // Populate per-slot rows based on roster slots (only show rows for active fighters)
+    const slotRows = [document.getElementById('cards-row-0'), document.getElementById('cards-row-1'), document.getElementById('cards-row-2'), document.getElementById('cards-row-3')];
+    let slots = [];
+    try { slots = (playerRoster && typeof playerRoster.getSlots === 'function') ? playerRoster.getSlots({ includeDetails: true }) : []; } catch (e) { slots = []; }
+
+    function writeRow(rowEl, labelHtml, listHtml) {
+        if (!rowEl) return;
+        rowEl.innerHTML = `<div class="cards-list"><span style="font-weight:bold;">${labelHtml}</span> ${listHtml}</div>`;
+        rowEl.style.display = '';
+    }
+
+    // clear rows
+    for (const r of slotRows) { if (r) { r.innerHTML = ''; r.style.display = 'none'; } }
+
+    // slot 0 (host/blue)
+    if (slots[0] && slots[0].fighter) {
+        const label = topLabel1 || `${hostName} Cards:`;
+        writeRow(slotRows[0], `<span style=\"color:#65c6ff;\">${label}</span>`, topList1 || '<span class="card-badge none">None</span>');
+    }
+    // slot 1 (joiner/red)
+    if (slots[1] && slots[1].fighter) {
+        const label = topLabel2 || `${joinerName} Cards:`;
+        writeRow(slotRows[1], `<span style=\"color:#ff5a5a;\">${label}</span>`, topList2 || '<span class="card-badge none">None</span>');
+    }
+    // slots 2..3 (yellow/green)
+    for (let si = 2; si <= 3; si++) {
+        if (slots[si] && slots[si].fighter) {
+            const f = slots[si].fighter;
+            const name = f.name || (`Bot ${si+1}`);
+            let entity = null;
+            try { entity = playerRoster.getEntityReference(f.id); } catch (e) { entity = f.entity || null; }
+            const cardsArr = (entity && Array.isArray(entity.cards)) ? entity.cards : (f.cards || []);
+            const listHtml = buildHtmlForList(cardsArr);
+            const color = (si === 2) ? '#ffe066' : '#2ecc71';
+            writeRow(slotRows[si], `<span style=\"color:${color};\">${name} Cards:</span>`, listHtml);
+        }
+    }
+
+    // update world cards into dedicated container under canvas
+    try {
+        const worldContainer = document.getElementById('world-cards-list');
+        if (worldContainer) {
+            worldContainer.innerHTML = `<span style=\"color:#8f4f8f;font-weight:bold; margin-right:8px;\">${worldHeader}</span> ${buildHtmlForWorldList(worldList)}`;
+            worldContainer.style.display = '';
+        }
+    } catch (e) {}
     
     // Enable pointer events and add click delegation for WorldMaster
     const isWorldMaster = window.localPlayerIndex === -1 && window.gameWorldMasterInstance;
@@ -7241,8 +8429,17 @@ function setupOverlayInit() {
                     // Host offered powerup choices to a role: show the UI on clients (unless match has ended)
                     if (!matchOver) {
                         try { waitingForCard = true; } catch (e) {}
-                        try { window._lastOfferedChoices = { choices: data.choices||[], chooserRole: data.chooserRole }; } catch (e) {}
-                        setTimeout(() => netShowPowerupCards(data.choices||[], data.chooserRole), 200);
+                        const offeredFighterId = data && data.fighterId != null ? String(data.fighterId) : null;
+                        const offeredSlotIndex = (data && typeof data.slotIndex === 'number') ? data.slotIndex : null;
+                        try {
+                            window._lastOfferedChoices = {
+                                choices: data.choices || [],
+                                chooserRole: data.chooserRole,
+                                fighterId: offeredFighterId,
+                                slotIndex: offeredSlotIndex
+                            };
+                        } catch (e) {}
+                        setTimeout(() => netShowPowerupCards(data.choices || [], data.chooserRole, { fighterId: offeredFighterId, slotIndex: offeredSlotIndex }), 200);
                     }
                 } else if (data && data.type === 'mod-offer') {
                     if (!matchOver) {
@@ -7254,7 +8451,13 @@ function setupOverlayInit() {
                 } else if (data && data.type === 'card-pick') {
                     // Joiner sent a pick: auto-accept and apply silently on host
                     if (NET.role === 'host') {
-                        const pending = { kind: 'card', pickerRole: data.pickerRole, cardName: data.card };
+                        const pending = {
+                            kind: 'card',
+                            pickerRole: data.pickerRole,
+                            cardName: data.card,
+                            fighterId: (data && data.fighterId != null) ? String(data.fighterId) : null,
+                            slotIndex: (data && typeof data.slotIndex === 'number') ? data.slotIndex : null
+                        };
                         applyHostPendingConfirm(pending);
                     } else {
                         // ignore (only host handles picks)
@@ -7269,14 +8472,109 @@ function setupOverlayInit() {
                     // Apply on non-host clients (host already applied during pick)
                     try {
                         if (NET.role !== 'host') {
-                            const target = getEntityForRole(data.pickerRole);
-                            const card = getCardByName(data.card);
+                            let target = null;
+                            if (data.fighterId != null) {
+                                target = getEntityForFighterId(data.fighterId);
+                            }
+                            if (!target) {
+                                target = getEntityForRole(data.pickerRole);
+                            }
+                            const card = data.card ? getCardByName(data.card) : null;
                             if (target && card) {
                                 try { card.effect(target); target.addCard(card.name); } catch (e) {}
                             }
+                            const accentColor = target && target.color ? target.color : null;
+                            const highlightRemoteSelection = () => {
+                                const div = document.getElementById('card-choices');
+                                if (!div || !div.childNodes || !div.childNodes.length) return false;
+                                const targetName = (typeof data.card === 'string') ? data.card : '';
+                                let matchIdx = -1;
+                                try {
+                                    const lastOffer = window._lastOfferedChoices;
+                                    if (lastOffer && Array.isArray(lastOffer.choices)) {
+                                        matchIdx = lastOffer.choices.findIndex(choiceName => {
+                                            if (!choiceName) return false;
+                                            if (typeof choiceName === 'string') return choiceName === targetName;
+                                            if (choiceName && typeof choiceName.name === 'string') return choiceName.name === targetName;
+                                            return false;
+                                        });
+                                    }
+                                } catch (err) { matchIdx = -1; }
+                                if (matchIdx < 0) {
+                                    for (let i = 0; i < div.childNodes.length; ++i) {
+                                        const child = div.childNodes[i];
+                                        const label = child && child.querySelector ? child.querySelector('b') : null;
+                                        if (label && label.textContent && label.textContent.trim() === targetName) {
+                                            matchIdx = i;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (matchIdx < 0 || !div.childNodes[matchIdx]) return false;
+                                const cardEl = div.childNodes[matchIdx];
+                                try {
+                                    Array.from(div.childNodes).forEach((child, idx) => {
+                                        if (idx === matchIdx) return;
+                                        child.classList.remove('selected', 'centered');
+                                        child.style.zIndex = 1;
+                                        if (child._origTransform) child.style.transform = child._origTransform;
+                                        try {
+                                            child.style.removeProperty('border');
+                                            child.style.removeProperty('box-shadow');
+                                            child.style.removeProperty('color');
+                                            const sm = child.querySelector('small'); if (sm) sm.style.removeProperty('color');
+                                            if (child._accentClass) child.classList.remove(child._accentClass);
+                                            if (child._accentStyle) { child._accentStyle.remove(); child._accentStyle = null; }
+                                        } catch (err) {}
+                                    });
+                                } catch (err) {}
+                                if (!cardEl._origTransform) cardEl._origTransform = cardEl.style.transform;
+                                cardEl.classList.add('selected', 'centered');
+                                cardEl.style.zIndex = 10;
+                                cardEl.style.transform = 'translate(-50%, -60px) scale(1.18) rotate(0deg)';
+                                const accent = accentColor || '#65c6ff';
+                                try {
+                                    cardEl.style.setProperty('border', '3px solid ' + accent, 'important');
+                                    cardEl.style.setProperty('box-shadow', '0 6px 18px ' + accent, 'important');
+                                    cardEl.style.setProperty('color', accent, 'important');
+                                    const sm = cardEl.querySelector('small'); if (sm) sm.style.setProperty('color', accent, 'important');
+                                    if (!cardEl._accentClass) cardEl._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
+                                    if (!cardEl._accentStyle) {
+                                        const styleEl = document.createElement('style');
+                                        styleEl.innerText = `.${cardEl._accentClass}::after{ background: radial-gradient(ellipse at center, ${accent}33 0%, #0000 100%) !important; } .${cardEl._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${accent}55 0%, #0000 100%) !important; }`;
+                                        document.head.appendChild(styleEl);
+                                        cardEl._accentStyle = styleEl;
+                                    }
+                                    cardEl.classList.add(cardEl._accentClass);
+                                } catch (err) {}
+                                return true;
+                            };
+                            const finalizeCardUI = () => {
+                                try {
+                                    const div = document.getElementById('card-choices');
+                                    if (div) {
+                                        Array.from(div.childNodes || []).forEach(child => {
+                                            try {
+                                                if (child && child._accentStyle) { child._accentStyle.remove(); child._accentStyle = null; }
+                                            } catch (err) {}
+                                        });
+                                        div.style.display = 'none';
+                                        div.innerHTML = '';
+                                        div.classList.remove('card-bg-visible');
+                                    }
+                                } catch (err) {}
+                                try { cardState.active = false; waitingForCard = false; } catch (err) {}
+                            };
+                            const mirrored = highlightRemoteSelection();
+                            if (mirrored) {
+                                setTimeout(finalizeCardUI, 650);
+                            } else {
+                                finalizeCardUI();
+                            }
+                            return;
                         }
                     } catch (e) {}
-                    // Close any lingering card UI and clear waiting state for all clients
+                    // Host already closed UI; ensure any other clients still clear state
                     try {
                         const div = document.getElementById('card-choices');
                         if (div) { div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible'); }
@@ -7486,7 +8784,14 @@ function setupOverlayInit() {
                     try {
                         if (window._lastOfferedChoices && Array.isArray(window._lastOfferedChoices.choices) && window._lastOfferedChoices.chooserRole === NET.role) {
                             // reopen the choices for the chooser
-                            setTimeout(() => netShowPowerupCards(window._lastOfferedChoices.choices, window._lastOfferedChoices.chooserRole), 250);
+                            setTimeout(() => netShowPowerupCards(
+                                window._lastOfferedChoices.choices,
+                                window._lastOfferedChoices.chooserRole,
+                                {
+                                    fighterId: window._lastOfferedChoices.fighterId,
+                                    slotIndex: window._lastOfferedChoices.slotIndex
+                                }
+                            ), 250);
                         }
                     } catch (e) {}
                 } else {
@@ -7516,13 +8821,43 @@ function setupOverlayInit() {
         try {
             if (!pending) return;
             if (pending.kind === 'card') {
-                const target = getEntityForRole(pending.pickerRole);
+                const pendingFighterId = (pending && pending.fighterId != null) ? String(pending.fighterId) : null;
+                let target = null;
+                if (pendingFighterId) {
+                    try { target = getEntityForFighterId(pendingFighterId); } catch (e) { target = null; }
+                }
+                if (!target) {
+                    target = getEntityForRole(pending.pickerRole);
+                }
                 const card = getCardByName(pending.cardName);
                 if (target && card) {
                     try { card.effect(target); target.addCard(card.name); } catch (e) {}
                 }
+                let fighterRecord = null;
+                if (pendingFighterId && playerRoster && typeof playerRoster.getFighterById === 'function') {
+                    try { fighterRecord = playerRoster.getFighterById(pendingFighterId, { includeEntity: true }) || null; } catch (e) {}
+                }
+                if (!fighterRecord && target) {
+                    try { fighterRecord = getFighterRecordForEntity(target); } catch (e) { fighterRecord = null; }
+                }
+                const fighterIdForBroadcast = pendingFighterId || (fighterRecord && fighterRecord.id != null ? String(fighterRecord.id) : null);
+                const slotIndexForBroadcast = (pending && typeof pending.slotIndex === 'number')
+                    ? pending.slotIndex
+                    : (fighterRecord && typeof fighterRecord.slotIndex === 'number' ? fighterRecord.slotIndex : null);
                 // Broadcast applied so clients close UI
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: pending.pickerRole, card: pending.cardName } })); } catch (e) {}
+                try {
+                    if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+                        const payload = { type:'card-apply', pickerRole: pending.pickerRole, card: pending.cardName };
+                        if (fighterIdForBroadcast != null) payload.fighterId = fighterIdForBroadcast;
+                        if (typeof slotIndexForBroadcast === 'number') payload.slotIndex = slotIndexForBroadcast;
+                        window.ws.send(JSON.stringify({ type:'relay', data: payload }));
+                    }
+                } catch (e) {}
+                // Advance local round state as host (same as if notifyPowerupSelectionComplete had run)
+                try {
+                    // Use the applied target entity so selection completes for this loser
+                    try { notifyPowerupSelectionComplete(target, pending.cardName); } catch (e) {}
+                } catch (e) {}
                 // Ensure host UI closes as well
                 try { const div = document.getElementById('card-choices'); if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); } } catch (e) {}
                 // If there was a pending world modifier offer queued for this round, show it now on host and broadcast to joiner
@@ -7536,6 +8871,10 @@ function setupOverlayInit() {
                             if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-offer', choices: offer.choices, chooserRole: offer.chooserRole, finalIdx: offer.finalIdx, manual: !!offer.manual } }));
                         } catch (e) {}
                     }
+                } catch (e) {}
+                // Advance local round state to avoid stalling (same behavior as when client-side selection completes)
+                try {
+                    try { notifyPowerupSelectionComplete(target, pending.cardName); } catch (e) {}
                 } catch (e) {}
             } else if (pending.kind === 'mod') {
                 const name = pending.name;
@@ -7556,13 +8895,38 @@ function setupOverlayInit() {
             hideHostConfirmOverlay();
             if (!pending) return;
             if (pending.kind === 'card') {
-                const target = getEntityForRole(pending.pickerRole);
+                const pendingFighterId = (pending && pending.fighterId != null) ? String(pending.fighterId) : null;
+                let target = null;
+                if (pendingFighterId) {
+                    try { target = getEntityForFighterId(pendingFighterId); } catch (e) { target = null; }
+                }
+                if (!target) {
+                    target = getEntityForRole(pending.pickerRole);
+                }
                 const card = getCardByName(pending.cardName);
                 if (target && card) {
                     try { card.effect(target); target.addCard(card.name); } catch (e) {}
                 }
+                let fighterRecord = null;
+                if (pendingFighterId && playerRoster && typeof playerRoster.getFighterById === 'function') {
+                    try { fighterRecord = playerRoster.getFighterById(pendingFighterId, { includeEntity: true }) || null; } catch (e) {}
+                }
+                if (!fighterRecord && target) {
+                    try { fighterRecord = getFighterRecordForEntity(target); } catch (e) { fighterRecord = null; }
+                }
+                const fighterIdForBroadcast = pendingFighterId || (fighterRecord && fighterRecord.id != null ? String(fighterRecord.id) : null);
+                const slotIndexForBroadcast = (pending && typeof pending.slotIndex === 'number')
+                    ? pending.slotIndex
+                    : (fighterRecord && typeof fighterRecord.slotIndex === 'number' ? fighterRecord.slotIndex : null);
                 // Broadcast applied so clients close UI
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: pending.pickerRole, card: pending.cardName } })); } catch (e) {}
+                try {
+                    if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+                        const payload = { type:'card-apply', pickerRole: pending.pickerRole, card: pending.cardName };
+                        if (fighterIdForBroadcast != null) payload.fighterId = fighterIdForBroadcast;
+                        if (typeof slotIndexForBroadcast === 'number') payload.slotIndex = slotIndexForBroadcast;
+                        window.ws.send(JSON.stringify({ type:'relay', data: payload }));
+                    }
+                } catch (e) {}
                 // Ensure host UI closes as well
                 try { const div = document.getElementById('card-choices'); if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); } } catch (e) {}
                 // If there was a pending world modifier offer queued for this round, show it now on host and broadcast to joiner
@@ -8239,6 +9603,7 @@ window.addEventListener('keydown', e => {
     if (e.key === ' ' || e.code === 'Space') {
         // mark keyboard state; collectLocalInput reads keys[] and player.shootQueued may be used as fallback
         // keep player.shootQueued for legacy code paths
+        try { if (!isEntityActive(player)) return; } catch (e) {}
         player.shootQueued = true;
     }
 });
@@ -8282,6 +9647,7 @@ function startGame() {
     activeWorldModifiers = [];
     usedWorldModifiers = {};
     try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
+    try { beginRoundLifecycle('game-start'); } catch (e) {}
     // If obstacles were pre-populated (for example, from the Map Editor), keep them.
     // Otherwise generate procedural obstacles as before.
     if (!obstacles || obstacles.length === 0) {
@@ -8302,6 +9668,76 @@ function startGame() {
         }
     }
     window.positionPlayersSafely();
+    // Ensure any roster-assigned bots have entity instances and are positioned
+    try {
+        if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getSlots === 'function') {
+            const slots = playerRoster.getSlots({ includeDetails: true }) || [];
+            // Place bots evenly around the center if they don't have entity instances yet
+            const activeBotSlots = slots.map(s => s.fighter).filter(f => f && f.kind === 'bot');
+            for (let i = 0; i < activeBotSlots.length; ++i) {
+                const f = activeBotSlots[i];
+                if (!f) continue;
+                let ent = playerRoster.getEntityReference(f.id);
+                const angle = (i / Math.max(1, activeBotSlots.length)) * Math.PI * 2 - Math.PI/2;
+                const radius = Math.min(window.CANVAS_W, window.CANVAS_H) * 0.32;
+                const px = Math.round(window.CANVAS_W/2 + Math.cos(angle) * radius);
+                const py = Math.round(window.CANVAS_H/2 + Math.sin(angle) * radius);
+                if (!ent) {
+                    // If this bot occupies the host or joiner slot, reuse the existing player/enemy entity
+                    if (Number.isInteger(f.slotIndex) && f.slotIndex === 0 && typeof player !== 'undefined' && player) {
+                        ent = player;
+                        try { playerRoster.setEntityReference(f.id, ent); } catch (e) {}
+                    } else if (Number.isInteger(f.slotIndex) && f.slotIndex === 1 && typeof enemy !== 'undefined' && enemy) {
+                        ent = enemy;
+                        try { playerRoster.setEntityReference(f.id, ent); } catch (e) {}
+                    }
+                }
+                if (!ent) {
+                    const color = (typeof getRosterFighterColor === 'function') ? (getRosterFighterColor(f.slotIndex, f) || f.color) : (f.color || '#ff5a5a');
+                    ent = new Player(false, color, px, py);
+                    ent.displayName = f.name || ent.displayName || `Bot ${f.id}`;
+                    // Basic sync of key stats
+                    ent.score = f.score || 0;
+                    ent._isRosterBot = true;
+                    ent._rosterFighterId = f.id;
+                    try { playerRoster.setEntityReference(f.id, ent); } catch (e) {}
+                } else {
+                    // Update position if entity exists but not placed
+                    if (typeof ent.x !== 'number' || typeof ent.y !== 'number') {
+                        ent.x = px; ent.y = py;
+                    }
+                    ent._isRosterBot = true;
+                    ent._rosterFighterId = f.id;
+                    ent.color = (typeof getRosterFighterColor === 'function') ? (getRosterFighterColor(f.slotIndex, f) || f.color || ent.color) : (f.color || ent.color);
+                    ent.displayName = f.name || ent.displayName;
+                    ent.score = f.score || ent.score || 0;
+                }
+            }
+        }
+    } catch (e) { console.warn('Failed to ensure roster bot entities:', e); }
+    // Make sure slot 0/1 roster fighters point to the player/enemy instances to avoid duplicates
+    try {
+        if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighterById === 'function') {
+            const slots = playerRoster.getSlots({ includeDetails: true }) || [];
+            const isMultiplayer = !!(NET && NET.connected);
+            const slot0Entity = (() => {
+                if (!isMultiplayer) return player;
+                if (NET.role === 'host') return player; // host's local player controls slot 0
+                return enemy; // joiner views host as enemy entity
+            })();
+            const slot1Entity = (() => {
+                if (!isMultiplayer) return enemy;
+                if (NET.role === 'host') return enemy; // host views joiner as enemy entity
+                return player; // joiner controls slot 1 locally
+            })();
+            if (slot0Entity && slots[0] && slots[0].fighter) {
+                try { playerRoster.setEntityReference(slots[0].fighter.id, slot0Entity); } catch (e) {}
+            }
+            if (slot1Entity && slots[1] && slots[1].fighter) {
+                try { playerRoster.setEntityReference(slots[1].fighter.id, slot1Entity); } catch (e) {}
+            }
+        }
+    } catch (e) {}
     // Ensure colors are right for current mode
     if (typeof NET === 'undefined' || !NET || !NET.connected) {
         if (player) player.color = HOST_PLAYER_COLOR;
@@ -8315,7 +9751,10 @@ function startGame() {
         if (enemy) enemy.color = HOST_PLAYER_COLOR;
     }
     // Ensure enemy existence and disabled flag according to selection
-    if (!enemy) enemy = new Player(false, "#ff5a5a", window.CANVAS_W*0.66, CANVAS_H/2);
+    if (!enemy) {
+        const enemyColor = (typeof getJoinerColor === 'function') ? getJoinerColor(0) : '#ff5a5a';
+        enemy = new Player(false, enemyColor, window.CANVAS_W*0.66, CANVAS_H/2);
+    }
     enemyDisabled = (enemyCount <= 0);
     
     lastTimestamp = 0;
@@ -8382,7 +9821,8 @@ if (canvas) {
                 
                 return;
             }
-            // queue a shoot action (legacy/compat path)
+            // queue a shoot action (legacy/compat path) only if player is active
+            try { if (!isEntityActive(player)) return; } catch (e) {}
             if (player) player.shootQueued = true;
         }
     });
@@ -8868,7 +10308,7 @@ if (deleteSavedBtn) {
 
 
 
-// --- Dev Console (fixed, always visible, global references) ---
+// --- Dev Console (fixed, global references) ---
 const devLog = document.getElementById('dev-console-log');
 const devInput = document.getElementById('dev-console-input');
 const devForm = document.getElementById('dev-console-form');

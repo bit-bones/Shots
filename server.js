@@ -2,7 +2,7 @@
 // Run with: node server.js
 const WebSocket = require('ws');
 const PORT = process.env.PORT || 3001;
-const MAX_JOINERS = 3; // Allows host + up to three additional players
+const MAX_JOINERS = 4; // Allows host + up to four additional players (supports 5 roster slots)
 const wss = new WebSocket.Server({ port: PORT });
 
 const sessions = new Map();

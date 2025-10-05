@@ -208,6 +208,20 @@
             min-width: 450px;
             font-family: sans-serif;
         }
+        /* Individual rows for up to 4 fighter badge lines */
+        .cards-row { display:block; margin-bottom:6px; text-align:center; }
+        .cards-row .cards-list { display:inline-block; pointer-events: none; }
+        /* World cards container placed under canvas */
+        #world-cards-ui {
+            position: absolute;
+            left: 50%;
+            transform: translateX(-50%);
+            bottom: 88px; /* above dev console */
+            z-index: 10;
+            pointer-events: none;
+            min-width: 450px;
+            font-family: sans-serif;
+        }
         .cards-list {
             margin-bottom: 0;
             white-space: nowrap;
@@ -450,6 +464,12 @@
                     <span class="slot-subtext">Click to assign</span>
                     <div class="slot-actions"></div>
                 </button>
+                <button class="roster-slot empty" data-slot="4" type="button">
+                    <span class="slot-title">Slot 5</span>
+                    <span class="slot-body">Unassigned</span>
+                    <span class="slot-subtext">Click to assign</span>
+                    <div class="slot-actions"></div>
+                </button>
             </div>
             <div id="roster-note" class="roster-note">Host: click a slot to toggle Human/Bot or assign a participant. Joiners see a read-only roster.</div>
         </div>
@@ -577,7 +597,17 @@
         </div>
     </div>
     </div>
-    <div id="cards-ui"></div>
+    <div id="cards-ui">
+        <div id="cards-row-0" class="cards-row"><div class="cards-list" data-slot="0"></div></div>
+        <div id="cards-row-1" class="cards-row"><div class="cards-list" data-slot="1"></div></div>
+        <div id="cards-row-2" class="cards-row"><div class="cards-list" data-slot="2"></div></div>
+        <div id="cards-row-3" class="cards-row"><div class="cards-list" data-slot="3"></div></div>
+    </div>
+
+    <!-- World cards placed under the game canvas (always visible during matches) -->
+    <div id="world-cards-ui">
+        <div class="cards-row"><div class="cards-list" id="world-cards-list"></div></div>
+    </div>
 
     <!-- Options Modal -->
     <div id="options-overlay" style="display:none; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2100;">
