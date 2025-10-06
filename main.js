@@ -705,6 +705,7 @@ function handleRoundVictory(winnerEntry) {
     } catch (err) {
         console.warn('[Lifecycle] Failed to complete round summary', err);
     }
+    try { maybeTriggerWorldModifierOffer({ reason: 'round-complete' }); } catch (err) { console.warn('[World Mod] Failed to queue offer', err); }
     scheduleNextRoundTransition(winnerEntry);
 }
 
@@ -719,6 +720,46 @@ function scheduleNextRoundTransition(winnerEntry) {
 }
 
 function resetArenaForNextRound(winnerEntry) {
+    let shouldDelayForChoice = false;
+    try { if (cardState && cardState.active) shouldDelayForChoice = true; } catch (e) {}
+    if (!shouldDelayForChoice) {
+        try { if (waitingForCard) shouldDelayForChoice = true; } catch (e) {}
+    }
+    if (!shouldDelayForChoice) {
+        try { if (roundFlowState && roundFlowState.awaitingCardSelection) shouldDelayForChoice = true; } catch (e) {}
+    }
+    let pendingOffer = null;
+    let hasPendingOffer = false;
+    try {
+        if (window && window._pendingWorldModOffer) {
+            pendingOffer = window._pendingWorldModOffer;
+            hasPendingOffer = !!(pendingOffer && pendingOffer.choices && pendingOffer.choices.length);
+        }
+    } catch (e) {}
+    if (!shouldDelayForChoice && hasPendingOffer) {
+        try { window._pendingWorldModOffer = null; } catch (err) {}
+        try { roundFlowState.pendingWorldModOffer = null; } catch (err) {}
+        let presented = false;
+        try { presented = presentWorldModifierOffer(pendingOffer) === true; } catch (err) {
+            console.warn('[World Mod] Failed to present pending offer during round reset', err);
+            presented = false;
+        }
+        if (!presented) {
+            try { window._pendingWorldModOffer = pendingOffer; } catch (err) {}
+            try { roundFlowState.pendingWorldModOffer = pendingOffer; } catch (err) {}
+        } else {
+            shouldDelayForChoice = true;
+        }
+    }
+    if (shouldDelayForChoice) {
+        if (roundFlowState.nextRoundTimeout) {
+            clearTimeout(roundFlowState.nextRoundTimeout);
+        }
+        roundFlowState.nextRoundTimeout = setTimeout(() => resetArenaForNextRound(winnerEntry), 450);
+        return;
+    }
+    roundFlowState.nextRoundTimeout = null;
+    try { if (roundFlowState) roundFlowState.roundTransitionActive = false; } catch (e) {}
     // Preserve winner reference for spawn ordering
 
     const orderedEntries = collectRosterEntries({ includeEliminated: true }).sort((a, b) => {
@@ -2582,6 +2623,149 @@ let matchOver = false;
 let activeWorldModifiers = [];
 let usedWorldModifiers = {};
 
+function areWorldModifiersAllowed() {
+    if (!Array.isArray(WORLD_MODIFIERS) || !WORLD_MODIFIERS.length) return false;
+    try {
+        if (typeof window.setupAllowWorldMods !== 'undefined' && window.setupAllowWorldMods === false) return false;
+    } catch (e) {}
+    return true;
+}
+
+function isWorldMasterManualModeActive() {
+    try {
+        if (window.gameWorldMasterInstance && window.gameWorldMasterInstance.autoPick === false) return true;
+    } catch (e) {}
+    try {
+        const apEl = document.getElementById('wm-autopick');
+        if (apEl && apEl.type === 'checkbox' && apEl.checked === false) return true;
+    } catch (e) {}
+    return false;
+}
+
+function getWorldModifierChooserRole() {
+    try {
+        if (typeof NET !== 'undefined' && NET && NET.connected) {
+            if (typeof worldMasterPlayerIndex === 'number') {
+                if (worldMasterPlayerIndex === 0) return 'host';
+                if (worldMasterPlayerIndex === 1) return 'joiner';
+            }
+            return 'host';
+        }
+    } catch (e) {}
+    return 'host';
+}
+
+function getFilteredWorldModifierDeck() {
+    let deck = Array.isArray(WORLD_MODIFIERS) ? WORLD_MODIFIERS.slice() : [];
+    try {
+        if (window.WorldMasterIntegration && typeof window.WorldMasterIntegration.getFilteredWorldModifiers === 'function') {
+            const filtered = window.WorldMasterIntegration.getFilteredWorldModifiers(deck) || [];
+            if (Array.isArray(filtered) && filtered.length) deck = filtered.slice();
+        }
+    } catch (e) {}
+    return deck;
+}
+
+function buildWorldModifierOffer(options = {}) {
+    if (!areWorldModifiersAllowed()) return null;
+    const deck = getFilteredWorldModifierDeck();
+    if (!deck.length) return null;
+    let pool = deck.filter(mod => mod && mod.name && !usedWorldModifiers[mod.name]);
+    if (!pool.length) pool = deck.slice();
+    if (!pool.length) return null;
+    const selectionCount = Math.min(3, pool.length);
+    let selections = [];
+    try {
+        if (typeof randomChoice === 'function') {
+            selections = randomChoice(pool, selectionCount) || [];
+        }
+    } catch (e) { selections = []; }
+    if (!Array.isArray(selections) || !selections.length) {
+        const copy = pool.slice();
+        while (selections.length < selectionCount && copy.length) {
+            const idx = randInt(0, copy.length - 1);
+            selections.push(copy.splice(idx, 1)[0]);
+        }
+    }
+    const choiceNames = selections.map(mod => mod && mod.name).filter(Boolean);
+    if (!choiceNames.length) return null;
+    let finalIdx = options && typeof options.finalIdx === 'number' ? options.finalIdx : null;
+    if (typeof finalIdx !== 'number' || finalIdx < 0 || finalIdx >= choiceNames.length) {
+        finalIdx = randInt(0, Math.max(0, choiceNames.length - 1));
+    }
+    const manual = ((options && options.manual === true) || ((typeof worldMasterEnabled !== 'undefined' && worldMasterEnabled) && isWorldMasterManualModeActive())) === true;
+    const offer = {
+        choices: choiceNames,
+        chooserRole: options && options.chooserRole ? options.chooserRole : getWorldModifierChooserRole(),
+        finalIdx,
+        reason: options && options.reason ? options.reason : null
+    };
+    if (manual) offer.manual = true;
+    return offer;
+}
+
+function presentWorldModifierOffer(offer, options = {}) {
+    if (!offer || !Array.isArray(offer.choices) || !offer.choices.length) return false;
+    if (!areWorldModifiersAllowed()) return false;
+    const payload = {
+        choices: offer.choices.slice(),
+        chooserRole: offer.chooserRole || getWorldModifierChooserRole(),
+        finalIdx: typeof offer.finalIdx === 'number' ? offer.finalIdx : undefined,
+        manual: !!offer.manual
+    };
+    const execute = () => {
+        try {
+            if (!(window.WorldMasterIntegration && typeof window.WorldMasterIntegration.triggerWorldModifierChoice === 'function' && window.WorldMasterIntegration.triggerWorldModifierChoice(payload.choices, payload.chooserRole))) {
+                netShowWorldModifierCards(payload.choices, payload.chooserRole, payload.finalIdx, payload);
+            }
+        } catch (err) {
+            netShowWorldModifierCards(payload.choices, payload.chooserRole, payload.finalIdx, payload);
+        }
+        try {
+            if (typeof NET !== 'undefined' && NET && NET.connected && NET.role === 'host') {
+                if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+                    window.ws.send(JSON.stringify({ type: 'relay', data: { type: 'mod-offer', choices: payload.choices, chooserRole: payload.chooserRole, finalIdx: payload.finalIdx, manual: !!payload.manual } }));
+                }
+            }
+        } catch (err) {}
+    };
+    try { waitingForCard = true; } catch (err) {}
+    try { cardState.active = true; } catch (err) {}
+    const delayMs = options && typeof options.delayMs === 'number' ? options.delayMs : 0;
+    if (delayMs > 0) setTimeout(execute, delayMs); else execute();
+    try { roundFlowState.pendingWorldModOffer = null; } catch (err) {}
+    return true;
+}
+
+function queueWorldModifierOffer(offer, options = {}) {
+    if (!offer || !Array.isArray(offer.choices) || !offer.choices.length) return false;
+    try { roundFlowState.pendingWorldModOffer = offer; } catch (e) {}
+    const shouldDefer = (options && options.defer === true) || isSelectionPauseActive();
+    if (shouldDefer) {
+        try { window._pendingWorldModOffer = Object.assign({}, offer); } catch (e) {}
+        return false;
+    }
+    try { window._pendingWorldModOffer = null; } catch (e) {}
+    return presentWorldModifierOffer(offer, options);
+}
+
+function maybeTriggerWorldModifierOffer(context = {}) {
+    if (!areWorldModifiersAllowed()) return false;
+    try {
+        if (typeof NET !== 'undefined' && NET && NET.connected && NET.role !== 'host') return false;
+    } catch (e) {}
+    const force = context && context.force === true;
+    if (!force) {
+        roundsSinceLastModifier = Math.max(0, roundsSinceLastModifier + 1);
+        if (roundsSinceLastModifier < worldModifierRoundInterval) return false;
+    }
+    roundsSinceLastModifier = 0;
+    const offer = buildWorldModifierOffer(context);
+    if (!offer) return false;
+    queueWorldModifierOffer(offer, { defer: context && context.defer === true });
+    return true;
+}
+
 // Infestation tracking
 let infestationActive = false;
 let infestationTimer = 0;
@@ -3600,8 +3784,19 @@ function applyHealingEffectEvent(data) {
     if (!entity || typeof entity.triggerHealingEffect !== 'function') return;
     const healAmount = typeof data.healAmount === 'number' ? data.healAmount : 0;
     const intensityOverride = typeof data.intensity === 'number' ? data.intensity : 0;
-    // Joiner-side only: show visuals without re-syncing
-    entity.triggerHealingEffect(Math.max(healAmount, 1), { skipSync: true, intensityOverride });
+    // Joiner-side: show visuals and locally apply heal so the joiner sees HP change immediately.
+    // Host already applied the authoritative heal; this event is primarily for joiner clients.
+    try {
+        entity.triggerHealingEffect(Math.max(healAmount, 1), { skipSync: true, intensityOverride });
+    } catch (e) {}
+    try {
+        // Only apply health change locally on non-host clients (joiner) or when entity isn't the authoritative one
+        if (typeof NET !== 'undefined' && NET && NET.connected && NET.role === 'joiner') {
+            if (typeof entity.health === 'number' && typeof entity.healthMax === 'number') {
+                entity.health = Math.min(entity.healthMax, (entity.health || 0) + Math.max(0, healAmount));
+            }
+        }
+    } catch (e) {}
 }
 
 function applyChunkUpdateEvent(data) {
@@ -3735,7 +3930,7 @@ function applyBurningStartEvent(data) {
         if (data.entityId) {
             // player or enemy burning
             let ent = (player && player.id === data.entityId) ? player : ((enemy && enemy.id === data.entityId) ? enemy : null);
-            if (ent) ent.burning = { time: 0, duration: data.duration || 2.5 };
+            if (ent) ent.burning = { time: 0, duration: data.duration || 2.5, nextTick: 0.45 + Math.random() * 0.2 };
         } else if (typeof data.obstacleIndex === 'number' && typeof data.chunkIndex === 'number') {
             const obs = obstacles[data.obstacleIndex];
             if (obs && obs.chunks && obs.chunks[data.chunkIndex]) {
@@ -6868,6 +7063,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                     if (hadPending) {
                         const offer = window._pendingWorldModOffer;
                         window._pendingWorldModOffer = null;
+                        try { roundFlowState.pendingWorldModOffer = null; } catch (e) {}
                         setTimeout(() => {
                             try {
                                 if (!(window.WorldMasterIntegration && typeof window.WorldMasterIntegration.triggerWorldModifierChoice === 'function' && window.WorldMasterIntegration.triggerWorldModifierChoice(offer.choices, offer.chooserRole))) {
@@ -6945,6 +7141,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                     if (hadPending2) {
                         const offer = window._pendingWorldModOffer;
                         window._pendingWorldModOffer = null;
+                        try { roundFlowState.pendingWorldModOffer = null; } catch (e) {}
                         setTimeout(() => {
                             try {
                                 if (!(window.WorldMasterIntegration && typeof window.WorldMasterIntegration.triggerWorldModifierChoice === 'function' && window.WorldMasterIntegration.triggerWorldModifierChoice(offer.choices, offer.chooserRole))) {
@@ -7177,6 +7374,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                         try {
                             const offer = window._pendingWorldModOffer;
                             window._pendingWorldModOffer = null;
+                            try { roundFlowState.pendingWorldModOffer = null; } catch (e) {}
                             setTimeout(() => {
                                 try {
                                     if (!(window.WorldMasterIntegration && typeof window.WorldMasterIntegration.triggerWorldModifierChoice === 'function' && window.WorldMasterIntegration.triggerWorldModifierChoice(offer.choices, offer.chooserRole))) {
@@ -7212,6 +7410,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                 if (hadPending3) {
                     const offer = window._pendingWorldModOffer;
                     window._pendingWorldModOffer = null;
+                    try { roundFlowState.pendingWorldModOffer = null; } catch (e) {}
                     setTimeout(() => {
                         try {
                             if (!(window.WorldMasterIntegration && typeof window.WorldMasterIntegration.triggerWorldModifierChoice === 'function' && window.WorldMasterIntegration.triggerWorldModifierChoice(offer.choices, offer.chooserRole))) {
@@ -7273,6 +7472,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                 if (hadPending) {
                     const offer = window._pendingWorldModOffer;
                     window._pendingWorldModOffer = null;
+                    try { roundFlowState.pendingWorldModOffer = null; } catch (e) {}
                     setTimeout(() => {
                         try {
                             if (!(window.WorldMasterIntegration && typeof window.WorldMasterIntegration.triggerWorldModifierChoice === 'function' && window.WorldMasterIntegration.triggerWorldModifierChoice(offer.choices, offer.chooserRole))) {
@@ -8865,6 +9065,7 @@ function setupOverlayInit() {
                     if (window._pendingWorldModOffer) {
                         const offer = window._pendingWorldModOffer;
                         window._pendingWorldModOffer = null;
+                        try { roundFlowState.pendingWorldModOffer = null; } catch (e) {}
                         try { waitingForCard = true; } catch (e) {}
                         try { netShowWorldModifierCards(offer.choices, offer.chooserRole, offer.finalIdx, offer); } catch (e) {}
                         try {
@@ -8934,6 +9135,7 @@ function setupOverlayInit() {
                     if (window._pendingWorldModOffer) {
                         const offer = window._pendingWorldModOffer;
                         window._pendingWorldModOffer = null;
+                        try { roundFlowState.pendingWorldModOffer = null; } catch (e) {}
                         try { waitingForCard = true; } catch (e) {}
                         try { netShowWorldModifierCards(offer.choices, offer.chooserRole, offer.finalIdx, offer); } catch (e) {}
                         try {
