@@ -132,7 +132,7 @@ function showWorldModifierCards() {
     cardState.active = true;
     let div = document.getElementById('card-choices');
     div.innerHTML = '';
-    // Only show modifiers not already picked
+    // World modifier deck (do not permanently hide modifiers that are currently active)
     let modDeck = WORLD_MODIFIERS;
     try {
         if (window.WorldMasterIntegration && typeof window.WorldMasterIntegration.getFilteredWorldModifiers === 'function') {
@@ -142,9 +142,11 @@ function showWorldModifierCards() {
             }
         }
     } catch (e) { console.warn('[WORLDMASTER] Failed to filter world modifier deck:', e); }
-    let available = modDeck.filter(m => !usedWorldModifiers[m.name]);
-    // If fewer than three unused modifiers remain, fall back to entire filtered deck
-    let pool = available.length >= 3 ? available : modDeck;
+        // Increase base alpha and size multipliers so trailSizeScale and trailAlphaScale have stronger effect.
+        const alpha = (0.01 + 0.09 * tnorm) * (b.trailAlphaScale || 1);
+        // Size is influenced by bullet radius, tnorm (older points smaller), and trailSizeScale for damage.
+        const size = b.radius * (0.08 + 0.6 * tnorm) * (b.trailSizeScale || 1);
+    let pool = modDeck.slice();
     if (!pool.length) {
         console.warn('[WORLDMASTER] No enabled world modifiers remaining; reverting to full deck for chooser.');
         pool = WORLD_MODIFIERS;
@@ -238,6 +240,17 @@ const playerRoster = (() => {
     }
 })();
 
+// Listen for score changes to sync in multiplayer
+if (playerRoster && typeof playerRoster.on === 'function') {
+    playerRoster.on('score-changed', (data) => {
+        if (NET && NET.role === 'host' && NET.connected && window.ws && window.ws.readyState === WebSocket.OPEN) {
+            try {
+                window.ws.send(JSON.stringify({ type: 'relay', data: { type: 'score-update', fighterId: data.fighterId, score: data.score } }));
+            } catch (e) {}
+        }
+    });
+}
+
 const matchLifecycleManager = (() => {
     try {
         if (window.matchLifecycleManager instanceof MatchLifecycleManager) return window.matchLifecycleManager;
@@ -270,11 +283,21 @@ const roundFlowState = {
     awaitingCardEntity: null,
     awaitingCardChooserRole: null,
     awaitingCardSlotIndex: null,
+    awaitingCardJoinerIndex: null,
     roundTransitionActive: false,
     eliminationOrder: [],
     nextRoundTimeout: null,
     pendingWorldModOffer: null
 };
+
+function coerceJoinerIndex(value) {
+    if (Number.isInteger(value) && value >= 0) return value;
+    if (typeof value === 'string') {
+        const parsed = parseInt(value, 10);
+        if (!Number.isNaN(parsed) && parsed >= 0) return parsed;
+    }
+    return null;
+}
 
 function resetRoundFlowState(options = {}) {
     roundFlowState.eliminationQueue.length = 0;
@@ -284,6 +307,7 @@ function resetRoundFlowState(options = {}) {
     roundFlowState.awaitingCardEntity = null;
     roundFlowState.awaitingCardChooserRole = null;
     roundFlowState.awaitingCardSlotIndex = null;
+    roundFlowState.awaitingCardJoinerIndex = null;
     roundFlowState.eliminationOrder = [];
     roundFlowState.pendingWorldModOffer = null;
     if (!options.keepTransition) {
@@ -295,103 +319,6 @@ function resetRoundFlowState(options = {}) {
     }
 }
 
-function collectRosterEntries(options = {}) {
-    if (!playerRoster || typeof playerRoster.getFighters !== 'function') {
-        return [];
-    }
-    const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
-    const includeEliminated = options.includeEliminated === true;
-    const entries = [];
-    for (const fighter of fighters) {
-        if (!fighter) continue;
-        if (!includeEliminated && fighter.isAlive === false) continue;
-        if (fighter.metadata && fighter.metadata.isWorldMaster) continue;
-        let entity = null;
-        try {
-            entity = playerRoster.getEntityReference(fighter.id) || fighter.entity || null;
-        } catch (err) {
-            entity = fighter.entity || null;
-        }
-        if (!entity) continue;
-        entries.push({ fighter, entity });
-    }
-    return entries;
-}
-
-function getFighterRecordForEntity(entity) {
-    if (!entity || !playerRoster || typeof playerRoster.getFighters !== 'function') return null;
-    const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
-    for (const fighter of fighters) {
-        const ref = (() => {
-            try {
-                return playerRoster.getEntityReference(fighter.id) || fighter.entity || null;
-            } catch (err) {
-                return fighter.entity || null;
-            }
-        })();
-        if (ref === entity) return fighter;
-    }
-    return null;
-}
-
-function inferRoleForEntity(entity, options = {}) {
-    if (!entity) return options.defaultRole || null;
-    try {
-        const netAvailable = (typeof NET !== 'undefined' && NET);
-        if (!netAvailable || !NET.connected) {
-            return entity.isPlayer ? 'host' : 'joiner';
-        }
-        const localRole = NET.role;
-        if (localRole === 'host') {
-            if (entity === player) return 'host';
-            if (entity === enemy) return 'joiner';
-        } else if (localRole === 'joiner') {
-            if (entity === player) return 'joiner';
-            if (entity === enemy) return 'host';
-        }
-        const fighterRecord = getFighterRecordForEntity(entity);
-        if (fighterRecord && typeof fighterRecord.slotIndex === 'number') {
-            return resolveChooserRoleForSlot(fighterRecord.slotIndex);
-        }
-    } catch (err) {
-        console.warn('[Card Flow] Failed to infer role for entity', err);
-    }
-    return options.defaultRole || null;
-}
-
-function resolveChooserRoleForSlot(slotIndex) {
-    if (slotIndex === 0) return 'host';
-    if (slotIndex === 1) return 'joiner';
-    return 'host';
-}
-
-function getEntityForFighterId(fighterId) {
-    if (fighterId === null || fighterId === undefined) return null;
-    const normalizedId = String(fighterId);
-    try {
-        if (playerRoster && typeof playerRoster.getEntityReference === 'function') {
-            const direct = playerRoster.getEntityReference(normalizedId) || playerRoster.getEntityReference(fighterId);
-            if (direct) return direct;
-        }
-    } catch (e) {}
-    const entries = collectRosterEntries({ includeEliminated: true });
-    for (const entry of entries) {
-        if (entry && entry.fighter && String(entry.fighter.id) === normalizedId) {
-            return entry.entity || null;
-        }
-    }
-    return null;
-}
-
-function isEntityActive(entity, options = {}) {
-    if (!entity) return false;
-    if (entity.disabled) return false;
-    if (typeof entity.health === 'number' && entity.health <= 0) return false;
-    if (options.skipRosterLookup) return true;
-    const fighterRecord = getFighterRecordForEntity(entity);
-    if (fighterRecord && fighterRecord.isAlive === false) return false;
-    return true;
-}
 
 function beginRoundLifecycle(reason) {
     resetRoundFlowState();
@@ -424,6 +351,21 @@ function queueEliminationForEntry(entry, context = {}) {
     if (!fighterId) return;
     if (roundFlowState.processedEliminations.has(fighterId)) return;
     roundFlowState.processedEliminations.add(fighterId);
+    const eliminationJoinerIndex = (() => {
+        if (entry.fighter && entry.fighter.metadata) {
+            const metaIdx = coerceJoinerIndex(entry.fighter.metadata.joinerIndex);
+            if (metaIdx !== null) return metaIdx;
+        }
+        if (typeof resolveJoinerIndexForEntity === 'function') {
+            const idx = coerceJoinerIndex(resolveJoinerIndexForEntity(entry.entity));
+            if (idx !== null) return idx;
+        }
+        if (typeof resolveJoinerIndexForSlot === 'function' && typeof entry.fighter.slotIndex === 'number') {
+            const idx = coerceJoinerIndex(resolveJoinerIndexForSlot(entry.fighter.slotIndex));
+            if (idx !== null) return idx;
+        }
+        return null;
+    })();
     roundFlowState.eliminationQueue.push({
         fighterId,
         entity: entry.entity,
@@ -434,7 +376,8 @@ function queueEliminationForEntry(entry, context = {}) {
             round: matchLifecycleManager && typeof matchLifecycleManager.getState === 'function'
                 ? matchLifecycleManager.getState().roundNumber
                 : null,
-            reason: 'health-zero'
+            reason: 'health-zero',
+            joinerIndex: Number.isInteger(eliminationJoinerIndex) ? eliminationJoinerIndex : undefined
         }, context || {})
     });
 }
@@ -444,6 +387,10 @@ function startCardDraftForElimination(entity, fighterId, context = {}, options =
     const opts = options || {};
     let slotIndex = typeof opts.slotIndex === 'number' ? opts.slotIndex : null;
     let chooserRole = opts.chooserRole || null;
+    let chooserJoinerIndex = coerceJoinerIndex(opts.joinerIndex);
+    if (chooserJoinerIndex === null) {
+        chooserJoinerIndex = coerceJoinerIndex(roundFlowState && roundFlowState.awaitingCardJoinerIndex);
+    }
     const fighterIdStr = String(fighterId);
 
     if ((slotIndex === null || chooserRole === null) && playerRoster && typeof playerRoster.getFighterById === 'function') {
@@ -452,6 +399,10 @@ function startCardDraftForElimination(entity, fighterId, context = {}, options =
             if (rec) {
                 if (slotIndex === null && typeof rec.slotIndex === 'number') slotIndex = rec.slotIndex;
                 if (chooserRole === null) chooserRole = resolveChooserRoleForSlot(rec.slotIndex);
+                if (chooserJoinerIndex === null && rec.metadata) {
+                    const parsed = coerceJoinerIndex(rec.metadata.joinerIndex);
+                    if (parsed !== null) chooserJoinerIndex = parsed;
+                }
             }
         } catch (e) {}
     }
@@ -461,6 +412,10 @@ function startCardDraftForElimination(entity, fighterId, context = {}, options =
             const record = getFighterRecordForEntity(entity);
             if (record && typeof record.slotIndex === 'number') {
                 slotIndex = record.slotIndex;
+                if (chooserJoinerIndex === null && record.metadata) {
+                    const parsed = coerceJoinerIndex(record.metadata.joinerIndex);
+                    if (parsed !== null) chooserJoinerIndex = parsed;
+                }
             }
         } catch (err) {}
     }
@@ -484,6 +439,11 @@ function startCardDraftForElimination(entity, fighterId, context = {}, options =
         } catch (err) {}
     }
 
+    if (chooserJoinerIndex === null && typeof resolveJoinerIndexForSlot === 'function' && typeof slotIndex === 'number') {
+        const idx = coerceJoinerIndex(resolveJoinerIndexForSlot(slotIndex));
+        if (idx !== null) chooserJoinerIndex = idx;
+    }
+
     if (chooserRole === null && slotIndex !== null) {
         chooserRole = resolveChooserRoleForSlot(slotIndex);
     }
@@ -492,15 +452,22 @@ function startCardDraftForElimination(entity, fighterId, context = {}, options =
         chooserRole = inferRoleForEntity(entity);
     }
 
+    if (chooserJoinerIndex === null && typeof resolveJoinerIndexForEntity === 'function') {
+        const idx = coerceJoinerIndex(resolveJoinerIndexForEntity(entity));
+        if (idx !== null) chooserJoinerIndex = idx;
+    }
+
     let sharedChoices = [];
     try {
         sharedChoices = buildPowerupChoices(entity, 5);
     } catch (err) {
         sharedChoices = [];
     }
+    const normalizedJoinerForDraft = coerceJoinerIndex(chooserJoinerIndex);
 
     roundFlowState.awaitingCardChooserRole = chooserRole;
     roundFlowState.awaitingCardSlotIndex = typeof slotIndex === 'number' ? slotIndex : null;
+    roundFlowState.awaitingCardJoinerIndex = normalizedJoinerForDraft;
 
     try {
         if (cardDraftManager && typeof cardDraftManager.startDraft === 'function') {
@@ -543,7 +510,8 @@ function startCardDraftForElimination(entity, fighterId, context = {}, options =
                             choices: choiceNames,
                             chooserRole,
                             fighterId: fighterIdStr,
-                            slotIndex: typeof slotIndex === 'number' ? slotIndex : null
+                            slotIndex: typeof slotIndex === 'number' ? slotIndex : null,
+                            joinerIndex: normalizedJoinerForDraft
                         }
                     }));
                     logDev('[CARD FLOW] Broadcast card-offer to ' + chooserRole + ' with choices: [' + choiceNames.join(', ') + '] (fighter ' + fighterIdStr + ')');
@@ -556,7 +524,8 @@ function startCardDraftForElimination(entity, fighterId, context = {}, options =
             choices: Array.isArray(sharedChoices) ? sharedChoices : [],
             chooserRole,
             fighterId: fighterIdStr,
-            slotIndex: typeof slotIndex === 'number' ? slotIndex : (context && typeof context.slotIndex === 'number' ? context.slotIndex : null)
+            slotIndex: typeof slotIndex === 'number' ? slotIndex : (context && typeof context.slotIndex === 'number' ? context.slotIndex : null),
+            joinerIndex: normalizedJoinerForDraft !== null ? normalizedJoinerForDraft : coerceJoinerIndex(context && context.joinerIndex)
         });
     } catch (err) {
         console.warn('[Cards] Failed to show powerup cards for eliminated fighter', err);
@@ -574,6 +543,22 @@ function processNextElimination() {
         ? slotIndex
         : (fighter && typeof fighter.slotIndex === 'number' ? fighter.slotIndex : null);
     const chooserRole = resolveChooserRoleForSlot(resolvedSlotIndex);
+    const chooserJoinerIndex = (() => {
+        const fromContext = context ? coerceJoinerIndex(context.joinerIndex) : null;
+        if (fromContext !== null) return fromContext;
+        const fromMetadata = (fighter && fighter.metadata) ? coerceJoinerIndex(fighter.metadata.joinerIndex) : null;
+        if (fromMetadata !== null) return fromMetadata;
+        if (typeof resolveJoinerIndexForSlot === 'function' && typeof resolvedSlotIndex === 'number') {
+            const idx = coerceJoinerIndex(resolveJoinerIndexForSlot(resolvedSlotIndex));
+            if (idx !== null) return idx;
+        }
+        if (typeof resolveJoinerIndexForEntity === 'function' && entity) {
+            const idx = coerceJoinerIndex(resolveJoinerIndexForEntity(entity));
+            if (idx !== null) return idx;
+        }
+        return null;
+    })();
+    const normalizedJoinerIndex = coerceJoinerIndex(chooserJoinerIndex);
     try {
         if (matchLifecycleManager && typeof matchLifecycleManager.markEliminated === 'function') {
             matchLifecycleManager.markEliminated(fighterId, context || { reason: 'health-zero' });
@@ -597,8 +582,9 @@ function processNextElimination() {
     roundFlowState.awaitingCardEntity = entity;
     roundFlowState.awaitingCardChooserRole = chooserRole;
     roundFlowState.awaitingCardSlotIndex = resolvedSlotIndex;
+    roundFlowState.awaitingCardJoinerIndex = normalizedJoinerIndex;
     waitingForCard = true;
-    startCardDraftForElimination(entity, fighterId, context || {}, { chooserRole, slotIndex: resolvedSlotIndex });
+    startCardDraftForElimination(entity, fighterId, context || {}, { chooserRole, slotIndex: resolvedSlotIndex, joinerIndex: normalizedJoinerIndex });
 }
 
 function notifyPowerupSelectionComplete(loserEntity, selectedCardName) {
@@ -609,6 +595,15 @@ function notifyPowerupSelectionComplete(loserEntity, selectedCardName) {
     const slotIndexForBroadcast = (() => {
         if (fighterRecord && typeof fighterRecord.slotIndex === 'number') return fighterRecord.slotIndex;
         if (typeof roundFlowState.awaitingCardSlotIndex === 'number') return roundFlowState.awaitingCardSlotIndex;
+        return null;
+    })();
+    const joinerIndexForBroadcast = (() => {
+        const fromState = coerceJoinerIndex(roundFlowState.awaitingCardJoinerIndex);
+        if (fromState !== null) return fromState;
+        if (fighterRecord && fighterRecord.metadata) {
+            const metaIdx = coerceJoinerIndex(fighterRecord.metadata.joinerIndex);
+            if (metaIdx !== null) return metaIdx;
+        }
         return null;
     })();
     let shouldBroadcastSelection = false;
@@ -634,6 +629,7 @@ function notifyPowerupSelectionComplete(loserEntity, selectedCardName) {
     roundFlowState.awaitingCardEntity = null;
     roundFlowState.awaitingCardChooserRole = null;
     roundFlowState.awaitingCardSlotIndex = null;
+    roundFlowState.awaitingCardJoinerIndex = null;
     waitingForCard = false;
     if (shouldBroadcastSelection && typeof window !== 'undefined' && window.ws && window.ws.readyState === WebSocket.OPEN) {
         try {
@@ -644,7 +640,8 @@ function notifyPowerupSelectionComplete(loserEntity, selectedCardName) {
                     pickerRole: chooserRoleForBroadcast || 'host',
                     card: selectedCardName || null,
                     fighterId: fighterIdForBroadcast != null ? String(fighterIdForBroadcast) : null,
-                    slotIndex: typeof slotIndexForBroadcast === 'number' ? slotIndexForBroadcast : null
+                    slotIndex: typeof slotIndexForBroadcast === 'number' ? slotIndexForBroadcast : null,
+                    joinerIndex: Number.isInteger(joinerIndexForBroadcast) ? joinerIndexForBroadcast : null
                 }
             }));
         } catch (e) {}
@@ -826,6 +823,13 @@ function resetArenaForNextRound(winnerEntry) {
     // and (optional) spawn positions so joiners render the same map visuals.
     try {
         if (NET && NET.role === 'host' && NET.connected && window.ws && window.ws.readyState === WebSocket.OPEN) {
+            let rosterScores = [];
+            try {
+                if (playerRoster && typeof playerRoster.getFighters === 'function') {
+                    const fighters = playerRoster.getFighters({ includeUnassigned: false }) || [];
+                    rosterScores = fighters.map(f => ({ id: f.id, score: f.score || 0 }));
+                }
+            } catch (err) {}
             const payload = {
                 type: 'round-reset',
                 obstacles: serializeObstacles(),
@@ -835,7 +839,8 @@ function resetArenaForNextRound(winnerEntry) {
                 scores: {
                     host: (enemy && typeof enemy.score === 'number') ? enemy.score|0 : 0,
                     joiner: (player && typeof player.score === 'number') ? player.score|0 : 0
-                }
+                },
+                rosterScores: rosterScores
             };
             try { window.ws.send(JSON.stringify({ type: 'relay', data: payload })); } catch (e) {}
         }
@@ -1009,6 +1014,10 @@ function resetArenaForNextRound(winnerEntry) {
             entry.entity.y = spawnY;
             entry.entity.health = entry.entity.healthMax || entry.entity.health || 100;
         }
+        // Reset shooting timers to eliminate cooldowns from previous round, but don't trigger immediate shots
+        if (entry.fighter && entry.fighter.id) {
+            entry.entity.timeSinceShot = entry.entity.shootInterval;
+        }
         entry.entity.health = entry.entity.healthMax || entry.entity.health || 100;
         entry.entity.disabled = false;
         entry.entity.damageFlash = 0;
@@ -1083,8 +1092,9 @@ function getRosterFighterColor(slotIndex, fighter) {
     if (slotIndex === 0) {
         return HOST_PLAYER_COLOR;
     }
-    if (fighter && fighter.metadata && typeof fighter.metadata.joinerIndex === 'number') {
-        return getJoinerColor(fighter.metadata.joinerIndex);
+    const joinerFromMetadata = (fighter && fighter.metadata) ? coerceJoinerIndex(fighter.metadata.joinerIndex) : null;
+    if (joinerFromMetadata !== null) {
+        return getJoinerColor(joinerFromMetadata);
     }
     if (slotIndex > 0) {
         return getJoinerColor(slotIndex - 1);
@@ -1213,6 +1223,9 @@ function onRosterSlotClicked(event) {
     const slotIndex = parseInt(el.getAttribute('data-slot'), 10);
     if (Number.isNaN(slotIndex)) return;
     if (slotIndex === 0) return; // local slot fixed
+    // If this slot is currently being inline-renamed, ignore clicks/keypresses to avoid
+    // accidental toggles while editing (e.g., Space key activating the button).
+    if (typeof _rosterInlineRenameSlot === 'number' && _rosterInlineRenameSlot === slotIndex) return;
     try {
         if (typeof playerRoster.toggleSlotState === 'function') {
             playerRoster.toggleSlotState(slotIndex);
@@ -1255,6 +1268,18 @@ function renderRosterUI() {
             }
         }
         if (subEl) subEl.textContent = desc.subtext;
+        // Show 'Host' label on the local slot when hosting (replace generic local-player text)
+        if (slotIndex === 0 && subEl) {
+            try {
+                // If we're connected to multiplayer, slot 1 represents the Host's player
+                if (typeof NET !== 'undefined' && NET && NET.connected) {
+                    subEl.textContent = 'Host';
+                } else {
+                    // single-player or offline
+                    subEl.textContent = 'Controlled on this device';
+                }
+            } catch (e) {}
+        }
         if (chipWrap) {
             chipWrap.innerHTML = '';
             if (fighter && fighter.metadata && fighter.metadata.isWorldMaster) {
@@ -1358,6 +1383,15 @@ function bindRosterUI() {
     ensureRosterDefaults();
     grid.querySelectorAll('.roster-slot').forEach(btn => {
         btn.addEventListener('click', onRosterSlotClicked);
+        // Right-click context menu for slot actions (rename for bots)
+        btn.addEventListener('contextmenu', (ev) => {
+            try {
+                ev.preventDefault();
+                const slotIndex = Number.parseInt(btn.getAttribute('data-slot'), 10);
+                showRosterContextMenu(slotIndex, ev.clientX, ev.clientY);
+            } catch (e) {}
+            return false;
+        });
     });
     if (typeof playerRoster.on === 'function') {
         playerRoster.on(PlayerRoster.EVENTS.ROSTER_UPDATED, () => {
@@ -1372,6 +1406,99 @@ function bindRosterUI() {
     }
     rosterUIBound = true;
     renderRosterUI();
+}
+
+// Roster context menu and inline rename helpers
+let _rosterContextEl = null;
+// Index of slot currently being inline-renamed, or null
+let _rosterInlineRenameSlot = null;
+function hideRosterContextMenu() {
+    try {
+        if (_rosterContextEl && _rosterContextEl.parentNode) _rosterContextEl.parentNode.removeChild(_rosterContextEl);
+    } catch (e) {}
+    _rosterContextEl = null;
+}
+
+function showRosterContextMenu(slotIndex, x, y) {
+    hideRosterContextMenu();
+    try {
+        const desc = describeRosterSlot(slotIndex);
+        const fighter = desc && desc.fighter ? desc.fighter : null;
+        if (!fighter || fighter.kind !== 'bot') return;
+        const menu = document.createElement('div');
+        menu.className = 'roster-context-menu';
+        Object.assign(menu.style, { position: 'absolute', left: x + 'px', top: y + 'px', zIndex: 20000, background: '#111', color: '#fff', padding: '6px', borderRadius: '6px', boxShadow: '0 6px 18px rgba(0,0,0,0.6)' });
+        const rename = document.createElement('div');
+        rename.className = 'roster-context-item';
+        rename.textContent = 'Rename';
+        rename.style.cursor = 'pointer';
+        rename.onclick = (ev) => {
+            ev && ev.stopPropagation && ev.stopPropagation();
+            hideRosterContextMenu();
+            beginInlineRenameForSlot(slotIndex);
+        };
+        menu.appendChild(rename);
+        document.body.appendChild(menu);
+        _rosterContextEl = menu;
+        setTimeout(() => {
+            const closer = (e) => { hideRosterContextMenu(); window.removeEventListener('click', closer); };
+            window.addEventListener('click', closer);
+        }, 0);
+    } catch (e) { console.warn('Failed to show roster context menu', e); }
+}
+
+function beginInlineRenameForSlot(slotIndex) {
+    try {
+        const grid = document.getElementById('roster-grid');
+        if (!grid) return;
+        const btn = grid.querySelector(`.roster-slot[data-slot="${slotIndex}"]`);
+        if (!btn) return;
+        const desc = describeRosterSlot(slotIndex);
+        const fighter = desc && desc.fighter ? desc.fighter : null;
+        if (!fighter) return;
+        const bodyEl = btn.querySelector('.slot-body');
+        if (!bodyEl) return;
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'roster-inline-rename';
+        input.value = fighter.name || '';
+        input.maxLength = 32;
+        input.style.width = '100%';
+        input.style.boxSizing = 'border-box';
+        bodyEl.innerHTML = '';
+        bodyEl.appendChild(input);
+    // Mark this slot as being edited so click/keypress handlers can ignore it
+    _rosterInlineRenameSlot = slotIndex;
+    input.focus();
+    input.select();
+
+        function commit() {
+            try {
+                const newName = (input.value || '').toString().trim().slice(0,32);
+                if (newName && playerRoster && typeof playerRoster.updateFighter === 'function') {
+                    playerRoster.updateFighter(fighter.id, { name: newName });
+                    try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
+                }
+            } catch (e) { console.warn('Failed to rename fighter', e); }
+            try { renderRosterUI(); } catch (e) {}
+            _rosterInlineRenameSlot = null;
+        }
+
+        // Prevent key events (notably Space) from bubbling to the parent button which would
+        // trigger a slot toggle. Handle Enter/Escape here and stop propagation for Space.
+        input.addEventListener('keydown', (ev) => {
+            // Stop the key from bubbling to global handlers or the slot button
+            ev.stopPropagation();
+            if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+            else if (ev.key === 'Escape') { ev.preventDefault(); renderRosterUI(); }
+            // Do NOT preventDefault for Space — allow it to insert into the input while still
+            // stopping propagation so parent button doesn't receive the event.
+        });
+        // also stop keypress/keyup to be safe across browsers
+    input.addEventListener('keypress', (ev) => { ev.stopPropagation(); });
+        input.addEventListener('keyup', (ev) => { ev.stopPropagation(); });
+        input.addEventListener('blur', () => { commit(); });
+    } catch (e) { console.warn('beginInlineRenameForSlot error', e); }
 }
 
 // --- WorldMaster Integration ---
@@ -1545,11 +1672,11 @@ function updateWorldMasterSetupUI() {
                 label.appendChild(document.createTextNode(' ' + p.name + (idx === 0 ? ' (Host)' : '')));
                 wmMpRoles.appendChild(label);
             });
-            // Ensure default for 3 players
-            if (lobbyPlayers.length === 3 && worldMasterPlayerIndex === null) {
-                worldMasterPlayerIndex = 2;
-                try { if (NET.role === 'host' && typeof window.broadcastSetupWM === 'function') window.broadcastSetupWM(); } catch (e) {}
-            }
+            // For 3-player lobbies do not auto-assign a WorldMaster by default.
+            // Previously we defaulted to making the 3rd player (index 2) the WorldMaster,
+            // which caused the second joiner to be promoted unexpectedly. Leave
+            // `worldMasterPlayerIndex` as null so all joiners behave as normal fighters
+            // unless the host explicitly chooses a WorldMaster.
         } else {
             // 2-player (or fallback) scenario: always create explicit Host and Joiner radios
             const hostName = (lobbyPlayers[0] && lobbyPlayers[0].name) || (NET.role === 'host' ? (NET.myName || 'Host') : (NET.peerName || 'Host'));
@@ -1805,6 +1932,30 @@ document.addEventListener('DOMContentLoaded', () => {
             optionsModal.style.display = 'block';
         });
     }
+
+    // Multiplayer modal 'Close' button logic
+    const mpCloseBtn = document.getElementById('mp-close');
+    if (mpCloseBtn) {
+        mpCloseBtn.addEventListener('click', function() {
+            // Hide the multiplayer modal
+            const mpModal = document.getElementById('multiplayer-modal');
+            if (mpModal) mpModal.style.display = 'none';
+            // If session is already created, keep it active and joinable
+            // If not, create session now (simulate host/invite click)
+            if (typeof NET !== 'undefined' && NET && NET.role === 'host' && NET.connected) {
+                // Session is already active, do nothing
+            } else {
+                // If not connected, trigger host/invite logic
+                if (typeof startHostSession === 'function') {
+                    startHostSession();
+                } else if (typeof hostBtn === 'object' && hostBtn && typeof hostBtn.click === 'function') {
+                    hostBtn.click();
+                }
+            }
+            // Ensure session code remains visible in roster and joiners can connect
+            try { if (typeof setMpSessionDisplay === 'function') setMpSessionDisplay(); } catch (e) {}
+        });
+    }
     // --- Prevent browser menus and stuck movement when clicking outside canvas ---
     // Prevent right-click context menu anywhere
     document.addEventListener('contextmenu', function(e) {
@@ -2057,37 +2208,7 @@ function checkVictoryVotes() {
     } catch (e) {}
 }
 
-// --- Sound Effects ---
-const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-// Volume settings (0.0 - 1.0)
-let masterVolume = 1.0;
-let musicVolume = 1.0; // reserved if you add music
-let sfxVolume = 1.0;
-// Per-effect multipliers. We map slider range 0-100 such that 50 == 1.0 (current level),
-// higher values make the effect louder than current.
-let shotVolume = 1.0;
-let explosionVolume = 1.0;
-let ricochetVolume = 1.0;
-let hitVolume = 1.0;
-let dashVolume = 1.0;
-let burningVolume = 1.0;
-// Limit concurrent procedural burning sound instances to avoid audio overload
-const MAX_BURNING_SOUNDS = 10;
-const activeBurningSounds = []; // { masterGain, stopTime, baseGain }
-let firestormBurningInstance = null; // persistent burning sound for firestorms
-// Load saved volumes from localStorage if present
-try {
-    const vs = JSON.parse(localStorage.getItem('shape_shot_volumes') || '{}');
-    if (vs && typeof vs.master === 'number') masterVolume = vs.master;
-    if (vs && typeof vs.music === 'number') musicVolume = vs.music;
-    if (vs && typeof vs.sfx === 'number') sfxVolume = vs.sfx;
-    if (vs && typeof vs.shot === 'number') shotVolume = vs.shot;
-    if (vs && typeof vs.explosion === 'number') explosionVolume = vs.explosion;
-    if (vs && typeof vs.ricochet === 'number') ricochetVolume = vs.ricochet;
-    if (vs && typeof vs.hit === 'number') hitVolume = vs.hit;
-    if (vs && typeof vs.dash === 'number') dashVolume = vs.dash;
-    if (vs && typeof vs.burning === 'number') burningVolume = vs.burning;
-} catch (e) {}
+// Sound effect helpers live in functions/sounds.js
 // Load saved rounds-to-win if present
 try {
     const savedRounds = parseInt(localStorage.getItem('shape_shot_rounds') || '3');
@@ -2095,336 +2216,6 @@ try {
     // If the setup input exists, populate it
     try { const roundsInput = document.getElementById('rounds-to-win'); if (roundsInput) roundsInput.value = ROUNDS_TO_WIN; } catch (e) {}
 } catch (e) {}
-function playGunShot() {
-    const o = audioCtx.createOscillator();
-    const g = audioCtx.createGain();
-    o.type = 'square';
-    o.frequency.value = 380;
-    g.gain.value = 0.035 * masterVolume * sfxVolume * shotVolume;
-    o.connect(g).connect(audioCtx.destination);
-    o.start();
-    o.frequency.linearRampToValueAtTime(180, audioCtx.currentTime + 0.09);
-    g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.11);
-    o.stop(audioCtx.currentTime + 0.12);
-    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'gunshot' }); } catch (e) {}
-}
-function playExplosion() {
-    const o = audioCtx.createOscillator();
-    const g = audioCtx.createGain();
-    o.type = 'triangle';
-    o.frequency.value = 80;
-    g.gain.value = 0.45 * masterVolume * sfxVolume * explosionVolume;
-    o.connect(g).connect(audioCtx.destination);
-    o.start();
-    o.frequency.linearRampToValueAtTime(30, audioCtx.currentTime + 0.18);
-    g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.22);
-    o.stop(audioCtx.currentTime + 0.23);
-    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'explosion' }); } catch (e) {}
-}
-function playSoftPoof() {
-    // Softer, shorter poof sound for lifecycle expiries
-    try {
-        const o = audioCtx.createOscillator();
-        const g = audioCtx.createGain();
-        o.type = 'triangle';
-        o.frequency.value = 120;
-        g.gain.value = 0.12 * masterVolume * sfxVolume * explosionVolume;
-        o.connect(g).connect(audioCtx.destination);
-        o.start();
-        o.frequency.linearRampToValueAtTime(60, audioCtx.currentTime + 0.12);
-        g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.14);
-        o.stop(audioCtx.currentTime + 0.15);
-    } catch (e) {}
-    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'soft-poof' }); } catch (e) {}
-}
-function playHit() {
-    const o = audioCtx.createOscillator();
-    const g = audioCtx.createGain();
-    o.type = 'sine';
-    o.frequency.value = 220;
-    g.gain.value = 0.13 * masterVolume * sfxVolume * hitVolume;
-    o.connect(g).connect(audioCtx.destination);
-    o.start();
-    o.frequency.linearRampToValueAtTime(110, audioCtx.currentTime + 0.08);
-    g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.09);
-    o.stop(audioCtx.currentTime + 0.1);
-    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'hit' }); } catch (e) {}
-}
-function playRicochet() {
-    // subtle short 'dink' sound for ricochet/deflect
-    const o = audioCtx.createOscillator();
-    const g = audioCtx.createGain();
-    o.type = 'triangle';
-    o.frequency.value = 980; // high-pitched dink
-    g.gain.value = 0.05 * masterVolume * sfxVolume * ricochetVolume;
-    o.connect(g).connect(audioCtx.destination);
-    o.start();
-    // quick pitch drop and fade
-    o.frequency.linearRampToValueAtTime(640, audioCtx.currentTime + 0.04);
-    g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.06);
-    o.stop(audioCtx.currentTime + 0.07);
-    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'ricochet' }); } catch (e) {}
-}
-function playDashWoosh(duration = 0.28, speedMult = 1.0) {
-    try {
-        // duration: seconds, speedMult: multiplier affecting pitch
-        const now = audioCtx.currentTime;
-        const dur = Math.max(0.06, Math.min(duration, 1.4));
-        // Two-layer woosh: low rumble + high whoosh
-    const low = audioCtx.createOscillator();
-    const lowGain = audioCtx.createGain();
-    low.type = 'sine';
-    // slightly lower base frequency for a rounder rumble
-    low.frequency.value = 80 * Math.max(0.55, speedMult);
-    lowGain.gain.value = 0.06 * masterVolume * sfxVolume * dashVolume;
-        low.connect(lowGain).connect(audioCtx.destination);
-        low.start(now);
-    low.frequency.linearRampToValueAtTime(40 * Math.max(0.55, speedMult), now + dur * 0.9);
-    lowGain.gain.linearRampToValueAtTime(0.0, now + dur);
-        low.stop(now + dur + 0.02);
-
-    const high = audioCtx.createOscillator();
-    const highGain = audioCtx.createGain();
-    high.type = 'sawtooth';
-    // keep high component but reduce base so it's less piercing
-    high.frequency.value = 250 * Math.max(0.65, speedMult);
-    highGain.gain.value = 0.05 * masterVolume * sfxVolume * dashVolume;
-        high.connect(highGain).connect(audioCtx.destination);
-        high.start(now);
-        // pitch sweep downward for a pleasant woosh
-    high.frequency.exponentialRampToValueAtTime(Math.max(120, 320 * Math.max(0.55, speedMult)), now + dur * 0.9);
-    highGain.gain.setValueAtTime(highGain.gain.value, now);
-    highGain.gain.exponentialRampToValueAtTime(0.001, now + dur);
-        high.stop(now + dur + 0.02);
-    } catch (e) { /* ignore audio errors */ }
-    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'dash' }); } catch (e) {}
-}
-// Continuous burning sound builder: uses two overlapped looping buffers and randomized gain
-// automation so the result is a continuous, non-pulsing crackle. Calls remain the same
-// (playBurning(duration)) but internally we'll create a short looped source to simulate
-// ongoing burning for the requested duration.
-function playBurning(duration = 0.5) {
-    try {
-        const now = audioCtx.currentTime;
-        // clamp duration but we'll use a short loop buffer length for continuity
-        const requested = Math.max(0.1, Math.min(duration, 6.0));
-        const loopLen = 0.6; // seconds, short loop that's overlapped to create continuous texture
-
-        // Helper: create a pink-noise buffer of length loopLen
-        function createPinkBuffer(lenSec) {
-            const len = Math.floor(audioCtx.sampleRate * lenSec);
-            const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
-            const d = buf.getChannelData(0);
-            let b0 = 0, b1 = 0, b2 = 0;
-            for (let i = 0; i < len; i++) {
-                const white = Math.random() * 2 - 1;
-                b0 = 0.997 * b0 + white * 0.029;
-                b1 = 0.985 * b1 + white * 0.013;
-                b2 = 0.950 * b2 + white * 0.007;
-                const pink = b0 + b1 + b2 + white * 0.02;
-                // soft decay within the small buffer to avoid clicks when stopped
-                d[i] = pink * (0.95 - (i / len) * 0.15);
-            }
-            return buf;
-        }
-
-        const bufA = createPinkBuffer(loopLen);
-        const bufB = createPinkBuffer(loopLen);
-
-        // Global filter and gain for the burning sound
-        const filter = audioCtx.createBiquadFilter();
-        filter.type = 'lowpass';
-        filter.frequency.value = 600;
-        filter.Q.value = 0.7;
-
-        const masterGain = audioCtx.createGain();
-        masterGain.gain.value = 0.05 * masterVolume * sfxVolume * burningVolume;
-
-        filter.connect(masterGain).connect(audioCtx.destination);
-
-        // If we already have too many burning sources, try to extend an existing one instead of
-        // creating a new full chain. This prevents audio overload when many entities ignite.
-        const nowActive = activeBurningSounds.filter(x => x.stopTime > now);
-        if (nowActive.length >= MAX_BURNING_SOUNDS) {
-            // Choose the one with the earliest stopTime and extend it slightly
-            nowActive.sort((a, b) => a.stopTime - b.stopTime);
-            const victim = nowActive[0];
-            // bump stopTime by requested seconds but not exceeding a reasonable cap
-            const extra = Math.min(requested, 4.0);
-            const newStop = Math.max(victim.stopTime, now) + extra;
-            // schedule a smoother gain bump to simulate more burning without adding nodes
-            try {
-                victim.masterGain.gain.cancelScheduledValues(now);
-                victim.masterGain.gain.setValueAtTime(victim.baseGain * 0.9, now + 0.01);
-                victim.masterGain.gain.linearRampToValueAtTime(victim.baseGain, now + 0.2 + Math.random() * 0.6);
-                victim.masterGain.gain.setValueAtTime(victim.baseGain, newStop - 0.08);
-                victim.masterGain.gain.linearRampToValueAtTime(0.0, newStop);
-            } catch (e) {}
-            victim.stopTime = newStop;
-            return;
-        }
-
-        // Create two sources that will alternate with small randomized offsets
-        const srcA = audioCtx.createBufferSource();
-        srcA.buffer = bufA;
-        srcA.loop = true;
-        const srcB = audioCtx.createBufferSource();
-        srcB.buffer = bufB;
-        srcB.loop = true;
-
-        // Per-source gain nodes so we can modulate amplitude independently
-        const gainA = audioCtx.createGain();
-        const gainB = audioCtx.createGain();
-        gainA.gain.value = 0.9;
-        gainB.gain.value = 0.9;
-
-        srcA.connect(gainA).connect(filter);
-        srcB.connect(gainB).connect(filter);
-
-        // Start times: stagger slightly to prevent synchronous waves
-        const startA = now + 0.01;
-        const jitter = Math.random() * 0.08;
-        const startB = now + loopLen / 2 + jitter + 0.01;
-        srcA.start(startA);
-        srcB.start(startB);
-
-        // Randomized slow gain automation to keep texture lively but not pulsing
-        function scheduleGainAutomation(gNode, sTime) {
-            const segs = Math.max(3, Math.round(loopLen * 2));
-            let t = sTime;
-            for (let i = 0; i < segs; i++) {
-                const dur = (loopLen / segs) * (0.9 + Math.random() * 0.3);
-                const val = 0.7 + Math.random() * 0.35; // gentle modulation around ~0.8
-                gNode.gain.setValueAtTime(val, t);
-                // slight linear ramp to next point
-                gNode.gain.linearRampToValueAtTime(0.65 + Math.random() * 0.4, t + dur);
-                t += dur;
-            }
-            // make sure it matches at the loop boundary smoothly
-            gNode.gain.setValueAtTime(gNode.gain.value, sTime + loopLen + 0.02);
-        }
-
-        scheduleGainAutomation(gainA, startA);
-        scheduleGainAutomation(gainB, startB);
-
-        // Stop both sources after requested duration with a smooth, slightly longer fade to avoid
-        // any perceptible truncation or clicking. Fade scales with requested time but is clamped.
-        const stopTime = now + requested;
-        const fade = Math.min(0.6, Math.max(0.12, requested * 0.25));
-        // cancel any prior schedules and smoothly target near-zero gain starting at (stopTime - fade)
-        try { masterGain.gain.cancelScheduledValues(now); } catch (e) {}
-        masterGain.gain.setValueAtTime(masterGain.gain.value, Math.max(now, stopTime - fade));
-        // use setTargetAtTime for a gentle exponential-like decay (timeConstant ~0.06)
-        masterGain.gain.setTargetAtTime(0.00001, Math.max(now, stopTime - fade) + 0.01, 0.06);
-
-        // Stop sources shortly after fade finishes to ensure complete silence
-        const stopAfter = stopTime + fade + 0.06;
-        try { srcA.stop(stopAfter); } catch (e) {}
-        try { srcB.stop(stopAfter); } catch (e) {}
-
-        // Track this active burning sound so we can cap concurrent instances
-        activeBurningSounds.push({ masterGain: masterGain, stopTime: stopAfter, baseGain: masterGain.gain.value });
-        // Cleanup entry after it stops (slightly after stopAfter)
-        setTimeout(() => {
-            for (let i = activeBurningSounds.length - 1; i >= 0; --i) {
-                if (activeBurningSounds[i].stopTime <= audioCtx.currentTime) activeBurningSounds.splice(i, 1);
-            }
-        }, (requested + fade + 0.8) * 1000);
-    } catch (e) { /* ignore audio errors */ }
-    try { if (typeof GameEvents !== 'undefined' && GameEvents.emit) GameEvents.emit('sound-effect', { name: 'burning' }); } catch (e) {}
-}
-
-// Persistent firestorm burning sound: starts when firestorm begins and stops when it ends
-function startFirestormBurning() {
-    if (firestormBurningInstance) return; // already running
-    try {
-        const now = audioCtx.currentTime;
-        const loopLen = 0.6;
-
-        function createPinkBuffer(lenSec) {
-            const len = Math.floor(audioCtx.sampleRate * lenSec);
-            const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
-            const d = buf.getChannelData(0);
-            let b0 = 0, b1 = 0, b2 = 0;
-            for (let i = 0; i < len; i++) {
-                const white = Math.random() * 2 - 1;
-                b0 = 0.997 * b0 + white * 0.029;
-                b1 = 0.985 * b1 + white * 0.013;
-                b2 = 0.950 * b2 + white * 0.007;
-                const pink = b0 + b1 + b2 + white * 0.02;
-                d[i] = pink * (0.95 - (i / len) * 0.15);
-            }
-            return buf;
-        }
-
-        const bufA = createPinkBuffer(loopLen);
-        const bufB = createPinkBuffer(loopLen);
-
-        const filter = audioCtx.createBiquadFilter();
-        filter.type = 'lowpass';
-        filter.frequency.value = 420;
-        filter.Q.value = 0.7;
-
-        const masterGain = audioCtx.createGain();
-        masterGain.gain.value = 0.05 * masterVolume * sfxVolume * burningVolume;
-
-        filter.connect(masterGain).connect(audioCtx.destination);
-
-        const srcA = audioCtx.createBufferSource();
-        srcA.buffer = bufA;
-        srcA.loop = true;
-        const srcB = audioCtx.createBufferSource();
-        srcB.buffer = bufB;
-        srcB.loop = true;
-
-        const gainA = audioCtx.createGain();
-        const gainB = audioCtx.createGain();
-        gainA.gain.value = 0.9;
-        gainB.gain.value = 0.9;
-
-        srcA.connect(gainA).connect(filter);
-        srcB.connect(gainB).connect(filter);
-
-        const startA = now + 0.01;
-        const jitter = Math.random() * 0.08;
-        const startB = now + loopLen / 2 + jitter + 0.01;
-        srcA.start(startA);
-        srcB.start(startB);
-
-        function scheduleGainAutomation(gNode, sTime) {
-            const segs = Math.max(3, Math.round(loopLen * 2));
-            let t = sTime;
-            for (let i = 0; i < segs; i++) {
-                const dur = (loopLen / segs) * (0.9 + Math.random() * 0.3);
-                const val = 0.7 + Math.random() * 0.35;
-                gNode.gain.setValueAtTime(val, t);
-                gNode.gain.linearRampToValueAtTime(0.65 + Math.random() * 0.4, t + dur);
-                t += dur;
-            }
-            gNode.gain.setValueAtTime(gNode.gain.value, sTime + loopLen + 0.02);
-        }
-
-        scheduleGainAutomation(gainA, startA);
-        scheduleGainAutomation(gainB, startB);
-
-        firestormBurningInstance = { srcA, srcB, masterGain, startTime: now };
-    } catch (e) { /* ignore audio errors */ }
-}
-
-function stopFirestormBurning() {
-    if (!firestormBurningInstance) return;
-    try {
-        const now = audioCtx.currentTime;
-        const fade = 0.3;
-        const stopTime = now + fade;
-        firestormBurningInstance.masterGain.gain.cancelScheduledValues(now);
-        firestormBurningInstance.masterGain.gain.setValueAtTime(firestormBurningInstance.masterGain.gain.value, now);
-        firestormBurningInstance.masterGain.gain.setTargetAtTime(0.00001, now + 0.01, 0.06);
-        firestormBurningInstance.srcA.stop(stopTime);
-        firestormBurningInstance.srcB.stop(stopTime);
-    } catch (e) { /* ignore audio errors */ }
-    firestormBurningInstance = null;
-}
 let OBSTACLE_COUNT = 8;
 let OBSTACLE_MIN_SIZE = 70, OBSTACLE_MAX_SIZE = 170;
 
@@ -2582,6 +2373,22 @@ function spawnHealerAt(pos) {
 
 function getHealerTargets() {
     const targets = [];
+    // Prefer roster-aware list when available so bots and additional players are included
+    try {
+        if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+            const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+            for (const f of fighters) {
+                if (!f || !f.entity) continue;
+                // Skip world master or disabled entries
+                if (f.metadata && f.metadata.isWorldMaster) continue;
+                // Only include entities that exist
+                targets.push(f.entity);
+            }
+            return targets;
+        }
+    } catch (e) {
+        // fallthrough to legacy mapping
+    }
     if (player) targets.push(player);
     if (enemy && !enemyDisabled) targets.push(enemy);
     return targets;
@@ -2670,8 +2477,9 @@ function buildWorldModifierOffer(options = {}) {
     if (!areWorldModifiersAllowed()) return null;
     const deck = getFilteredWorldModifierDeck();
     if (!deck.length) return null;
-    let pool = deck.filter(mod => mod && mod.name && !usedWorldModifiers[mod.name]);
-    if (!pool.length) pool = deck.slice();
+    // Do not exclude modifiers that are currently marked as used/active. Offers should
+    // still be able to include already-active modifiers so World Master can toggle them.
+    let pool = deck.slice();
     if (!pool.length) return null;
     const selectionCount = Math.min(3, pool.length);
     let selections = [];
@@ -2901,13 +2709,6 @@ if (typeof window !== 'undefined') {
     ensureGlobalDeckController();
 }
 
-// --- Utilities ---
-
-
-// Dash settings helper (extracted so both update() and drawPlayer() can use it)
-
-
-
 function beginDash(p, dashVec, dashSet, opts = {}) {
     if (!p) return;
     try {
@@ -2938,10 +2739,6 @@ function beginDash(p, dashVec, dashSet, opts = {}) {
         try { playDashWoosh(p.dashTime, dashSet.speedMult); } catch (e) {}
     }
 }
-
-
-
-
 
 function completeTeledash(p, dashSet, aim, blockers = {}) {
     if (!p) return;
@@ -3011,6 +2808,8 @@ var player, enemy, bullets, obstacles;
 let enemyCount = 1;
 let enemyDisabled = false; // when true, enemy exists but AI/draw are disabled (for 0 enemies option; ignored in MP)
 let explosions = [];
+// Visual-only impact line effects when bullets hit obstacles
+let impactLines = [];
 let lastTimestamp = 0;
 let cardState = { active: false, player: null, callback: null };
 
@@ -3164,6 +2963,14 @@ const NET = {
     lastInputAt: 0,     // host: last time an input was received from joiner
     lastSnapshotAt: 0,  // joiner: last time a snapshot was received from host
     remoteInput: { up:false,down:false,left:false,right:false,shoot:false,dash:false,aimX:0,aimY:0,seq:0 },
+    // Per-joiner input maps for multiplayer with multiple joiners
+    remoteInputs: {}, // keyed by joinerIndex
+    remoteShootQueuedMap: {},
+    remoteDashReqSeqMap: {},
+    lastInputAtMap: {},
+    lastProcessedRemoteDashSeqMap: {},
+    // Debug helpers (development only)
+    _debugLastInputSeqMap: {},
     shootLatch: false, // joiner-side edge trigger to avoid hold-to-shoot
     // Host latches for joiner one-shot actions so they fire when off cooldown
     remoteShootQueued: false,
@@ -3238,7 +3045,7 @@ const NET = {
         if (!window.ws || window.ws.readyState !== WebSocket.OPEN || this.role !== 'joiner') return;
         const input = this.collectLocalInput();
         this.inputSeq++;
-        const payload = { type: 'input', seq: this.inputSeq, input };
+        const payload = { type: 'input', seq: this.inputSeq, input, joinerIndex: (Number.isInteger(this.joinerIndex) ? this.joinerIndex : null) };
         try { window.ws.send(JSON.stringify({ type: 'relay', data: payload })); } catch (e) {}
     },
     // HOST: send snapshot to joiner
@@ -3345,6 +3152,28 @@ const NET = {
                         if (!ent) continue;
                         const s = serializePlayer(ent);
                         s.fighterId = f.id;
+                        out.push(s);
+                    }
+                    return out;
+                } catch (e) { return []; }
+            })() : [],
+            // Also include roster-assigned human players (joiners) so joiners receive authoritative positions
+            rosterPlayers: (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') ? (function(){
+                try {
+                    const out = [];
+                    const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+                    for (const f of fighters) {
+                        if (!f) continue;
+                        // Expose human-controlled roster fighters (control: 'remote' or with joinerIndex) - skip bots
+                        if (f.kind === 'bot') continue;
+                        const ent = playerRoster.getEntityReference(f.id) || f.entity || null;
+                        if (!ent) continue;
+                        const s = serializePlayer(ent);
+                        s.fighterId = f.id;
+                        s.joinerIndex = (f.metadata) ? coerceJoinerIndex(f.metadata.joinerIndex) : null;
+                        s.displayName = f.name || s.displayName || null;
+                        // include metadata color if available to allow joiners to color correctly
+                        s.color = (f.metadata && f.metadata.color) ? f.metadata.color : (ent && ent.color ? ent.color : null);
                         out.push(s);
                     }
                     return out;
@@ -3532,6 +3361,14 @@ const NET = {
                     if (isLocal) {
                         b.isLocalPlayerBullet = true;
                     }
+                    // Recompute visual trail scaling (joiner needs these to match host visuals)
+                    try {
+                        const speedBased = Math.round((b.speed || 0) / 85);
+                        const damageBased = Math.round(Math.min(6, (b.damage || 0) * 0.6));
+                        b.trailMax = Math.max(2, Math.min(18, speedBased + damageBased));
+                        b.trailSizeScale = Math.max(0.08, Math.min(4.0, 0.10 + (b.damage || 0) * 0.09));
+                        b.trailAlphaScale = Math.max(0.02, Math.min(3.0, 0.03 + (b.damage || 0) * 0.06));
+                    } catch (e) {}
                 } else {
                     // Map ownerRole from snapshot to a local entity so visual owner/color is correct
                     let owner = (typeof sb.ownerRole === 'string') ? getEntityForRole(sb.ownerRole) : player;
@@ -3552,6 +3389,15 @@ const NET = {
                     if (sb.ownerRole === 'joiner' && NET.role === 'joiner') {
                         nb.isLocalPlayerBullet = true;
                     }
+                    // Ensure visual trail scaling matches the host snapshot's damage/speed
+                    try {
+                        const speedBased = Math.round((nb.speed || 0) / 85);
+                        const damageBased = Math.round(Math.min(6, (nb.damage || 0) * 0.6));
+                        nb.trailMax = Math.max(2, Math.min(18, speedBased + damageBased));
+                        nb.trailSizeScale = Math.max(0.08, Math.min(4.0, 0.10 + (nb.damage || 0) * 0.09));
+                        nb.trailAlphaScale = Math.max(0.02, Math.min(3.0, 0.03 + (nb.damage || 0) * 0.06));
+                        if (!Array.isArray(nb.trail)) nb.trail = [];
+                    } catch (e) {}
                     bullets.push(nb);
                 }
             }
@@ -3609,6 +3455,48 @@ const NET = {
                         } catch (e) {}
                     }
                 }
+                // Also handle human roster players so joiners see other joiners' movement/colors
+                try {
+                    const rplayers = snap.rosterPlayers || [];
+                    if (NET.role === 'joiner' && Array.isArray(rplayers) && rplayers.length) {
+                        // Upsert entities for each roster player reported by host
+                        for (const rp of rplayers) {
+                            if (!rp || typeof rp.fighterId === 'undefined') continue;
+                            let ent = null;
+                            try { ent = (playerRoster && typeof playerRoster.getEntityReference === 'function') ? playerRoster.getEntityReference(rp.fighterId) : null; } catch (e) { ent = null; }
+                            if (!ent) {
+                                // Create a visual-only Player entity for this roster player
+                                ent = new Player(false, rp.color || '#ffffff', rp.x || 0, rp.y || 0);
+                                ent.displayName = rp.displayName || `Player ${rp.fighterId}`;
+                                // Register entity with roster so future mapping works
+                                try { if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.setEntityReference === 'function') playerRoster.setEntityReference(rp.fighterId, ent); } catch (e) {}
+                            }
+                            // Mark as a roster-driven human (not a bot)
+                            ent._isRosterHuman = true;
+                            ent._rosterFighterId = rp.fighterId;
+                            // Apply authoritative stats
+                            ent.x = typeof rp.x === 'number' ? rp.x : ent.x;
+                            ent.y = typeof rp.y === 'number' ? rp.y : ent.y;
+                            if (typeof rp.hp === 'number') ent.health = rp.hp;
+                            if (typeof rp.ts === 'number') ent.timeSinceShot = rp.ts;
+                            if (typeof rp.si === 'number') ent.shootInterval = rp.si;
+                            if (typeof rp.dc === 'number') ent.dashCooldown = rp.dc;
+                            ent.dashActive = !!rp.da;
+                            ent.teledash = !!rp.td;
+                            ent.teledashWarmupActive = !!rp.tdA;
+                            // Smoothing target map for roster players
+                            if (NET.joinerTargets && NET.joinerTargets.rosterPlayers) {
+                                NET.joinerTargets.rosterPlayers.set(rp.fighterId, { x: rp.x, y: rp.y });
+                            } else if (NET.joinerTargets) {
+                                NET.joinerTargets.rosterPlayers = new Map();
+                                NET.joinerTargets.rosterPlayers.set(rp.fighterId, { x: rp.x, y: rp.y });
+                            }
+                            // Update color and display name for accurate visuals
+                            try { if (rp.color) ent.color = rp.color; } catch (e) {}
+                            try { if (rp.displayName) ent.displayName = rp.displayName; } catch (e) {}
+                        }
+                    }
+                } catch (e) {}
             } catch (e) {}
         } catch (e) { /* ignore snapshot errors to avoid crashing */ }
     },
@@ -3725,6 +3613,42 @@ function applyExplosionEvent(data) {
     if (!data) return;
     explosions.push(new Explosion(data.x, data.y, data.radius, data.color, 0, null));
     if (typeof playExplosion === 'function') playExplosion();
+}
+
+// Spawn impact line effects at x,y. count is number of lines; strength scales visuals
+function createImpactLines(x, y, damage, color, baseAngle) {
+    // Threshold: below this damage, produce no visible impact lines
+    const MIN_VISIBLE_DAMAGE = 6;
+    if (!damage || damage <= MIN_VISIBLE_DAMAGE) return; // skip for very small damage
+
+    // Non-linear scaling: map damage to 0..1 using a reference range
+    const REF_MAX = 48; // damage at which effects reach full scale
+    const norm = Math.max(0, Math.min(1, (damage - MIN_VISIBLE_DAMAGE) / (REF_MAX - MIN_VISIBLE_DAMAGE)));
+
+    // Count grows with damage (non-linear: ease-in)
+    const maxCount = 12;
+    const count = Math.round(Math.pow(norm, 1.25) * maxCount);
+
+    const speed = 300 + norm * 400; // px/sec scaled by normalized damage
+    const life = 0.04 + norm * 0.36; // grows with damage but stays short for low damage
+
+    for (let i = 0; i < count; ++i) {
+        let angle;
+        if (typeof baseAngle === 'number') {
+            const jitter = (Math.random() - 0.5) * 0.35;
+            const offset = (i - (count - 1) / 2) * (Math.PI * 0.10);
+            angle = baseAngle + offset + jitter;
+        } else {
+            const diag = (Math.random() < 0.5) ? (Math.PI / 4) : (-Math.PI / 4);
+            const jitter = (Math.random() - 0.5) * 0.35;
+            angle = diag + jitter + (Math.random() * Math.PI * 0.14 - Math.PI * 0.07);
+        }
+        const mag = speed * (0.6 + Math.random() * 0.8);
+        // width and alpha scale using eased normalized damage
+        const width = 0.35 + Math.pow(norm, 1.6) * 3.2; // base small, max ~3.55
+        const alphaScale = 0.06 + Math.pow(norm, 1.4) * 1.8; // base very small, max ~1.86
+        impactLines.push({ x, y, vx: Math.cos(angle) * mag, vy: Math.sin(angle) * mag, life, t: 0, color: color || '#ffd966', width, alphaScale });
+    }
 }
 
 function applyInfestationDieEvent(data) {
@@ -3927,6 +3851,17 @@ function applyDynamicDespawnEvent(data) {
 function applyBurningStartEvent(data) {
     if (!data) return;
     try {
+        // Prefer fighterId (roster-aware) when available
+        if (data.fighterId != null) {
+            let ent = null;
+            try { ent = (playerRoster && typeof playerRoster.getEntityReference === 'function') ? playerRoster.getEntityReference(String(data.fighterId)) : null; } catch (e) { ent = null; }
+            if (!ent) {
+                // fallback to mapping by entityId
+                if (data.entityId) ent = (player && player.id === data.entityId) ? player : ((enemy && enemy.id === data.entityId) ? enemy : null);
+            }
+            if (ent) ent.burning = { time: 0, duration: data.duration || 2.5, nextTick: 0.45 + Math.random() * 0.2 };
+            return;
+        }
         if (data.entityId) {
             // player or enemy burning
             let ent = (player && player.id === data.entityId) ? player : ((enemy && enemy.id === data.entityId) ? enemy : null);
@@ -3953,6 +3888,13 @@ function applyBurningStartEvent(data) {
 function applyBurningStopEvent(data) {
     if (!data) return;
     try {
+        if (data.fighterId != null) {
+            try {
+                const ent = (playerRoster && typeof playerRoster.getEntityReference === 'function') ? playerRoster.getEntityReference(String(data.fighterId)) : null;
+                if (ent) ent.burning = null;
+            } catch (e) {}
+            return;
+        }
         if (data.entityId) {
             let ent = (player && player.id === data.entityId) ? player : ((enemy && enemy.id === data.entityId) ? enemy : null);
             if (ent) ent.burning = null;
@@ -3984,6 +3926,19 @@ function applySoundEffectEvent(data) {
     } catch (e) {}
 }
 
+function applyImpactEvent(data) {
+    if (!data) return;
+    try {
+        const x = data.x || 0;
+        const y = data.y || 0;
+        const damage = data.damage || 1;
+        const color = data.color || '#ffffff';
+        const baseAngle = (typeof data.baseAngle === 'number') ? data.baseAngle : 0;
+        try { if (typeof createImpactLines === 'function') createImpactLines(x, y, damage, color, baseAngle); } catch (e) {}
+        try { if (typeof playImpact === 'function') playImpact(damage); } catch (e) {}
+    } catch (e) {}
+}
+
 // --- Sync helper functions (use GameEvents.emit when host) ---
 function syncToJoiner(eventType, data) {
     try {
@@ -4010,6 +3965,11 @@ function createSyncedExplosion(x, y, radius, color, damage, owner) {
 function createSyncedChunkUpdate(obstacleIndex, chunkUpdates) {
     const data = { obstacleIndex, updates: chunkUpdates };
     syncToJoiner('chunk-update', data);
+}
+
+function createSyncedImpact(x, y, damage, color, baseAngle) {
+    const data = { x, y, damage: damage || 1, color: color || '#ffffff', baseAngle: baseAngle || 0 };
+    syncToJoiner('impact', data);
 }
 
 function createSyncedDamageFlash(targetEntity, damage, isBurning = false) {
@@ -4260,6 +4220,101 @@ function update(dt) {
     // --- Multiplayer Sync (host-authoritative) ---
     NET.onFrame(dt);
     const simulateLocally = !NET.connected || NET.role === 'host';
+
+    // Helper: perform a lightweight, visual-only obstacle collision and ricochet
+    // for bullets that are simulated locally on a non-authoritative client (joiner).
+    // This mirrors the host's ricochet math (surface normal reflection and bounce
+    // decrement) but does NOT modify obstacle chunk state or emit authoritative
+    // chunk updates. Its purpose is purely to keep joiner visuals in sync with
+    // the host for locally-fired bullets.
+    function handleLocalBulletObstacleCollision(b) {
+        if (!b || !b.active) return;
+        if (!Array.isArray(obstacles) || !obstacles.length) return;
+        try {
+            for (let o of obstacles) {
+                if (!o || o.destroyed) continue;
+                // If bullet doesn't pierce, check collision and reflect/deactivate
+                if (!b.pierce) {
+                    let collidedChunk = null;
+                    let closestX = 0, closestY = 0;
+                    for (const c of o.chunks) {
+                        if (c.destroyed) continue;
+                        let cx = clamp(b.x, c.x, c.x + c.w);
+                        let cy = clamp(b.y, c.y, c.y + c.h);
+                        let dx = b.x - cx, dy = b.y - cy;
+                        if ((dx*dx + dy*dy) < b.radius * b.radius) {
+                            collidedChunk = c;
+                            closestX = cx; closestY = cy;
+                            break;
+                        }
+                    }
+                    if (collidedChunk) {
+                        if ((b.bouncesLeft|0) > 0) {
+                            // reflect velocity around surface normal (from collision point to bullet center)
+                            let nx = b.x - closestX;
+                            let ny = b.y - closestY;
+                            let nlen = Math.hypot(nx, ny);
+                            if (nlen === 0) {
+                                nx = (Math.random() - 0.5) || 0.0001;
+                                ny = (Math.random() - 0.5) || 0.0001;
+                                nlen = Math.hypot(nx, ny);
+                            }
+                            nx /= nlen; ny /= nlen;
+                            let vx = Math.cos(b.angle), vy = Math.sin(b.angle);
+                            let dot = vx*nx + vy*ny;
+                            let rx = vx - 2 * dot * nx;
+                            let ry = vy - 2 * dot * ny;
+                            b.angle = Math.atan2(ry, rx);
+                            b.bouncesLeft = Math.max(0, b.bouncesLeft - 1);
+                            b.x += rx * (b.radius * 0.9);
+                            b.y += ry * (b.radius * 0.9);
+                            try { if (typeof playRicochet === 'function') playRicochet(); } catch (e) {}
+                            // Only visual; don't modify obstacle chunks here
+                            break;
+                        } else {
+                            // compute surface normal from collision point to bullet center
+                            try {
+                                let nx = b.x - closestX;
+                                let ny = b.y - closestY;
+                                let nlen = Math.hypot(nx, ny);
+                                if (nlen === 0) { nx = (Math.random() - 0.5) || 0.0001; ny = (Math.random() - 0.5) || 0.0001; nlen = Math.hypot(nx, ny); }
+                                nx /= nlen; ny /= nlen;
+                                const baseAngle = Math.atan2(ny, nx);
+                                createImpactLines(b.x, b.y, b.damage || 1, (b.owner && b.owner.color) ? b.owner.color : '#ffffff', baseAngle);
+                                try { if (typeof playImpact === 'function') playImpact(b.damage || 1); } catch (e) {}
+                                try { if (NET && NET.role === 'host') createSyncedImpact(b.x, b.y, b.damage || 1, (b.owner && b.owner.color) ? b.owner.color : '#ffffff', baseAngle); } catch (e) {}
+                            } catch (e) {}
+                            b.active = false;
+                            break;
+                        }
+                    }
+                } else {
+                    // Piercing bullets: decrement pierceLimit on chunk contact (visual-only)
+                    let collided = false;
+                    let closestX = 0, closestY = 0;
+                    for (const c of o.chunks) {
+                        if (c.destroyed) continue;
+                        let cx = clamp(b.x, c.x, c.x + c.w);
+                        let cy = clamp(b.y, c.y, c.y + c.h);
+                        let dx = b.x - cx, dy = b.y - cy;
+                        if ((dx*dx + dy*dy) < b.radius * b.radius) {
+                            collided = true; closestX = cx; closestY = cy; break;
+                        }
+                    }
+                    if (collided) {
+                        b.pierceLimit--;
+                        if (b.pierceLimit <= 0) {
+                            // Suppress impact animation and sound for piercing bullet expiration inside obstacle
+                            b.active = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            // defensive: don't allow visual collision handling to throw
+        }
+    }
     const enemySuppressed = isEnemySuppressedForGameplay();
     const activeEnemy = enemy && !enemySuppressed;
     // Joiner: smooth positions toward latest snapshot targets and tick timers locally
@@ -4318,6 +4373,23 @@ function update(dt) {
                 }
             } catch (e) {}
         }
+        // Smooth roster human player positions (joiner)
+        if (NET.joinerTargets && NET.joinerTargets.rosterPlayers) {
+            try {
+                const fighters = (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') ? playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) : [];
+                for (const f of (fighters || [])) {
+                    if (!f) continue;
+                    const fid = f.id;
+                    const ent = playerRoster.getEntityReference ? playerRoster.getEntityReference(fid) : (f.entity || null);
+                    if (!ent) continue;
+                    const target = NET.joinerTargets.rosterPlayers.get(fid);
+                    if (target && typeof ent.x === 'number' && typeof ent.y === 'number') {
+                        ent.x = lerp(ent.x, target.x, t);
+                        ent.y = lerp(ent.y, target.y, t);
+                    }
+                }
+            } catch (e) {}
+        }
         // Smooth healer positions
         if (NET.joinerTargets && NET.joinerTargets.healers) {
             for (const healer of healers) {
@@ -4358,7 +4430,7 @@ function update(dt) {
                 if (entity && typeof entity.updateBurning === 'function') {
                     entity.updateBurning(dt);
                 }
-                if (typeof entity.update === 'function') entity.update(dt);
+                if (entity && typeof entity.update === 'function' && !entity._isRosterHuman) entity.update(dt);
             }
         } else {
             // Fallback for legacy two-player
@@ -5003,44 +5075,80 @@ function update(dt) {
         }
     }
     if (NET.role === 'host') {
-        // Host: drive enemy using remote input from joiner
-        let ri = NET.remoteInput || { up:false,down:false,left:false,right:false };
-        let vx = (ri.right?1:0) - (ri.left?1:0);
-        let vy = (ri.down?1:0) - (ri.up?1:0);
-        if (!enemy.dashActive) {
-            if (vx || vy) {
-                // Axis-separated movement to allow smooth sliding along obstacle surfaces
-                let norm = Math.hypot(vx, vy);
-                vx = norm ? (vx / norm) : 0; 
-                vy = norm ? (vy / norm) : 0;
-                const speed = enemy.speed;
-                // Move X, resolve collisions on X only
-                const oldX = enemy.x;
-                enemy.x += vx * speed * dt;
-                enemy.x = clamp(enemy.x, enemy.radius, window.CANVAS_W - enemy.radius);
-                for (let o of obstacles) {
-                    if (o.circleCollide(enemy.x, enemy.y, enemy.radius)) { enemy.x = oldX; break; }
+        // Host: drive remote players using per-joiner remoteInputs
+        try {
+            const inputsMap = NET.remoteInputs || {};
+            for (const key in inputsMap) {
+                const jIdx = coerceJoinerIndex(key);
+                if (jIdx === null) continue;
+                const ri = inputsMap[jIdx] || { up:false,down:false,left:false,right:false };
+                // Find the fighter/entity that corresponds to this joiner index
+                let remoteEntity = null;
+                try {
+                    const fighters = (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') ? playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) : [];
+                    for (const f of fighters) {
+                        if (!f || !f.metadata) continue;
+                        const metaJi = coerceJoinerIndex(f && f.metadata && f.metadata.joinerIndex);
+                        if (metaJi === jIdx) { remoteEntity = f.entity || (playerRoster.getEntityReference && playerRoster.getEntityReference(f.id)) || null; break; }
+                    }
+                } catch (e) { remoteEntity = null; }
+                if (!remoteEntity) {
+                    // Fallback: use legacy enemy mapping for joinerIndex 0
+                    if (jIdx === 0 && enemy) remoteEntity = enemy;
+                    else continue;
                 }
-                // Move Y, resolve collisions on Y only
-                const oldY = enemy.y;
-                enemy.y += vy * speed * dt;
-                enemy.y = clamp(enemy.y, enemy.radius, CANVAS_H - enemy.radius);
-                for (let o of obstacles) {
-                    if (o.circleCollide(enemy.x, enemy.y, enemy.radius)) { enemy.y = oldY; break; }
+                try { console.log('[HOST] joiner->entity mapping', jIdx, '->', (remoteEntity && (remoteEntity._rosterFighterId || remoteEntity.id || '<no-id>'))); } catch (e) {}
+                let vx = (ri.right?1:0) - (ri.left?1:0);
+                let vy = (ri.down?1:0) - (ri.up?1:0);
+                if (!remoteEntity.dashActive) {
+                    if (vx || vy) {
+                        let norm = Math.hypot(vx, vy);
+                        vx = norm ? (vx / norm) : 0;
+                        vy = norm ? (vy / norm) : 0;
+                        const speed = remoteEntity.speed || 0;
+                        const oldX = remoteEntity.x;
+                        remoteEntity.x += vx * speed * dt;
+                        remoteEntity.x = clamp(remoteEntity.x, remoteEntity.radius, window.CANVAS_W - remoteEntity.radius);
+                        for (let o of obstacles) { if (o.circleCollide(remoteEntity.x, remoteEntity.y, remoteEntity.radius)) { remoteEntity.x = oldX; break; } }
+                        const oldY = remoteEntity.y;
+                        remoteEntity.y += vy * speed * dt;
+                        remoteEntity.y = clamp(remoteEntity.y, remoteEntity.radius, CANVAS_H - remoteEntity.radius);
+                        for (let o of obstacles) { if (o.circleCollide(remoteEntity.x, remoteEntity.y, remoteEntity.radius)) { remoteEntity.y = oldY; break; } }
+                    }
                 }
+                // Process dash/shoot requests for this joiner using per-joiner maps further down
             }
-        }
+        } catch (e) {}
         // If enemy is currently dashing, move and resolve collisions (host authoritative)
         if (enemy.dashActive) {
             let dashSet = getDashSettings(enemy);
-            if (isTeledashEnabled(enemy)) {
-                const blockers = { obstacles, others: [player] };
-                const aimProvider = () => ({
-                    x: (NET.remoteInput && typeof NET.remoteInput.aimX === 'number') ? NET.remoteInput.aimX : player.x,
-                    y: (NET.remoteInput && typeof NET.remoteInput.aimY === 'number') ? NET.remoteInput.aimY : player.y
-                });
-                updateTeledashWarmup(enemy, dt, dashSet, aimProvider, blockers);
-            } else {
+                if (isTeledashEnabled(enemy)) {
+                    const blockers = { obstacles, others: [player] };
+                    // Aim provider that resolves the correct joiner's aim for the given entity.
+                    const aimProvider = () => {
+                        try {
+                            // Attempt to find the roster fighter record that references this enemy entity
+                            if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+                                const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+                                for (const f of fighters) {
+                                    if (!f) continue;
+                                    const ent = f.entity || (playerRoster.getEntityReference && playerRoster.getEntityReference(f.id));
+                                    if (ent === enemy) {
+                                        const ji = coerceJoinerIndex(f && f.metadata && f.metadata.joinerIndex);
+                                        const ri = (ji !== null && NET.remoteInputs) ? NET.remoteInputs[ji] : null;
+                                        return {
+                                            x: (ri && typeof ri.aimX === 'number') ? ri.aimX : player.x,
+                                            y: (ri && typeof ri.aimY === 'number') ? ri.aimY : player.y
+                                        };
+                                    }
+                                }
+                            }
+                        } catch (e) {}
+                        // Fallback: use legacy player cursor
+                        return { x: player.x, y: player.y };
+                    };
+                    updateTeledashWarmup(enemy, dt, dashSet, aimProvider, blockers);
+                } else {
                 let dashVx = enemy.dashDir.x * enemy.speed * dashSet.speedMult;
                 let dashVy = enemy.dashDir.y * enemy.speed * dashSet.speedMult;
                 let oldx = enemy.x, oldy = enemy.y;
@@ -5131,57 +5239,73 @@ function update(dt) {
             // Cooldown ticks when not dashing
             enemy.dashCooldown = Math.max(0, enemy.dashCooldown - dt);
         }
-        // Remote dash intent processed once per input sequence to avoid double-firing when cooldown finishes
-        if (NET.remoteDashReqSeq && NET.remoteDashReqSeq > NET.lastProcessedRemoteDashSeq && enemy.dash && !enemy.dashActive && enemy.dashCooldown <= 0) {
-            // If the remote (joiner) is currently moving, dash in that movement direction so dash follows movement
-            // Otherwise fallback to aim-based dash (toward cursor) as before.
-            let dir = { x: 0, y: 0 };
-            if (vx || vy) {
-                // use movement vector from remote input
-                let norm = Math.hypot(vx, vy) || 1;
-                dir.x = vx / norm; dir.y = vy / norm;
-                let dashSet = getDashSettings(enemy);
-                // Host should show the remote player's warmup ring for mutual visibility
-                beginDash(enemy, dir, dashSet, { showWarmup: true });
-            } else {
-                // trigger dash using direction toward aim (cursor) when stationary
-                let dx = (ri.aimX||player.x) - enemy.x;
-                let dy = (ri.aimY||player.y) - enemy.y;
-                let norm = Math.hypot(dx, dy) || 1;
-                dir = { x: dx/norm, y: dy/norm };
-                let dashSet = getDashSettings(enemy);
-                // Host-side dash for remote: show the remote's warmup ring for mutual visibility
-                beginDash(enemy, dir, dashSet, { lockedAim: { x: ri.aimX || player.x, y: ri.aimY || player.y }, showWarmup: true });
-            }
-            NET.lastProcessedRemoteDashSeq = NET.remoteDashReqSeq;
-            NET.remoteDashReqSeq = 0;
-        }
-        // Always tick enemy shoot timer on host
-        enemy.timeSinceShot += dt;
-        // Remote shoot intent: only fire if remote input currently indicates shoot is held
-        if (NET.remoteShootQueued && enemy.timeSinceShot >= enemy.shootInterval) {
-            // Only proceed if the remote input currently wants to shoot (holding), otherwise drop the queued request
-            const remoteWantsShoot = !!(NET.remoteInput && NET.remoteInput.shoot);
-            if (remoteWantsShoot) {
-                // Use joiner's aim coordinates (from remote input) if available
-                let aimX = (ri && typeof ri.aimX === 'number') ? ri.aimX : player.x;
-                let aimY = (ri && typeof ri.aimY === 'number') ? ri.aimY : player.y;
-                let target = { x: aimX, y: aimY };
-                enemy.shootToward(target, bullets);
-                // tag bullets with ids (host)
-                for (let i = bullets.length-1; i >= 0; i--) {
-                    if (bullets[i].owner === enemy && !bullets[i].id) NET.tagBullet(bullets[i]);
+        // Process dash and shooting intents per joiner (multi-joiner support)
+        try {
+            const inputsMap = NET.remoteInputs || {};
+            for (const key in inputsMap) {
+                const jIdx = coerceJoinerIndex(key);
+                if (jIdx === null) continue;
+                const ri = inputsMap[jIdx] || {};
+                // locate the entity for this joiner via roster metadata
+                let remoteEntity = null;
+                try {
+                    const fighters = (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') ? playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) : [];
+                    for (const f of fighters) {
+                        if (!f || !f.metadata) continue;
+                        const metaJi = coerceJoinerIndex(f && f.metadata && f.metadata.joinerIndex);
+                        if (metaJi === jIdx) { remoteEntity = f.entity || (playerRoster.getEntityReference && playerRoster.getEntityReference(f.id)) || null; break; }
+                    }
+                } catch (e) { remoteEntity = null; }
+                if (!remoteEntity) {
+                    // legacy fallback to enemy for joiner 0
+                    if (jIdx === 0 && enemy) remoteEntity = enemy;
+                    else continue;
                 }
-                enemy.timeSinceShot = 0;
-                // If the remote is still holding, keep remoteShootQueued true so subsequent shots fire as cooldown completes
-                // Otherwise clear the queued flag to avoid delayed firing
-                if (!remoteWantsShoot) NET.remoteShootQueued = false;
-            } else {
-                NET.remoteShootQueued = false;
+
+                // Dash processing per-joiner
+                const dashReq = (NET.remoteDashReqSeqMap && NET.remoteDashReqSeqMap[jIdx]) || 0;
+                const lastProc = (NET.lastProcessedRemoteDashSeqMap && NET.lastProcessedRemoteDashSeqMap[jIdx]) || 0;
+                if (dashReq && dashReq > lastProc && remoteEntity.dash && !remoteEntity.dashActive && remoteEntity.dashCooldown <= 0) {
+                    let vx = (ri.right?1:0) - (ri.left?1:0);
+                    let vy = (ri.down?1:0) - (ri.up?1:0);
+                    let dir = { x: 0, y: 0 };
+                    if (vx || vy) {
+                        let norm = Math.hypot(vx, vy) || 1; dir.x = vx / norm; dir.y = vy / norm;
+                        let dashSet = getDashSettings(remoteEntity);
+                        beginDash(remoteEntity, dir, dashSet, { showWarmup: true });
+                    } else {
+                        let dx = (ri.aimX||player.x) - remoteEntity.x;
+                        let dy = (ri.aimY||player.y) - remoteEntity.y;
+                        let norm = Math.hypot(dx, dy) || 1; dir = { x: dx/norm, y: dy/norm };
+                        let dashSet = getDashSettings(remoteEntity);
+                        beginDash(remoteEntity, dir, dashSet, { lockedAim: { x: ri.aimX || player.x, y: ri.aimY || player.y }, showWarmup: true });
+                    }
+                    if (!NET.lastProcessedRemoteDashSeqMap) NET.lastProcessedRemoteDashSeqMap = {};
+                    NET.lastProcessedRemoteDashSeqMap[jIdx] = dashReq;
+                    if (NET.remoteDashReqSeqMap) NET.remoteDashReqSeqMap[jIdx] = 0;
+                }
+
+                // Shooting per-joiner (host authoritative)
+                remoteEntity.timeSinceShot = (remoteEntity.timeSinceShot || 0) + dt;
+                if (NET.remoteShootQueuedMap && NET.remoteShootQueuedMap[jIdx] && remoteEntity.timeSinceShot >= remoteEntity.shootInterval) {
+                    const wantsShoot = !!(ri && ri.shoot);
+                    if (wantsShoot) {
+                        const aimX = (ri && typeof ri.aimX === 'number') ? ri.aimX : player.x;
+                        const aimY = (ri && typeof ri.aimY === 'number') ? ri.aimY : player.y;
+                        remoteEntity.shootToward({ x: aimX, y: aimY }, bullets);
+                        for (let i = bullets.length-1; i >= 0; i--) {
+                            if (bullets[i].owner === remoteEntity && !bullets[i].id) NET.tagBullet(bullets[i]);
+                        }
+                        remoteEntity.timeSinceShot = 0;
+                        if (!wantsShoot) NET.remoteShootQueuedMap[jIdx] = false;
+                    } else {
+                        NET.remoteShootQueuedMap[jIdx] = false;
+                    }
+                }
+                // Clear transient flags on this per-joiner input record
+                if (ri) { ri.shoot = false; ri.dash = false; }
             }
-        }
-        // Clear transient flags so future presses can re-queue
-        NET.remoteInput.shoot = false; NET.remoteInput.dash = false;
+        } catch (e) { /* defensive */ }
     } else {
         // Joiner: suppress local enemy AI entirely; enemy state comes from snapshots
         // No movement/AI here
@@ -5744,26 +5868,38 @@ function update(dt) {
     // Bullets: on host (or solo), integrate locally; on joiner, lerp toward snapshot targets for smooth visuals
     if (simulateLocally) {
         for (let b of bullets) if (b.active) b.update(dt);
-        // On host, steer enemy bullets (joiner) toward joiner's aim if they have Shot Controller
-        if (NET.connected && NET.role === 'host' && NET.remoteInput && typeof NET.remoteInput.aimX === 'number' && typeof NET.remoteInput.aimY === 'number') {
+        // On host, steer remote-controlled bullets toward their joiner's aim if available
+        if (NET.connected && NET.role === 'host') {
+            const inputsMap = NET.remoteInputs || {};
             for (let b of bullets) {
-                if (b.active && b.owner === enemy && b.shotController && b.playerControlActive) {
-                    let dx = NET.remoteInput.aimX - b.x;
-                    let dy = NET.remoteInput.aimY - b.y;
-                    let distToCursor = Math.hypot(dx, dy);
-                    if (distToCursor > 2) {
-                        let steerAngle = Math.atan2(dy, dx);
-                        // Smoothly steer toward cursor (limit turn rate for control)
-                        let turnRate = 0.13; // radians per frame
-                        let da = steerAngle - b.angle;
-                        // Wrap angle to [-PI, PI]
-                        while (da > Math.PI) da -= 2 * Math.PI;
-                        while (da < -Math.PI) da += 2 * Math.PI;
-                        if (Math.abs(da) > turnRate) {
-                            b.angle += turnRate * Math.sign(da);
-                        } else {
-                            b.angle = steerAngle;
-                        }
+                if (!b.active || !b.shotController || !b.playerControlActive) continue;
+                // determine which joiner controls this bullet via owner -> roster fighter mapping
+                let owner = b.owner || null;
+                let joinerIdx = null;
+                if (owner && owner._rosterFighterId) {
+                    try {
+                        const f = (playerRoster && typeof playerRoster.getFighterById === 'function') ? playerRoster.getFighterById(owner._rosterFighterId) : null;
+                        if (f && f.metadata) joinerIdx = coerceJoinerIndex(f.metadata.joinerIndex);
+                    } catch (e) {}
+                } else if (owner === enemy) {
+                    joinerIdx = 0;
+                }
+                if (joinerIdx === null) continue;
+                const ri = inputsMap[joinerIdx] || null;
+                if (!ri || typeof ri.aimX !== 'number' || typeof ri.aimY !== 'number') continue;
+                let dx = ri.aimX - b.x;
+                let dy = ri.aimY - b.y;
+                let distToCursor = Math.hypot(dx, dy);
+                if (distToCursor > 2) {
+                    let steerAngle = Math.atan2(dy, dx);
+                    let turnRate = 0.13; // radians per frame
+                    let da = steerAngle - b.angle;
+                    while (da > Math.PI) da -= 2 * Math.PI;
+                    while (da < -Math.PI) da += 2 * Math.PI;
+                    if (Math.abs(da) > turnRate) {
+                        b.angle += turnRate * Math.sign(da);
+                    } else {
+                        b.angle = steerAngle;
                     }
                 }
             }
@@ -5775,16 +5911,39 @@ function update(dt) {
             if (!b.active) continue;
             // If this bullet is locally controlled (host or joiner), simulate it locally
             if (b.isLocalPlayerBullet) {
-                try { b.update(dt); } catch (e) { /* ignore update errors to avoid crash */ }
+                try {
+                    b.update(dt);
+                    // If we're a non-authoritative client (joiner) and this bullet belongs to the local player,
+                    // perform a visual-only obstacle collision/ricochet so joiner visuals match host behavior.
+                    if (NET && NET.connected && NET.role === 'joiner') {
+                        try { handleLocalBulletObstacleCollision(b); } catch (e) {}
+                    }
+                } catch (e) { /* ignore update errors to avoid crash */ }
                 continue;
             }
             // Otherwise, smooth position/angle from snapshot
             const tx = (typeof b.targetX === 'number') ? b.targetX : b.x;
             const ty = (typeof b.targetY === 'number') ? b.targetY : b.y;
             const ta = (typeof b.targetAngle === 'number') ? b.targetAngle : b.angle;
-            b.x = lerp(b.x, tx, t);
-            b.y = lerp(b.y, ty, t);
+            const newX = lerp(b.x, tx, t);
+            const newY = lerp(b.y, ty, t);
             b.angle = lerpAngle(b.angle, ta, t);
+            // Append visual trail points for non-local bullets (joiner) so trails are visible
+            try {
+                // If the bullet has moved noticeably since last stored trail point, push one
+                if (!Array.isArray(b.trail)) b.trail = [];
+                const last = b.trail.length ? b.trail[b.trail.length - 1] : null;
+                const dx = last ? (newX - last.x) : (newX - b.x);
+                const dy = last ? (newY - last.y) : (newY - b.y);
+                if (!last || (dx*dx + dy*dy) > 9) { // ~3px threshold squared
+                    b.trail.push({ x: newX, y: newY });
+                    // Clamp trail length to bullet's trailMax if present or a sensible default
+                    const maxLen = (typeof b.trailMax === 'number') ? b.trailMax : 8;
+                    while (b.trail.length > maxLen) b.trail.shift();
+                }
+            } catch (e) {}
+            b.x = newX;
+            b.y = newY;
             // Optionally, smooth angle as well (if needed)
         }
     }
@@ -5876,6 +6035,14 @@ function update(dt) {
                         if (b.fireshot) {
                             let stacks = (b.owner && b.owner.fireshotStacks) ? b.owner.fireshotStacks : 1;
                             victim.burning = { time: 0, duration: 1.2 + 1.3 * stacks };
+                            try {
+                                if (NET && NET.role === 'host' && NET.connected) {
+                                    const payload = { duration: victim.burning.duration };
+                                    if (victim._rosterFighterId) payload.fighterId = victim._rosterFighterId;
+                                    else if (victim.id) payload.entityId = victim.id;
+                                    try { GameEvents.emit('burning-start', payload); } catch (e) {}
+                                }
+                            } catch (e) {}
                         }
                     }
                     b.active = false;
@@ -5899,6 +6066,14 @@ function update(dt) {
                         if (b.fireshot) {
                             const stacks = (b.owner && b.owner.fireshotStacks) ? b.owner.fireshotStacks : 1;
                             healer.burning = { time: 0, duration: 1.2 + 1.3 * stacks };
+                            try {
+                                if (NET && NET.role === 'host' && NET.connected) {
+                                    const payload = { duration: healer.burning.duration };
+                                    if (healer._rosterFighterId) payload.fighterId = healer._rosterFighterId;
+                                    else if (healer.id) payload.entityId = healer.id;
+                                    try { GameEvents.emit('burning-start', payload); } catch (e) {}
+                                }
+                            } catch (e) {}
                         }
                     }
                     b.active = false;
@@ -5929,6 +6104,11 @@ function update(dt) {
                         if (b.fireshot) {
                             let stacks = (b.owner && b.owner.fireshotStacks) ? b.owner.fireshotStacks : 1;
                             ic.burning = { time: 0, duration: 1.2 + 1.3 * stacks };
+                            try {
+                                if (NET && NET.role === 'host' && NET.connected) {
+                                    try { GameEvents.emit('burning-start', { infestedId: ic.id, duration: ic.burning.duration }); } catch (e) {}
+                                }
+                            } catch (e) {}
                         }
                         if (b.explosive) {
                             triggerExplosion(b, centerX, centerY);
@@ -6055,7 +6235,21 @@ function update(dt) {
                                 break;
                             }
                         } else {
-                            // no bounces left -> deactivate
+                            // no bounces left -> spawn impact lines and deactivate
+                            try {
+                                if (typeof createImpactLines === 'function') {
+                                    // compute a reasonable normal if we have a collision point
+                                    let nx = 0, ny = 0;
+                                    try { nx = b.x - (closestX || b.x); ny = b.y - (closestY || b.y); } catch (e) { nx = 0; ny = 0; }
+                                    let nlen = Math.hypot(nx, ny);
+                                    if (nlen === 0) { nx = (Math.random() - 0.5) || 0.0001; ny = (Math.random() - 0.5) || 0.0001; nlen = Math.hypot(nx, ny); }
+                                    nx /= nlen; ny /= nlen;
+                                    const baseAngle = Math.atan2(ny, nx);
+                                    createImpactLines(b.x, b.y, b.damage || 1, (b.owner && b.owner.color) ? b.owner.color : '#ffffff', baseAngle);
+                                    try { if (typeof playImpact === 'function') playImpact(b.damage || 1); } catch (e) {}
+                                    try { if (NET && NET.role === 'host') createSyncedImpact(b.x, b.y, b.damage || 1, (b.owner && b.owner.color) ? b.owner.color : '#ffffff', baseAngle); } catch (e) {}
+                                }
+                            } catch (e) {}
                             b.active = false;
                             break;
                         }
@@ -6108,7 +6302,20 @@ function update(dt) {
                             // continue to next bullet (don't deactivate)
                             break;
                         } else {
-                            // no bounces left -> behave as before
+                            // spawn impact lines at collision normal and deactivate
+                            try {
+                                if (typeof createImpactLines === 'function') {
+                                    let nx = b.x - closestX;
+                                    let ny = b.y - closestY;
+                                    let nlen = Math.hypot(nx, ny);
+                                    if (nlen === 0) { nx = (Math.random() - 0.5) || 0.0001; ny = (Math.random() - 0.5) || 0.0001; nlen = Math.hypot(nx, ny); }
+                                    nx /= nlen; ny /= nlen;
+                                    const baseAngle = Math.atan2(ny, nx);
+                                    createImpactLines(b.x, b.y, b.damage || 1, (b.owner && b.owner.color) ? b.owner.color : '#ffffff', baseAngle);
+                                    try { if (typeof playImpact === 'function') playImpact(b.damage || 1); } catch (e) {}
+                                    try { if (NET && NET.role === 'host') createSyncedImpact(b.x, b.y, b.damage || 1, (b.owner && b.owner.color) ? b.owner.color : '#ffffff', baseAngle); } catch (e) {}
+                                }
+                            } catch (e) {}
                             b.active = false;
                             break;
                         }
@@ -6130,9 +6337,9 @@ function update(dt) {
                 if (collidedChunk) {
                     b.pierceLimit--;
                     if (b.pierceLimit <= 0) {
-                        if (b.explosive) {
-                            triggerExplosion(b, b.x, b.y, o);
-                        }
+                        // Bullet expired due to pierce limit while inside an obstacle chunk.
+                        // Do NOT spawn impact lines, explosions, or play sounds in this case —
+                        // simply deactivate the bullet so it disappears silently.
                         b.active = false;
                         break;
                     }
@@ -6286,302 +6493,6 @@ function triggerExplosion(bullet, x, y) {
 }
 
 // --- Draw ---
-function draw() {
-    ctx.clearRect(0, 0, window.CANVAS_W, CANVAS_H);
-    if (MAP_BORDER) {
-        ctx.save();
-        ctx.strokeStyle = '#3d4550';
-        ctx.lineWidth = 6;
-        ctx.globalAlpha = 0.55;
-        ctx.strokeRect(3, 3, window.CANVAS_W-6, CANVAS_H-6);
-        ctx.restore();
-    }
-    for(let o of obstacles) o.draw(ctx);
-    // Draw healer pre-spawn indicator if pending
-    if (healerPendingRespawn && healerPreSpawnPos) {
-        // show only during final 2 seconds before spawn
-        const remaining = Math.max(0, (healerRespawnDelay || 0) - healerRespawnTimer);
-        if (remaining <= 2) {
-            const now = performance.now();
-            const pulse = 0.8 + 0.2 * Math.sin(now / 250); // slower, gentler pulse
-            ctx.save();
-            ctx.globalCompositeOperation = 'lighter';
-            const radius = 56 + 10 * Math.sin(now / 300);
-            const grad = ctx.createRadialGradient(healerPreSpawnPos.x, healerPreSpawnPos.y, 8, healerPreSpawnPos.x, healerPreSpawnPos.y, radius);
-            grad.addColorStop(0, `rgba(76,255,122,${0.42 * pulse})`);
-            grad.addColorStop(0.7, `rgba(76,255,122,${0.16 * pulse})`);
-            grad.addColorStop(1, 'rgba(76,255,122,0)');
-            ctx.fillStyle = grad;
-            ctx.beginPath();
-            ctx.arc(healerPreSpawnPos.x, healerPreSpawnPos.y, radius, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.restore();
-        }
-    }
-    // Draw firestorm pre-spawn indicator if pending
-    if (firestormPreSpawnPos) {
-        const now = performance.now();
-        const pulse = 0.8 + 0.2 * Math.sin(now / 200); // slightly faster pulse than healer
-        ctx.save();
-        ctx.globalCompositeOperation = 'lighter';
-        const radius = firestormPreSpawnPos.radius * 0.6 + 16 * Math.sin(now / 280);
-        const grad = ctx.createRadialGradient(firestormPreSpawnPos.x, firestormPreSpawnPos.y, 12, firestormPreSpawnPos.x, firestormPreSpawnPos.y, radius);
-        grad.addColorStop(0, `rgba(255,100,50,${0.45 * pulse})`);
-        grad.addColorStop(0.6, `rgba(255,150,80,${0.18 * pulse})`);
-        grad.addColorStop(1, 'rgba(255,100,50,0)');
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(firestormPreSpawnPos.x, firestormPreSpawnPos.y, radius, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-    }
-    if (healersActive) {
-        for (const healer of healers) {
-            if (!healer || !healer.active) continue;
-            healer.draw(ctx);
-        }
-    }
-    for(let b of bullets) {
-        ctx.save();
-        ctx.globalAlpha = 0.78;
-        ctx.fillStyle = b.owner.color;
-        ctx.beginPath();
-        ctx.arc(b.x, b.y, b.radius, 0, Math.PI*2);
-        ctx.fill();
-        // Fireshot: draw fire particles
-        if (b.fireshot) {
-            for (let i = 0; i < 4; ++i) {
-                let ang = Math.random() * Math.PI * 2;
-                let dist = b.radius * (0.7 + Math.random() * 0.6);
-                let px = b.x + Math.cos(ang) * dist;
-                let py = b.y + Math.sin(ang) * dist;
-                ctx.globalAlpha = 0.32 + Math.random() * 0.18;
-                ctx.beginPath();
-                ctx.arc(px, py, 2.2 + Math.random() * 2.2, 0, Math.PI*2);
-                ctx.fillStyle = `rgba(255,${180+Math.floor(Math.random()*60)},40,0.85)`;
-                ctx.shadowColor = '#ffb347';
-                ctx.shadowBlur = 8;
-                ctx.fill();
-                ctx.shadowBlur = 0;
-            }
-            ctx.globalAlpha = 0.78;
-        }
-        if (b.explosive) {
-            ctx.globalAlpha = 0.38;
-            ctx.shadowColor = "#fff";
-            ctx.shadowBlur = 18;
-            ctx.beginPath();
-            ctx.arc(b.x, b.y, b.radius*1.88, 0, Math.PI*2);
-            ctx.fillStyle = "#fff";
-            ctx.fill();
-            ctx.shadowBlur = 0;
-        }
-        ctx.restore();
-    }
-    for(let e of explosions) e.draw(ctx);
-    // Draw infested chunks
-    for(let ic of infestedChunks) {
-        ic.draw(ctx);
-    }
-    // Draw firestorm (always, for both host and joiner)
-    if (firestormInstance) {
-        firestormInstance.draw(ctx);
-    }
-    const enemySuppressedNow = isEnemySuppressedForGameplay();
-    const playerIsActive = isEntityActive(player);
-    const enemyIsActive = isEntityActive(enemy);
-    // Draw local 'player' entity unless it's the blue character in WM-without-AI (host view)
-    if (typeof player !== 'undefined' && player) {
-        const hostIsWMNow_A = NET.connected && worldMasterEnabled && ((((worldMasterPlayerIndex|0) === 0)) || (NET.role === 'host' && window.localPlayerIndex === -1));
-        const hidePlayerBlue = hostIsWMNow_A && worldMasterEnabled && enemySuppressedNow && (NET.role === 'host');
-    if (!hidePlayerBlue && playerIsActive) drawPlayer(player);
-    }
-    // Determine which character should be hidden based on WM mode and Enemy AI
-    const hostIsWM = NET.connected && worldMasterEnabled && (worldMasterPlayerIndex === 0);
-    const joinerIsWM = NET.connected && worldMasterEnabled && (worldMasterPlayerIndex === 1);
-    
-    // Host=blue, Joiner=red. Hide the non-WM character when Enemy AI is disabled
-    const hideBlueChar = hostIsWM && enemySuppressedNow;
-    const hideRedChar = joinerIsWM && enemySuppressedNow;
-    
-    // Draw enemy unless it should be hidden
-    if (!((NET.role === 'host' && hideRedChar) || (NET.role === 'joiner' && hideBlueChar))) {
-    if (typeof enemy !== 'undefined' && enemy && enemyIsActive) drawPlayer(enemy);
-    }
-
-    // Draw additional roster-assigned entity references (bots/extra fighters)
-    try {
-        if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
-            const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
-            for (const f of fighters) {
-                if (!f || !f.entity) continue;
-                const ent = f.entity;
-                // Skip main player/enemy already drawn
-                if (ent === player || ent === enemy) continue;
-                // Skip worldmaster placeholders
-                if (f.metadata && f.metadata.isWorldMaster) continue;
-                // Only draw if alive and not marked disabled
-                if (f.isAlive === false) continue;
-                if (!isEntityActive(ent)) continue;
-                try { drawPlayer(ent); } catch (e) {}
-            }
-        }
-    } catch (e) {}
-
-    // Draw match scoreboard for up to four roster slots (top-left, top-right, bottom-left, bottom-right)
-    function drawMatchScoreboard() {
-        try {
-            ctx.save();
-            ctx.font = "bold 22px sans-serif";
-            // If playerRoster is available prefer it; otherwise fall back to legacy player/enemy
-            const useRoster = (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getSlots === 'function');
-            if (!useRoster) {
-                // Legacy fallback for singleplayer/two-player setup
-                const pName = (player && (player.displayName || NET.myName)) || (NET.myName || 'Player 1');
-                const eName = (enemy && (enemy.displayName)) || (NET.peerName || 'Shot bot');
-                ctx.fillStyle = "#65c6ff";
-                ctx.fillText(pName + ": " + ((player && typeof player.score === 'number') ? player.score : '0'), 24, 34);
-                ctx.fillStyle = "#ff5a5a";
-                if (enemy) ctx.fillText(eName + ": " + ((enemy && typeof enemy.score === 'number') ? enemy.score : '0'), window.CANVAS_W - 220, 34);
-                ctx.restore();
-                return;
-            }
-
-            const slots = playerRoster.getSlots({ includeDetails: true }) || [];
-            // Positions for up to 4 visible fighters
-            const positions = [
-                { x: 24, y: 34, align: 'left' },
-                { x: window.CANVAS_W - 220, y: 34, align: 'right' },
-                { x: 24, y: window.CANVAS_H - 12, align: 'left' },
-                { x: window.CANVAS_W - 220, y: window.CANVAS_H - 12, align: 'right' }
-            ];
-
-            for (let i = 0; i < Math.min(4, slots.length); ++i) {
-                const slot = slots[i] || {};
-                const fighter = slot.fighter || null;
-                if (!fighter) continue;
-                // Skip drawing a WorldMaster metadata placeholder here
-                if (fighter.metadata && fighter.metadata.isWorldMaster) continue;
-                const pos = positions[i];
-                const name = fighter.displayName || fighter.name || (`Slot ${i+1}`);
-                const score = (typeof fighter.score === 'number') ? fighter.score : 0;
-                const color = (typeof getRosterFighterColor === 'function') ? (getRosterFighterColor(i, fighter) || '#fff') : '#fff';
-                ctx.fillStyle = color;
-                if (pos.align === 'right') {
-                    ctx.textAlign = 'right';
-                    ctx.fillText(name + ": " + score, pos.x, pos.y);
-                    ctx.textAlign = 'left';
-                } else {
-                    ctx.textAlign = 'left';
-                    ctx.fillText(name + ": " + score, pos.x, pos.y);
-                }
-            }
-            ctx.restore();
-        } catch (err) {
-            try { ctx.restore(); } catch (e) {}
-        }
-    }
-
-    drawMatchScoreboard();
-
-    drawCardsUI();
-}
-
-function drawPlayer(p) {
-    // Prefer instance draw() when available (it renders aura/particles/heal flash)
-    try {
-        if (p && typeof p.draw === 'function') {
-            p.draw(ctx);
-        }
-    } catch (e) { /* defensive: fallback to legacy drawing below if draw() errors */ }
-
-    ctx.save();
-    let shakeX = 0, shakeY = 0;
-    if (p.shakeTime > 0) {
-        let mag = p.shakeMag * (p.shakeTime / 0.18);
-        shakeX = rand(-mag, mag);
-        shakeY = rand(-mag, mag);
-    }
-    let cdFrac = Math.min(1, p.timeSinceShot / p.shootInterval);
-    if (cdFrac < 1) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(p.x + shakeX, p.y + shakeY, p.radius + 7, -Math.PI/2, -Math.PI/2 + Math.PI*2*cdFrac, false);
-        ctx.strokeStyle = p.color;
-        ctx.globalAlpha = 0.48;
-        ctx.lineWidth = 4.2;
-        ctx.shadowColor = p.color;
-        ctx.shadowBlur = 2;
-        ctx.stroke();
-        // Always draw the black base circle underneath the cooldown ring
-    ctx.globalAlpha = 1;
-    ctx.shadowBlur = 0;
-    ctx.beginPath();
-    ctx.arc(p.x + shakeX, p.y + shakeY, p.radius + 7, -Math.PI/2, -Math.PI/2 + Math.PI*2*cdFrac, false);
-    ctx.strokeStyle = "#222";
-    ctx.lineWidth = 2.5;
-    ctx.stroke();
-        ctx.restore();
-    }
-
-    // Draw dash cooldown only (do not show dash-progress while dashing)
-    try {
-        let dashSet = getDashSettings(p);
-        let ringFrac = null;
-        let ringColor = '#ffd86b';
-        let ringGlow = '#ffd86b';
-        let ringAlpha = 0.62;
-        const isTele = isTeledashEnabled(p);
-        if (isTele && p.teledashWarmupActive && (dashSet.warmup || 0) > 0) {
-            const warmupTotal = Math.max(0.001, p.teledashWarmupTime || dashSet.warmup || 0);
-            ringFrac = clamp((p.teledashWarmupElapsed || 0) / warmupTotal, 0, 1);
-            // Use the same yellow used for dash cooldown rings so warmup matches player's dash UI
-            ringColor = 'rgba(200,220,255,0.9)';
-            ringGlow = 'rgba(200,220,255,0.9)';
-            ringAlpha = 0.62;
-        } else if ((dashSet.cooldown || 0) > 0 && p.dashCooldown > 0) {
-            // Prefer authoritative max cooldown from host snapshot when available (joiner)
-            const maxCd = (typeof p.dashCooldownMax === 'number' && p.dashCooldownMax > 0) ? p.dashCooldownMax : dashSet.cooldown;
-            ringFrac = 1 - clamp(p.dashCooldown / maxCd, 0, 1);
-        }
-        if (ringFrac !== null && ringFrac > 0) {
-            ctx.save();
-            ctx.beginPath();
-            ctx.arc(p.x + shakeX, p.y + shakeY, p.radius + 13, -Math.PI/2, -Math.PI/2 + Math.PI*2*ringFrac, false);
-            ctx.strokeStyle = ringColor;
-            ctx.globalAlpha = ringAlpha;
-            ctx.lineWidth = 3.6;
-            ctx.shadowColor = ringGlow;
-            ctx.shadowBlur = ringColor === '#6ecbff' ? 7 : 6;
-            ctx.stroke();
-            ctx.restore();
-        }
-    } catch (e) { /* defensive: if something unexpected, ignore dash UI */ }
-    ctx.globalAlpha = 1;
-    ctx.shadowBlur = 0;
-    ctx.strokeStyle = "#222";
-    ctx.lineWidth = 2.5;
-    ctx.stroke();
-    const healthBarBaseW = 54;
-    let w = Math.max(18, healthBarBaseW * Math.sqrt((p.healthMax || window.HEALTH_MAX) / window.HEALTH_MAX));
-    let h = 10;
-    let x = p.x - w/2 + shakeX, y = p.y - p.radius - 18 + shakeY;
-    ctx.save();
-    if (p.healthbarFlash > 0) {
-        let t = Math.min(1, p.healthbarFlash / 0.45);
-        ctx.shadowColor = "#fff";
-        ctx.shadowBlur = 16 * t;
-    }
-    ctx.fillStyle = "#222";
-    ctx.fillRect(x, y, w, h);
-    ctx.fillStyle = "#56ff7a";
-    ctx.fillRect(x, y, w * clamp(p.health/p.healthMax, 0, 1), h);
-    ctx.strokeStyle = "#000";
-    ctx.strokeRect(x, y, w, h);
-    ctx.restore();
-    ctx.restore();
-}
-
 // --- Powerup Cards ---
 function buildPowerupChoices(loser, desiredCount = 5) {
     let powerupPool = POWERUPS;
@@ -6642,6 +6553,7 @@ function showPowerupCards(loser, options = {}) {
     })();
     const fighterIdFromOptions = (options && options.fighterId != null) ? String(options.fighterId) : null;
     const slotIndexFromOptions = (options && typeof options.slotIndex === 'number') ? options.slotIndex : null;
+    const joinerIndexFromOptions = coerceJoinerIndex(options ? options.joinerIndex : null);
     let fighterRecord = null;
     if (fighterIdFromOptions && playerRoster && typeof playerRoster.getFighterById === 'function') {
         try { fighterRecord = playerRoster.getFighterById(fighterIdFromOptions, { includeEntity: true }) || null; } catch (err) { fighterRecord = null; }
@@ -6652,7 +6564,7 @@ function showPowerupCards(loser, options = {}) {
     const fighterMetadata = (fighterRecord && fighterRecord.metadata) ? fighterRecord.metadata : {};
     const fighterKind = fighterRecord ? fighterRecord.kind : null;
     const controlTag = (fighterMetadata && typeof fighterMetadata.control === 'string') ? fighterMetadata.control : null;
-    const joinerIndexMeta = (fighterMetadata && Number.isInteger(fighterMetadata.joinerIndex)) ? fighterMetadata.joinerIndex : null;
+    const joinerIndexMeta = fighterMetadata ? coerceJoinerIndex(fighterMetadata.joinerIndex) : null;
     const resolvedSlotIndex = (slotIndexFromOptions !== null && slotIndexFromOptions !== undefined)
         ? slotIndexFromOptions
         : (fighterRecord && typeof fighterRecord.slotIndex === 'number' ? fighterRecord.slotIndex : null);
@@ -6661,7 +6573,7 @@ function showPowerupCards(loser, options = {}) {
         if (typeof NET !== 'undefined' && NET && NET.connected) {
             if (NET.role === 'host') {
                 if (chooserRole === 'joiner') return true;
-                if (Number.isInteger(joinerIndexMeta)) return true;
+                if (joinerIndexMeta !== null) return true;
             } else if (NET.role === 'joiner') {
                 if (chooserRole === 'host' && controlTag === 'remote-host') return true;
             }
@@ -6704,7 +6616,8 @@ function showPowerupCards(loser, options = {}) {
             choices: choiceNames,
             chooserRole: chooserRole || null,
             fighterId: fighterIdFromOptions || (fighterRecord && fighterRecord.id != null ? String(fighterRecord.id) : null),
-            slotIndex: resolvedSlotIndex
+            slotIndex: resolvedSlotIndex,
+            joinerIndex: joinerIndexFromOptions != null ? joinerIndexFromOptions : joinerIndexMeta
         };
     } catch (err) {}
 
@@ -6920,6 +6833,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
     const options = opts || {};
     const fighterId = options && options.fighterId != null ? String(options.fighterId) : null;
     const slotIndex = (options && typeof options.slotIndex === 'number') ? options.slotIndex : null;
+    const joinerIndexFromOptions = (options && Number.isInteger(options.joinerIndex)) ? options.joinerIndex : null;
     // chooserRole: 'host' or 'joiner'
     // Map to the correct local entity so color usage is correct on clients; prefer fighterId when provided
     let loser = null;
@@ -6962,6 +6876,23 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
         return;
     }
     const slotIndexForMessage = (typeof slotIndex === 'number') ? slotIndex : (loserRecord && typeof loserRecord.slotIndex === 'number' ? loserRecord.slotIndex : null);
+    const joinerIndexForMessage = (() => {
+        if (joinerIndexFromOptions !== null) return joinerIndexFromOptions;
+        if (loserRecord && loserRecord.metadata) {
+            const metaIdx = coerceJoinerIndex(loserRecord.metadata.joinerIndex);
+            if (metaIdx !== null) return metaIdx;
+        }
+        if (typeof resolveJoinerIndexForSlot === 'function' && typeof slotIndexForMessage === 'number') {
+            const idx = coerceJoinerIndex(resolveJoinerIndexForSlot(slotIndexForMessage));
+            if (idx !== null) return idx;
+        }
+        if (typeof resolveJoinerIndexForEntity === 'function' && loser) {
+            const idx = coerceJoinerIndex(resolveJoinerIndexForEntity(loser));
+            if (idx !== null) return idx;
+        }
+        return null;
+    })();
+    const joinerIndexPayload = coerceJoinerIndex(joinerIndexForMessage);
     const fighterIdForMessage = (() => {
         if (fighterId) return fighterId;
         if (loserRecord && loserRecord.id != null) return String(loserRecord.id);
@@ -7160,7 +7091,23 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
     }
 
     // Networked clients: decide if this chooser is local
-    const isMe = (chooserRole === NET.role);
+    let isMe = false;
+    if (typeof NET === 'undefined' || !NET || !NET.connected) {
+        isMe = chooserRole === 'host';
+    } else if (NET.role === 'host') {
+        isMe = chooserRole === 'host';
+    } else if (NET.role === 'joiner') {
+        if (chooserRole === 'joiner') {
+            const joinerIdx = Number.isInteger(NET.joinerIndex) ? NET.joinerIndex : null;
+            if (joinerIndexFromOptions !== null) {
+                isMe = joinerIdx !== null && joinerIdx === joinerIndexFromOptions;
+            } else {
+                isMe = false;
+            }
+        } else {
+            isMe = false;
+        }
+    }
     const resolvedSlotIndex = (typeof slotIndex === 'number') ? slotIndex : (loserRecord && typeof loserRecord.slotIndex === 'number' ? loserRecord.slotIndex : null);
     const localFighterIdStr = (() => {
         try { return (typeof localFighterId !== 'undefined' && localFighterId !== null) ? String(localFighterId) : null; } catch (err) { return null; }
@@ -7175,6 +7122,13 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                 if (typeof getJoinerSlotIndex === 'function') return getJoinerSlotIndex(joinerIdx);
                 return joinerIdx + 1;
             }
+        } catch (err) {}
+        return null;
+    })();
+    const localJoinerIndex = (() => {
+        try {
+            if (typeof NET === 'undefined' || !NET || !NET.connected) return null;
+            if (NET.role === 'joiner' && Number.isInteger(NET.joinerIndex)) return NET.joinerIndex;
         } catch (err) {}
         return null;
     })();
@@ -7200,11 +7154,12 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
     const slotMatchesLocal = !!(localSlotIndex !== null && resolvedSlotIndex !== null && localSlotIndex === resolvedSlotIndex);
     const fighterIdMatchesLocal = !!(localFighterIdStr && fighterId && localFighterIdStr === fighterId);
     const externalIdMatchesLocal = !!(localExternalId && loserRecord && typeof loserRecord.externalId === 'string' && loserRecord.externalId === localExternalId);
+    const joinerMatchesLocal = !!(joinerIndexFromOptions !== null && localJoinerIndex !== null && joinerIndexFromOptions === localJoinerIndex);
     const metadataSuggestsLocal = (() => {
         if (!loserRecord || !loserRecord.metadata) return false;
         const meta = loserRecord.metadata;
         const control = typeof meta.control === 'string' ? meta.control : null;
-        const metaJoinerIndex = Number.isInteger(meta.joinerIndex) ? meta.joinerIndex : null;
+        const metaJoinerIndex = coerceJoinerIndex(meta.joinerIndex);
         if (typeof NET === 'undefined' || !NET || !NET.connected) {
             return control === 'local';
         }
@@ -7213,12 +7168,15 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
             return false;
         }
         if (NET.role === 'joiner') {
-            if (chooserRole === 'joiner' && Number.isInteger(NET.joinerIndex) && metaJoinerIndex === NET.joinerIndex) return true;
+            if (chooserRole === 'joiner' && Number.isInteger(NET.joinerIndex)) {
+                if (metaJoinerIndex === NET.joinerIndex) return true;
+                if (joinerIndexFromOptions !== null && NET.joinerIndex === joinerIndexFromOptions) return true;
+            }
             return false;
         }
         return false;
     })();
-    let isLocalChooser = isMe || entityMatchesLocal || slotMatchesLocal || fighterIdMatchesLocal || externalIdMatchesLocal || metadataSuggestsLocal;
+    let isLocalChooser = isMe || entityMatchesLocal || slotMatchesLocal || fighterIdMatchesLocal || externalIdMatchesLocal || joinerMatchesLocal || metadataSuggestsLocal;
     if (!isLocalChooser && typeof NET !== 'undefined' && NET && NET.role === 'joiner' && chooserRole === 'host') {
         // Fallback: if roster record maps to our slot even though chooserRole disagrees, treat as local
         if (localSlotIndex !== null && resolvedSlotIndex === localSlotIndex) {
@@ -7360,7 +7318,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                     try { opt.effect(loser); loser.addCard(opt.name); } catch (e) {}
                     try {
                         if (window.ws && window.ws.readyState === WebSocket.OPEN) {
-                            window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage } }));
+                            window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage, joinerIndex: joinerIndexPayload } }));
                         }
                     } catch (e) {}
                     closeLocalChooser();
@@ -7393,7 +7351,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                 } else {
                     try {
                         if (window.ws && window.ws.readyState === WebSocket.OPEN) {
-                            window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-pick', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage } }));
+                            window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-pick', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage, joinerIndex: joinerIndexPayload } }));
                         }
                     } catch (e) {}
                     closeLocalChooser();
@@ -7402,7 +7360,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
             }
             if (!NET.connected || (NET.role === 'host' && chooserRole === 'host')) {
                 try { opt.effect(loser); loser.addCard(opt.name); } catch (e) {}
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage } })); } catch (e) {}
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage, joinerIndex: joinerIndexPayload } })); } catch (e) {}
                 div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible');
                 cardState.active = false;
                 const hadPending3 = !!window._pendingWorldModOffer;
@@ -7423,7 +7381,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                     } catch (e) {}
                 }
             } else {
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-pick', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage } })); } catch (e) {}
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-pick', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage, joinerIndex: joinerIndexPayload } })); } catch (e) {}
                 div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible');
                 // keep waitingForCard true until apply arrives
             }
@@ -7459,7 +7417,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                 const opt = choices[idx];
                 if (!opt) return;
                 try { opt.effect(loser); loser.addCard(opt.name); } catch (e) {}
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage } })); } catch (e) {}
+                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-apply', pickerRole: chooserRole, card: opt.name, fighterId: fighterIdForMessage, slotIndex: slotIndexForMessage, joinerIndex: joinerIndexPayload } })); } catch (e) {}
                 try {
                     div.style.display = 'none';
                     div.innerHTML = '';
@@ -7904,12 +7862,26 @@ function updateCardsUI() {
 
     // slot 0 (host/blue)
     if (slots[0] && slots[0].fighter) {
-        const label = topLabel1 || `${hostName} Cards:`;
+        // If label maps to a generic 'Shot bot' and the slot actually holds a bot,
+        // prefer the bot's configured name so card badges show the updated name.
+        let label = topLabel1 || `${hostName} Cards:`;
+        try {
+            const f0 = slots[0].fighter;
+            if (f0 && f0.kind === 'bot' && /shot bot/i.test((label || '').toLowerCase()) ) {
+                label = (f0.name || `Bot 1`) + ' Cards:';
+            }
+        } catch (e) {}
         writeRow(slotRows[0], `<span style=\"color:#65c6ff;\">${label}</span>`, topList1 || '<span class="card-badge none">None</span>');
     }
     // slot 1 (joiner/red)
     if (slots[1] && slots[1].fighter) {
-        const label = topLabel2 || `${joinerName} Cards:`;
+        let label = topLabel2 || `${joinerName} Cards:`;
+        try {
+            const f1 = slots[1].fighter;
+            if (f1 && f1.kind === 'bot' && /shot bot/i.test((label || '').toLowerCase()) ) {
+                label = (f1.name || `Bot 2`) + ' Cards:';
+            }
+        } catch (e) {}
         writeRow(slotRows[1], `<span style=\"color:#ff5a5a;\">${label}</span>`, topList2 || '<span class="card-badge none">None</span>');
     }
     // slots 2..3 (yellow/green)
@@ -8085,1698 +8057,6 @@ function drawCardsUI() {
 }
 
 // --- Setup Overlay Logic ---
-function setupOverlayInit() {
-    // --- Multiplayer WebSocket logic ---
-    // Make networking vars global so update() can access them reliably
-    window.ws = null;
-    window.wsRole = null; // 'host' or 'joiner'
-    window.wsSession = null;
-    window.remotePlayerState = { x: 0, y: 0, shoot: false, dash: false };
-    window.lastSentAction = {};
-    // Configurable server URL: prefer ?ws=, otherwise try same origin, fallback to localhost
-    const paramWs = new URLSearchParams(window.location.search).get('ws');
-    const defaultWs = (location.protocol === 'https:' ? 'wss://' : 'ws://') + (location.hostname || 'localhost') + ':3001';
-    window.MULTIPLAYER_WS_URL = paramWs || defaultWs;
-
-    window.sendAction = function(action) {
-        if (window.ws && window.ws.readyState === WebSocket.OPEN) {
-            window.ws.send(JSON.stringify({ type: 'relay', data: action }));
-        }
-    };
-
-    function handleGameMessage(data) {
-        // --- WorldMaster network protocol extension ---
-        if (data && data.type === 'worldmaster-card-toggle') {
-            // Sync card deck enable/disable states
-            // Example: { type: 'worldmaster-card-toggle', cardType: 'mod'|'powerup', name, enabled }
-            if (window.gameWorldMaster && typeof window.gameWorldMaster.syncCardDecksFromNet === 'function') {
-                window.gameWorldMaster.syncCardDecksFromNet(data);
-            }
-            return;
-        }
-        if (data && data.type === 'worldmaster-control') {
-            // Sync which effect is being manually controlled
-            // Example: { type: 'worldmaster-control', effectName }
-            if (window.gameWorldMaster && typeof window.gameWorldMaster.syncControlStateFromNet === 'function') {
-                window.gameWorldMaster.syncControlStateFromNet(data);
-            }
-            return;
-        }
-        if (data && data.type === 'worldmaster-action') {
-            // Sync manual effect activations (click locations)
-            // Example: { type: 'worldmaster-action', effectName, x, y }
-            // If a WM instance exists locally (e.g., on the WM client), use its handler first.
-            // In cases where the stub exists but no instance is present (host not WM), fall back to host execution.
-            let handledByWM = false;
-            if (window.gameWorldMaster && typeof window.gameWorldMaster.syncActionFromNet === 'function') {
-                const hadInstance = !!window.gameWorldMasterInstance;
-                window.gameWorldMaster.syncActionFromNet(data);
-                handledByWM = !!window.gameWorldMasterInstance && !window.gameWorldMasterInstance.isLocal;
-                // Note: when host is not WM, there is no instance, so handledByWM remains false
-            }
-            if (!handledByWM) {
-                try {
-                    if (NET && NET.role === 'host') {
-                        const eff = (data.effectName || '').toString();
-                        const x = Number(data.x), y = Number(data.y);
-                        // Execute based on effect
-                        if (eff === 'Firestorm') {
-                            try {
-                                // Increase manual/manual-triggered Firestorm default radius from 140 to 200
-                                firestormInstance = new Firestorm(x, y, 200);
-                                firestormActive = true; firestormTimer = 0;
-                                // Emit actual radius value (was incorrectly hardcoded to 140)
-                                GameEvents.emit('firestorm-spawn', { x, y, radius: 200 });
-                            } catch (e) {}
-                        } else if (eff === 'Spontaneous') {
-                            // Find obstacle at x,y and create explosion
-                            try {
-                                for (let oi = 0; oi < (obstacles||[]).length; oi++) {
-                                    const o = obstacles[oi];
-                                    if (!o || o.destroyed) continue;
-                                    const inBox = (x >= o.x && x <= o.x + o.w && y >= o.y && y <= o.y + o.h);
-                                    const cx = o.x + o.w/2, cy = o.y + o.h/2;
-                                    const near = Math.hypot(x - cx, y - cy) <= Math.max(o.w, o.h) * 0.8;
-                                    if (inBox || near) {
-                                        const cx = o.x + o.w/2, cy = o.y + o.h/2;
-                                        const r = Math.max(o.w, o.h) * 1.0 + 50;
-                                        const dmg = 36;
-                                        explosions.push(new Explosion(cx, cy, r, '#ff6b4a', dmg, null, false));
-                                        for (const c of o.chunks) { if (!c.destroyed) { const ang = Math.atan2(c.y + c.h/2 - cy, c.x + c.w/2 - cx) + (Math.random()-0.5)*0.8; const v = 200 + Math.random()*180; c.vx = Math.cos(ang)*v; c.flying = true; c.destroyed = true; c.alpha = 1; } }
-                                        o.destroyed = true;
-                                        try { createSyncedChunkUpdate(oi, o.chunks.map((cc, idx) => ({ i: idx, destroyed: !!cc.destroyed, flying: !!cc.flying, vx: cc.vx||0, vy: cc.vy||0, alpha: cc.alpha||1, x: cc.x, y: cc.y }))); } catch (e) {}
-                                        try { createSyncedExplosion(cx, cy, r, '#ff6b4a', dmg, null); } catch (e) {}
-                                        try { playExplosion(); } catch (e) {}
-                                        break;
-                                    }
-                                }
-                            } catch (e) {}
-                        } else if (eff === 'Infestation') {
-                            try {
-                                for (let oi = 0; oi < (obstacles||[]).length; oi++) {
-                                    const obs = obstacles[oi];
-                                    if (!obs || !obs.chunks) continue;
-                                    for (let ci = 0; ci < obs.chunks.length; ci++) {
-                                        const c = obs.chunks[ci];
-                                        if (!c || c.destroyed) continue;
-                                        if (x >= c.x && x <= c.x + c.w && y >= c.y && y <= c.y + c.h) {
-                                            // Enforce max active infested chunks
-                                            try {
-                                                const activeCount = (infestedChunks || []).filter(ic => ic && ic.active).length;
-                                                if (activeCount < 10) {
-                                                    const inf = new InfestedChunk(c, obs);
-                                                    infestedChunks.push(inf);
-                                                }
-                                            } catch (e) {
-                                                const inf = new InfestedChunk(c, obs);
-                                                infestedChunks.push(inf);
-                                            }
-                                            try {
-                                                if (typeof inf !== 'undefined' && inf) {
-                                                    GameEvents.emit('infestation-spawn', { obstacleIndex: oi, chunkIndex: ci, id: inf.id, x: inf.x, y: inf.y, w: inf.w, h: inf.h, hp: inf.hp });
-                                                }
-                                            } catch (e) {}
-                                            oi = obstacles.length; break;
-                                        }
-                                    }
-                                }
-                            } catch (e) {}
-                        } else if (eff === 'Dynamic' || eff === 'Dynamic-Spawn' || eff === 'Dynamic-Despawn') {
-                            // Equal in/out behavior: keep total live obstacles constant
-                            try {
-                                const enemySuppressed = isEnemySuppressedForGameplay();
-                                // Destroy helper
-                                const destroyIdx = (idx) => {
-                                    const o = obstacles[idx]; if (!o || o.destroyed) return false;
-                                    for (const c of o.chunks) { if (!c.destroyed) { c.destroyed = true; c.flying = true; c.vx = rand(-140,140); c.vy = rand(-240,-40); c.alpha = 1; } }
-                                    o.destroyed = true; try { GameEvents.emit('dynamic-despawn', { obstacleIndex: idx }); } catch (e) {}
-                                    return true;
-                                };
-                                // Create helper
-                                const makeAt = (px, py) => {
-                                    // Try multiple attempts to find a non-overlapping location near px,py
-                                    for (let attempt = 0; attempt < 40; attempt++) {
-                                        const size = rand(OBSTACLE_MIN_SIZE, OBSTACLE_MAX_SIZE);
-                                        const w = size, h = size;
-                                        // jitter around desired px,py a bit
-                                        const jitterX = px + rand(-40, 40);
-                                        const jitterY = py + rand(-40, 40);
-                                        let nx = Math.max(60, Math.min(window.CANVAS_W - 60 - w, jitterX - w/2));
-                                        let ny = Math.max(60, Math.min(CANVAS_H - 60 - h, jitterY - h/2));
-                                        const candidate = new Obstacle(nx, ny, w, h);
-                                        const centerX = nx + w/2, centerY = ny + h/2;
-                                        let safe = true;
-                                        for (let k = 0; k < obstacles.length; k++) {
-                                            const o2 = obstacles[k];
-                                            if (!o2) continue;
-                                            if (!o2.destroyed && rectsOverlap(o2, candidate)) { safe = false; break; }
-                                        }
-                                        if (!safe) continue;
-                                        if (dist(centerX, centerY, player.x, player.y) <= 90) safe = false;
-                                        if (!enemySuppressed && dist(centerX, centerY, enemy.x, enemy.y) <= 90) safe = false;
-                                        if (!safe) continue;
-                                        return candidate;
-                                    }
-                                    // Failed to find safe spot
-                                    return null;
-                                };
-                                // Find clicked obstacle
-                                let clicked = -1;
-                                for (let oi = 0; oi < (obstacles||[]).length; oi++) {
-                                    const o = obstacles[oi]; if (!o || o.destroyed) continue;
-                                    if (x >= o.x && x <= o.x + o.w && y >= o.y && y <= o.y + o.h) { clicked = oi; break; }
-                                }
-                                if (clicked >= 0) {
-                                    // Remove clicked (mark chunks flying) and append a new obstacle elsewhere so flying chunks remain visible
-                                    destroyIdx(clicked);
-                                    const newObs = makeAt(rand(80, window.CANVAS_W-80), rand(80, CANVAS_H-80));
-                                    if (newObs) {
-                                        obstacles.push(newObs);
-                                        try { GameEvents.emit('dynamic-spawn', { obstacleIndex: obstacles.indexOf(newObs), obstacle: { x: newObs.x, y: newObs.y, w: newObs.w, h: newObs.h } }); } catch (e) {}
-                                    }
-                                } else {
-                                    // Empty space: spawn at click, remove a random live obstacle (mark destroyed but keep it for visuals)
-                                    const liveIdx = obstacles.map((o,i)=>(!o||o.destroyed)?-1:i).filter(i=>i>=0);
-                                    if (liveIdx.length > 0) {
-                                        const remIdx = liveIdx[Math.floor(Math.random()*liveIdx.length)];
-                                        const newObs = makeAt(x, y);
-                                        if (newObs) {
-                                            destroyIdx(remIdx);
-                                            obstacles.push(newObs);
-                                            try { GameEvents.emit('dynamic-spawn', { obstacleIndex: obstacles.indexOf(newObs), obstacle: { x: newObs.x, y: newObs.y, w: newObs.w, h: newObs.h } }); } catch (e) {}
-                                        }
-                                    }
-                                }
-                            } catch (e) {}
-                        }
-                    }
-                } catch (e) { console.warn('Failed to execute WM action on host fallback', e); }
-            }
-            return;
-        }
-        // Remote focus from WM chooser hover (visual only)
-        if (data && data.type === 'mod-focus') {
-            try {
-                const idx = (typeof data.idx === 'number') ? data.idx : -1;
-                const div = document.getElementById('card-choices');
-                if (!div) return;
-                // Record forced focus on the div so clearAll respects it
-                div._forceFocus = idx >= 0 ? idx : -1;
-                // Clear existing hover highlights except the forced one
-                for (let c of div.childNodes) {
-                    try {
-                        const ci = Array.prototype.indexOf.call(div.childNodes, c);
-                        if (div._forceFocus >= 0 && ci === div._forceFocus) continue;
-                        c.style.removeProperty('border');
-                        c.style.removeProperty('box-shadow');
-                        c.style.removeProperty('color');
-                        const sm = c.querySelector('small'); if (sm) sm.style.removeProperty('color');
-                        const hb = c.querySelector('b'); if (hb) hb.style.removeProperty('color');
-                        if (c._accentClass) c.classList.remove(c._accentClass);
-                        if (c._accentStyle) { c._accentStyle.remove(); c._accentStyle = null; }
-                        c.style.transform = 'none';
-                        c.style.zIndex = 1;
-                    } catch (e) {}
-                }
-                if (idx >= 0 && div.childNodes[idx]) {
-                    const card = div.childNodes[idx];
-                    try {
-                        const accent = '#a06cc7';
-                        const textColor = '#b48be6';
-                        card.style.transform = 'scale(1.13)';
-                        card.style.zIndex = 10;
-                        card.style.setProperty('border', `3px solid ${accent}`, 'important');
-                        card.style.setProperty('box-shadow', `0 6px 18px ${accent}`, 'important');
-                        card.style.setProperty('color', textColor, 'important');
-                        const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', textColor, 'important');
-                        const hb = card.querySelector('b'); if (hb) hb.style.setProperty('color', textColor, 'important');
-                        if (!card._accentClass) card._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
-                        if (!card._accentStyle) {
-                            const styleEl = document.createElement('style');
-                            styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${accent}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${accent}55 0%, #0000 100%) !important; }`;
-                            document.head.appendChild(styleEl);
-                            card._accentStyle = styleEl;
-                        }
-                        card.classList.add(card._accentClass);
-                    } catch (e) {}
-                }
-            } catch (e) {}
-            return;
-        }
-        // Update remote player state
-        if (typeof data.x === 'number' && typeof data.y === 'number') {
-            remotePlayerState.x = data.x;
-            remotePlayerState.y = data.y;
-        }
-        if (data.shoot) remotePlayerState.shoot = true;
-        if (data.dash) remotePlayerState.dash = true;
-    }
-
-    // Patch ws.onmessage to use handleGameMessage
-    function patchWsOnMessage() {
-        if (!window.ws) return;
-        window.ws.onmessage = function(event) {
-            let msg;
-            try { msg = JSON.parse(event.data); } catch (e) { return; }
-            if (msg.type === 'error') {
-                const message = (msg && msg.message) ? msg.message : 'An error occurred while communicating with the server.';
-                alert(message);
-                return;
-            }
-            if (msg.type === 'hosted') {
-                if (mpSessionCode) mpSessionCode.value = msg.code;
-                if (typeof setMpSessionDisplay === 'function') setMpSessionDisplay(msg.code);
-                window.wsSession = msg.code;
-                if (!NET.hostName) NET.hostName = NET.myName || 'Host';
-                try {
-                    if (typeof setLobbyPlayers === 'function') {
-                        setLobbyPlayers(NET.myName || 'Player 1', NET.getJoinerName(0) || NET.peerName || 'Player 2');
-                    }
-                } catch (e) {}
-                try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
-                try { updateWorldMasterSetupUI(); } catch (e) {}
-            } else if (msg.type === 'joined') {
-                hideMpModal();
-                alert('Joined session: ' + msg.code);
-                window.wsSession = msg.code;
-                if (mpSessionCode) mpSessionCode.value = msg.code;
-                if (typeof setMpSessionDisplay === 'function') setMpSessionDisplay(msg.code);
-                const idx = (typeof msg.joinerIndex === 'number' && msg.joinerIndex >= 0) ? msg.joinerIndex : null;
-                NET.joinerIndex = idx;
-                if (idx !== null) {
-                    const localName = NET.pendingName || NET.myName || '';
-                    if (localName) {
-                        NET.updateJoinerName(idx, localName, { control: 'local' });
-                    }
-                }
-                if (NET.pendingName) {
-                    NET.myName = NET.pendingName;
-                    NET.pendingName = '';
-                }
-                sendLocalDisplayName();
-                try {
-                    if (typeof setLobbyPlayers === 'function') {
-                        const hostLabel = NET.hostName || NET.peerName || 'Host';
-                        setLobbyPlayers(hostLabel, NET.myName || 'Player 2');
-                    }
-                } catch (e) {}
-                try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
-                try { updateWorldMasterSetupUI(); } catch (e) {}
-                try { renderRosterUI(); } catch (e) {}
-            } else if (msg.type === 'peer-joined') {
-                hideMpModal();
-                const idx = (typeof msg.joinerIndex === 'number' && msg.joinerIndex >= 0) ? msg.joinerIndex : 0;
-                if (NET.role === 'host') {
-                    alert('A player has joined your session!' + (Number.isInteger(idx) ? ` (Slot ${idx + 2})` : ''));
-                    const existingName = NET.getJoinerName(idx);
-                    const placeholder = existingName || `Joiner ${idx + 1}`;
-                    NET.updateJoinerName(idx, placeholder, { control: 'remote' });
-                    assignRemoteJoinerToRoster(idx, placeholder, { isPending: true });
-                    sendLocalDisplayName();
-                    try { broadcastRosterSnapshot(); } catch (e) {}
-                } else {
-                    if (idx !== NET.joinerIndex) {
-                        const existingName = NET.getJoinerName(idx);
-                        NET.updateJoinerName(idx, existingName || `Joiner ${idx + 1}`, { control: 'remote' });
-                    }
-                }
-                try {
-                    if (typeof setLobbyPlayers === 'function') {
-                        const hostLabel = NET.role === 'host' ? (NET.myName || 'Host') : (NET.hostName || NET.peerName || 'Host');
-                        const joinerLabel = NET.role === 'host' ? (NET.getJoinerName(0) || NET.peerName || 'Joiner') : (NET.myName || 'Player 2');
-                        setLobbyPlayers(hostLabel, joinerLabel);
-                    }
-                } catch (e) {}
-                try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
-                try { updateWorldMasterSetupUI(); } catch (e) {}
-                try { renderRosterUI(); } catch (e) {}
-            } else if (msg.type === 'peer-left') {
-                const idx = (typeof msg.joinerIndex === 'number' && msg.joinerIndex >= 0) ? msg.joinerIndex : null;
-                if (idx !== null) {
-                    if (NET.role === 'host') {
-                        try { clearRemoteJoinerFromRoster(idx); } catch (e) {}
-                        try { broadcastRosterSnapshot(); } catch (e) {}
-                    }
-                    NET.removeJoiner(idx);
-                }
-                try {
-                    if (typeof setLobbyPlayers === 'function') {
-                        const hostLabel = NET.role === 'host' ? (NET.myName || 'Host') : (NET.hostName || NET.peerName || 'Host');
-                        const joinerLabel = NET.role === 'host' ? (NET.getJoinerName(0) || NET.peerName || 'Joiner') : (NET.myName || 'Player 2');
-                        setLobbyPlayers(hostLabel, joinerLabel);
-                    }
-                } catch (e) {}
-                try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
-                try { updateWorldMasterSetupUI(); } catch (e) {}
-                try { renderRosterUI(); } catch (e) {}
-            } else if (msg.type === 'host-left') {
-                if (NET.role === 'joiner') {
-                    alert('Host left the session. You have been disconnected.');
-                    NET.handleDisconnect('Host left the session');
-                }
-            } else if (msg.type === 'relay') {
-                // New routing: input from joiner to host, snapshots from host to joiner
-                const data = msg.data;
-                try { /* removed debug relay tap logging */ } catch (e) {}
-                // Unified event system: handle game-event
-                if (data && data.type === 'game-event' && data.event) {
-                    if (typeof GameEvents !== 'undefined' && typeof GameEvents.processEvent === 'function') {
-                        GameEvents.processEvent(data.event);
-                    }
-                    return;
-                }
-                if (data && data.type === 'input' && NET.role === 'host') {
-                    NET.remoteInput = { ...(data.input||{}), seq: data.seq };
-                    NET.lastInputAt = NET.now();
-                    // Queue one-shot actions so they trigger as soon as possible
-                    if (data.input && data.input.shoot) NET.remoteShootQueued = true;
-                    if (data.input && data.input.dash) {
-                        // track the sequence so repeated inputs don't cause multiple queued dashes
-                        NET.remoteDashReqSeq = data.seq || (NET.remoteDashReqSeq + 1);
-                    }
-                } else if (data && data.type === 'snapshot' && NET.role === 'joiner') {
-                    NET.applySnapshot(data.snap);
-                } else if (data && data.type === 'set-name') {
-                    const rawName = (data.name || '').toString();
-                    const name = rawName.slice(0, 32);
-                    const joinerIdx = (typeof data.joinerIndex === 'number' && data.joinerIndex >= 0) ? data.joinerIndex : null;
-                    if (data.role === 'host') {
-                        NET.hostName = name || 'Host';
-                        NET.peerName = NET.hostName;
-                        if (NET.role === 'host') {
-                            try { broadcastRosterSnapshot(); } catch (e) {}
-                        }
-                    } else if (data.role === 'joiner') {
-                        if (joinerIdx !== null) {
-                            NET.updateJoinerName(joinerIdx, name || `Joiner ${joinerIdx + 1}`, { control: 'remote' });
-                            if (NET.role === 'host') {
-                                assignRemoteJoinerToRoster(joinerIdx, name || `Joiner ${joinerIdx + 1}`);
-                                try { broadcastRosterSnapshot(); } catch (e) {}
-                            }
-                            if (NET.role === 'joiner' && joinerIdx === NET.joinerIndex) {
-                                NET.myName = name || NET.myName;
-                            }
-                        }
-                    } else {
-                        if (NET.role === 'host') {
-                            const idx = joinerIdx === null ? 0 : joinerIdx;
-                            NET.updateJoinerName(idx, name || `Joiner ${idx + 1}`, { control: 'remote' });
-                            if (NET.role === 'host') {
-                                try { broadcastRosterSnapshot(); } catch (e) {}
-                            }
-                        } else {
-                            NET.hostName = name || NET.hostName;
-                            NET.peerName = name || NET.peerName;
-                            if (NET.role === 'host') {
-                                try { broadcastRosterSnapshot(); } catch (e) {}
-                            }
-                        }
-                    }
-                    try {
-                        if (typeof setLobbyPlayers === 'function') {
-                            const hostLabel = NET.role === 'host' ? (NET.myName || 'Host') : (NET.hostName || 'Host');
-                            const joinerLabel = NET.role === 'host' ? (NET.getJoinerName(0) || NET.peerName || 'Joiner') : (NET.myName || 'Player 2');
-                            setLobbyPlayers(hostLabel, joinerLabel);
-                        }
-                    } catch (e) {}
-                    try { updateCardsUI(); } catch (e) {}
-                    try { updateWorldMasterSetupUI(); } catch (e) {}
-                    try { renderRosterUI(); } catch (e) {}
-                } else if (data && data.type === 'roster-sync' && data.roster) {
-                    const rosterData = data.roster;
-                    if (NET.role === 'joiner' && playerRoster && typeof playerRoster.importSerializable === 'function') {
-                        try {
-                            playerRoster.importSerializable(rosterData, { preserveExternalIds: true });
-                        } catch (e) {}
-                        try {
-                            if (Array.isArray(rosterData.fighters)) {
-                                rosterData.fighters.forEach((fighter) => {
-                                    if (!fighter) return;
-                                    const meta = fighter.metadata || {};
-                                    if (typeof meta.joinerIndex === 'number') {
-                                        NET.updateJoinerName(meta.joinerIndex, fighter.name || `Joiner ${meta.joinerIndex + 1}`, meta);
-                                    }
-                                    if (meta.isHost) {
-                                        NET.hostName = fighter.name || NET.hostName;
-                                        NET.peerName = NET.hostName;
-                                    }
-                                });
-                            }
-                        } catch (e) {}
-                        try { renderRosterUI(); } catch (e) {}
-                        try { updateWorldMasterSetupUI(); } catch (e) {}
-                        try {
-                            if (typeof setLobbyPlayers === 'function') {
-                                const hostLabel = NET.hostName || 'Host';
-                                const joinerLabel = (typeof NET.joinerIndex === 'number')
-                                    ? (NET.getJoinerName(NET.joinerIndex) || NET.myName || 'Player 2')
-                                    : (NET.myName || 'Player 2');
-                                setLobbyPlayers(hostLabel, joinerLabel);
-                            }
-                        } catch (e) {}
-                    }
-                } else if (data && data.type === 'setup' && NET.role === 'joiner') {
-                    // Update the joiner's setup UI live
-                    applyIncomingSetup(data.data);
-                } else if (data && data.type === 'rounds-update') {
-                    // Host sent the rounds-to-win value; apply on joiner so UI and logic match
-                    try {
-                        const r = parseInt(data.rounds);
-                        if (NET.role === 'joiner' && typeof r === 'number' && !isNaN(r) && r > 0) {
-                            ROUNDS_TO_WIN = r;
-                            try { const roundsInput = document.getElementById('rounds-to-win'); if (roundsInput) roundsInput.value = ROUNDS_TO_WIN; } catch (e) {}
-                            try { localStorage.setItem('shape_shot_rounds', String(ROUNDS_TO_WIN)); } catch (e) {}
-                        }
-                    } catch (e) {}
-                } else if (data && data.type === 'round-start') {
-                    // Sync obstacles and critical flags before starting
-                    if (NET.role === 'joiner') {
-                        // If host included player names, store them for HUD
-                        try {
-                            if (data.names) {
-                                NET.peerName = data.names && data.names.p0 ? data.names.p0 : NET.peerName;
-                                // our own name may be included too
-                                NET.myName = data.names && data.names.p1 ? data.names.p1 : NET.myName;
-                                try { updateCardsUI(); } catch (e) {}
-                                try { if (typeof setLobbyPlayers === 'function') setLobbyPlayers(NET.peerName || 'Player 1', NET.myName || 'Player 2'); } catch (e) {}
-                            }
-                        } catch (e) {}
-                        // apply settings
-                        try {
-                            DYNAMIC_MODE = !!data.dynamic;
-                            DYNAMIC_RATE = parseFloat(data.dynamicRate);
-                            MAP_BORDER = !!data.mapBorder;
-                            worldModifierRoundInterval = parseInt(data.worldModInterval||3);
-                            // build obstacles
-                            deserializeObstacles(data.obstacles||[]);
-                        } catch (e) {}
-                        // Clear any transient world-mod entities so client visuals reset with the map
-                        try { infestedChunks = []; firestormInstance = null; firestormTimer = 0; spontaneousTimer = 0; infestationTimer = 0; } catch (e) {}
-                        // Close any lingering card UI
-                        const div = document.getElementById('card-choices');
-                        if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); }
-                        cardState.active = false; waitingForCard = false;
-                        hideWaitingOverlay();
-                        startGame();
-                    }
-                } else if (data && data.type === 'player-ready') {
-                    if (NET.role === 'host') {
-                        const idx = (typeof data.joinerIndex === 'number' && data.joinerIndex >= 0) ? data.joinerIndex : 0;
-                        readyPlayers.add(`joiner${idx}`);
-                        maybeStartRoundIfReady();
-                    }
-                } else if (data && data.type === 'round-reset') {
-                    // Host reset after death: sync map, positions, and scores
-                    try {
-                        if (NET.role === 'joiner') {
-                            deserializeObstacles(data.obstacles||[]);
-                            if (data.hostPos) { enemy.x = data.hostPos.x; enemy.y = data.hostPos.y; enemy.health = data.hostPos.hp; }
-                            if (data.joinerPos) { player.x = data.joinerPos.x; player.y = data.joinerPos.y; player.health = data.joinerPos.hp; }
-                            if (data.scores) {
-                                // P1 (host) shows on joiner as enemy; P2 (joiner) shows as player
-                                enemy.score = data.scores.host|0;
-                                player.score = data.scores.joiner|0;
-                            }
-                            bullets = []; explosions = []; infestedChunks = [];
-                            // reset transient world-mod entities on joiner after round-reset
-                            try { firestormInstance = null; firestormTimer = 0; spontaneousTimer = 0; infestationTimer = 0; } catch (e) {}
-                            // Ensure any local burning states are cleared so DoT doesn't carry over
-                            try {
-                                if (player && player.burning) player.burning = null;
-                                if (enemy && enemy.burning) enemy.burning = null;
-                                if (Array.isArray(obstacles)) {
-                                    for (let oi = 0; oi < obstacles.length; oi++) {
-                                        const obs = obstacles[oi];
-                                        if (!obs || !obs.chunks) continue;
-                                        for (let ci = 0; ci < obs.chunks.length; ci++) {
-                                            const chunk = obs.chunks[ci];
-                                            if (chunk && chunk.burning) chunk.burning = null;
-                                        }
-                                    }
-                                }
-                                try { if (typeof burningEntities !== 'undefined') burningEntities = new Set(); } catch (e) {}
-                            } catch (e) {}
-                        } else {
-                            // host already applied locally in update()
-                        }
-                        updateCardsUI();
-                        // Close any lingering card UI
-                        const div = document.getElementById('card-choices');
-                        if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); }
-                        cardState.active = false; waitingForCard = false;
-                    } catch (e) {}
-                } else if (data && data.type === 'card-offer') {
-                    // Host offered powerup choices to a role: show the UI on clients (unless match has ended)
-                    if (!matchOver) {
-                        try { waitingForCard = true; } catch (e) {}
-                        const offeredFighterId = data && data.fighterId != null ? String(data.fighterId) : null;
-                        const offeredSlotIndex = (data && typeof data.slotIndex === 'number') ? data.slotIndex : null;
-                        try {
-                            window._lastOfferedChoices = {
-                                choices: data.choices || [],
-                                chooserRole: data.chooserRole,
-                                fighterId: offeredFighterId,
-                                slotIndex: offeredSlotIndex
-                            };
-                        } catch (e) {}
-                        setTimeout(() => netShowPowerupCards(data.choices || [], data.chooserRole, { fighterId: offeredFighterId, slotIndex: offeredSlotIndex }), 200);
-                    }
-                } else if (data && data.type === 'mod-offer') {
-                    if (!matchOver) {
-                        try { waitingForCard = true; } catch (e) {}
-                        const finalIdx = (typeof data.finalIdx === 'number') ? data.finalIdx : undefined;
-                        const manual = !!data.manual;
-                        setTimeout(() => netShowWorldModifierCards(data.choices||[], data.chooserRole, finalIdx, { manual }), 200);
-                    }
-                } else if (data && data.type === 'card-pick') {
-                    // Joiner sent a pick: auto-accept and apply silently on host
-                    if (NET.role === 'host') {
-                        const pending = {
-                            kind: 'card',
-                            pickerRole: data.pickerRole,
-                            cardName: data.card,
-                            fighterId: (data && data.fighterId != null) ? String(data.fighterId) : null,
-                            slotIndex: (data && typeof data.slotIndex === 'number') ? data.slotIndex : null
-                        };
-                        applyHostPendingConfirm(pending);
-                    } else {
-                        // ignore (only host handles picks)
-                    }
-                } else if (data && data.type === 'mod-pick') {
-                    // Joiner sent a world-mod pick: auto-accept and apply silently on host
-                    if (NET.role === 'host') {
-                        const pending = { kind: 'mod', chooserRole: data.chooserRole || data.pickerRole, name: data.name };
-                        applyHostPendingConfirm(pending);
-                    }
-                } else if (data && data.type === 'card-apply') {
-                    // Apply on non-host clients (host already applied during pick)
-                    try {
-                        if (NET.role !== 'host') {
-                            let target = null;
-                            if (data.fighterId != null) {
-                                target = getEntityForFighterId(data.fighterId);
-                            }
-                            if (!target) {
-                                target = getEntityForRole(data.pickerRole);
-                            }
-                            const card = data.card ? getCardByName(data.card) : null;
-                            if (target && card) {
-                                try { card.effect(target); target.addCard(card.name); } catch (e) {}
-                            }
-                            const accentColor = target && target.color ? target.color : null;
-                            const highlightRemoteSelection = () => {
-                                const div = document.getElementById('card-choices');
-                                if (!div || !div.childNodes || !div.childNodes.length) return false;
-                                const targetName = (typeof data.card === 'string') ? data.card : '';
-                                let matchIdx = -1;
-                                try {
-                                    const lastOffer = window._lastOfferedChoices;
-                                    if (lastOffer && Array.isArray(lastOffer.choices)) {
-                                        matchIdx = lastOffer.choices.findIndex(choiceName => {
-                                            if (!choiceName) return false;
-                                            if (typeof choiceName === 'string') return choiceName === targetName;
-                                            if (choiceName && typeof choiceName.name === 'string') return choiceName.name === targetName;
-                                            return false;
-                                        });
-                                    }
-                                } catch (err) { matchIdx = -1; }
-                                if (matchIdx < 0) {
-                                    for (let i = 0; i < div.childNodes.length; ++i) {
-                                        const child = div.childNodes[i];
-                                        const label = child && child.querySelector ? child.querySelector('b') : null;
-                                        if (label && label.textContent && label.textContent.trim() === targetName) {
-                                            matchIdx = i;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if (matchIdx < 0 || !div.childNodes[matchIdx]) return false;
-                                const cardEl = div.childNodes[matchIdx];
-                                try {
-                                    Array.from(div.childNodes).forEach((child, idx) => {
-                                        if (idx === matchIdx) return;
-                                        child.classList.remove('selected', 'centered');
-                                        child.style.zIndex = 1;
-                                        if (child._origTransform) child.style.transform = child._origTransform;
-                                        try {
-                                            child.style.removeProperty('border');
-                                            child.style.removeProperty('box-shadow');
-                                            child.style.removeProperty('color');
-                                            const sm = child.querySelector('small'); if (sm) sm.style.removeProperty('color');
-                                            if (child._accentClass) child.classList.remove(child._accentClass);
-                                            if (child._accentStyle) { child._accentStyle.remove(); child._accentStyle = null; }
-                                        } catch (err) {}
-                                    });
-                                } catch (err) {}
-                                if (!cardEl._origTransform) cardEl._origTransform = cardEl.style.transform;
-                                cardEl.classList.add('selected', 'centered');
-                                cardEl.style.zIndex = 10;
-                                cardEl.style.transform = 'translate(-50%, -60px) scale(1.18) rotate(0deg)';
-                                const accent = accentColor || '#65c6ff';
-                                try {
-                                    cardEl.style.setProperty('border', '3px solid ' + accent, 'important');
-                                    cardEl.style.setProperty('box-shadow', '0 6px 18px ' + accent, 'important');
-                                    cardEl.style.setProperty('color', accent, 'important');
-                                    const sm = cardEl.querySelector('small'); if (sm) sm.style.setProperty('color', accent, 'important');
-                                    if (!cardEl._accentClass) cardEl._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
-                                    if (!cardEl._accentStyle) {
-                                        const styleEl = document.createElement('style');
-                                        styleEl.innerText = `.${cardEl._accentClass}::after{ background: radial-gradient(ellipse at center, ${accent}33 0%, #0000 100%) !important; } .${cardEl._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${accent}55 0%, #0000 100%) !important; }`;
-                                        document.head.appendChild(styleEl);
-                                        cardEl._accentStyle = styleEl;
-                                    }
-                                    cardEl.classList.add(cardEl._accentClass);
-                                } catch (err) {}
-                                return true;
-                            };
-                            const finalizeCardUI = () => {
-                                try {
-                                    const div = document.getElementById('card-choices');
-                                    if (div) {
-                                        Array.from(div.childNodes || []).forEach(child => {
-                                            try {
-                                                if (child && child._accentStyle) { child._accentStyle.remove(); child._accentStyle = null; }
-                                            } catch (err) {}
-                                        });
-                                        div.style.display = 'none';
-                                        div.innerHTML = '';
-                                        div.classList.remove('card-bg-visible');
-                                    }
-                                } catch (err) {}
-                                try { cardState.active = false; waitingForCard = false; } catch (err) {}
-                            };
-                            const mirrored = highlightRemoteSelection();
-                            if (mirrored) {
-                                setTimeout(finalizeCardUI, 650);
-                            } else {
-                                finalizeCardUI();
-                            }
-                            return;
-                        }
-                    } catch (e) {}
-                    // Host already closed UI; ensure any other clients still clear state
-                    try {
-                        const div = document.getElementById('card-choices');
-                        if (div) { div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible'); }
-                    } catch (e) {}
-                    try { cardState.active = false; waitingForCard = false; } catch (e) {}
-                } else if (data && data.type === 'card-hover') {
-                    // Mirror hover state for non-chooser clients
-                    try {
-                        const chooserRole = data.chooserRole;
-                        const idx = typeof data.idx === 'number' ? data.idx : -1;
-                        const div = document.getElementById('card-choices');
-                        if (div && div.childNodes && div.childNodes.length > 0) {
-                            // Remove existing highlights
-                            for (let n = 0; n < div.childNodes.length; ++n) {
-                                const c = div.childNodes[n];
-                                c.classList.remove('selected', 'centered');
-                                c.style.zIndex = 1;
-                                // reset transform if stored
-                                try { c.style.transform = c._origTransform || c.style.transform; } catch (e) {}
-                                try {
-                                    c.style.removeProperty('border');
-                                    c.style.removeProperty('box-shadow');
-                                    c.style.removeProperty('color');
-                                    const sm = c.querySelector('small'); if (sm) sm.style.removeProperty('color');
-                                    const hb = c.querySelector('b'); if (hb) hb.style.removeProperty('color');
-                                    if (c._accentClass) c.classList.remove(c._accentClass);
-                                    if (c._accentStyle) { c._accentStyle.remove(); c._accentStyle = null; }
-                                } catch (e) {}
-                            }
-                            if (idx >= 0 && idx < div.childNodes.length) {
-                                const card = div.childNodes[idx];
-                                // chooserRole color mapping: map role to the correct local entity
-                                const chooserEntity = getEntityForRole(chooserRole);
-                                const color = chooserEntity && chooserEntity.color ? chooserEntity.color : null;
-                                try {
-                                    card.classList.add('selected', 'centered');
-                                    card.style.zIndex = 10;
-                                    // store original transform if not present
-                                    if (!card._origTransform) card._origTransform = card.style.transform;
-                                    card.style.transform = 'translate(-50%, -60px) scale(1.18) rotate(0deg)';
-                                    if (color) {
-                                        card.style.setProperty('border', '3px solid ' + color, 'important');
-                                        card.style.setProperty('box-shadow', '0 6px 18px ' + color, 'important');
-                                        card.style.setProperty('color', color, 'important');
-                                        const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', color, 'important');
-                                        if (!card._accentClass) card._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
-                                        if (!card._accentStyle) {
-                                            const styleEl = document.createElement('style');
-                                            styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${color}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${color}55 0%, #0000 100%) !important; }`;
-                                            document.head.appendChild(styleEl);
-                                            card._accentStyle = styleEl;
-                                        }
-                                        card.classList.add(card._accentClass);
-                                    }
-                                } catch (e) {}
-                            }
-                        }
-                    } catch (e) {}
-                } else if (data && data.type === 'hit-anim') {
-                    // Visual-only: play damage flash/shake for targetRole on joiner
-                    try {
-                        if (NET.role !== 'host') {
-                            const tgt = getEntityForRole(data.targetRole);
-                            if (tgt) {
-                                tgt.shakeTime = 0.20; tgt.shakeMag = 8; tgt.damageFlash = 0.25; try { playHit(); } catch(e) {}
-                            }
-                        }
-                    } catch (e) {}
-                } else if (data && data.type === 'firestorm-spawn') {
-                    // Visual-only: spawn firestorm on joiner
-                    try {
-                        if (NET.role !== 'host') {
-                            firestormInstance = new Firestorm(data.x, data.y, data.radius);
-                            firestormActive = true;
-                            if (firestormTimeout) { clearTimeout(firestormTimeout); }
-                            firestormTimeout = setTimeout(() => {
-                                firestormActive = false;
-                                firestormInstance = null;
-                                firestormTimeout = null;
-                            }, 10000);
-                        }
-                    } catch (e) {}
-                } else if (data && data.type === 'firestorm-remove') {
-                    // Visual-only: remove firestorm on joiner
-                    try {
-                        if (NET.role !== 'host') {
-                            firestormInstance = null;
-                        }
-                    } catch (e) {}
-                } else if (data && data.type === 'infestation-spawn') {
-                    // Visual-only: spawn infested chunk on joiner
-                    try {
-                        if (NET.role !== 'host') {
-                            const oi = data.obstacleIndex, ci = data.chunkIndex;
-                            if (typeof oi === 'number' && typeof ci === 'number' && obstacles[oi] && obstacles[oi].chunks[ci]) {
-                                try {
-                                    const activeCount = (infestedChunks || []).filter(ic => ic && ic.active).length;
-                                    if (activeCount < 10) {
-                                        // avoid duplicates by id if provided
-                                        if (typeof data.id !== 'undefined' && (infestedChunks || []).some(ic => ic && ic.id === data.id)) return;
-                                        let infestedChunk = new InfestedChunk(obstacles[oi].chunks[ci], obstacles[oi]);
-                                        infestedChunk.id = data.id || infestedChunk.id;
-                                        infestedChunks.push(infestedChunk);
-                                    }
-                                } catch (e) {
-                                    let infestedChunk = new InfestedChunk(obstacles[oi].chunks[ci], obstacles[oi]);
-                                    infestedChunk.id = data.id || infestedChunk.id;
-                                    infestedChunks.push(infestedChunk);
-                                }
-                            }
-                        }
-                    } catch (e) {}
-                // Visual-only: play damage flash/shake for targetRole on joiner
-                } else if (data && data.type === 'hit-anim') {
-                    try {
-                        if (NET.role !== 'host') {
-                            const tgt = getEntityForRole(data.targetRole);
-                            if (tgt) {
-                                tgt.shakeTime = 0.20; tgt.shakeMag = 8; tgt.damageFlash = 0.25; try { playHit(); } catch(e) {}
-                            }
-                        }
-                    } catch (e) {}
-                        } else if (data && data.type === 'explosion') {
-                            // Visual-only explosion sent from host: recreate locally on joiner
-                            try {
-                                if (NET.role !== 'host') {
-                                    const ex = new Explosion(data.x, data.y, data.radius || window.EXPLOSION_BASE_RADIUS, data.color || '#ffffff', data.damage || 0, null, !!data.obl);
-                                    explosions.push(ex);
-                                    try { playExplosion(); } catch (e) {}
-                                }
-                            } catch (e) {}
-                    } else if (data && data.type === 'chunks-update') {
-                        // Visual-only chunk updates from host: apply to local obstacles if possible
-                        try {
-                            if (NET.role !== 'host') {
-                                const idx = data.obstacleIndex;
-                                if (typeof idx === 'number' && obstacles && obstacles[idx]) {
-                                    const obs = obstacles[idx];
-                                    const updates = data.updates || [];
-                                    for (const u of updates) {
-                                        const ci = u.i;
-                                        if (typeof ci !== 'number' || !obs.chunks || !obs.chunks[ci]) continue;
-                                        const cc = obs.chunks[ci];
-                                            cc.destroyed = !!u.destroyed;
-                                            cc.flying = !!u.flying;
-                                            cc.vx = u.vx || 0; cc.vy = u.vy || 0; cc.alpha = (typeof u.alpha === 'number') ? u.alpha : cc.alpha;
-                                            // Burning field: if provided, set burning timer/duration; otherwise preserve existing
-                                            if (u.burning) {
-                                                cc.burning = { time: 0, duration: u.burning.duration };
-                                            }
-                                        // position sync if provided
-                                        if (typeof u.x === 'number') cc.x = u.x; if (typeof u.y === 'number') cc.y = u.y;
-                                    }
-                                    // Recompute obstacle destroyed state in case all chunks are removed
-                                    try {
-                                        obs.destroyed = obs.chunks.every(c => !!c.destroyed);
-                                    } catch (e) {}
-                                }
-                            }
-                        } catch (e) {}
-                } else if (data && data.type === 'mod-pick') {
-                    // Only host should authoritatively apply then broadcast
-                    if (NET.role === 'host') {
-                        const name = data.name;
-                        applyWorldModifierByName(name);
-                        // Close host UI and clear waiting state immediately
-                        try {
-                            const div = document.getElementById('card-choices');
-                            if (div) { div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible'); }
-                        } catch (e) {}
-                        try { cardState.active = false; waitingForCard = false; } catch (e) {}
-                        try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-apply', name } })); } catch (e) {}
-                    }
-                } else if (data && data.type === 'mod-apply') {
-                    // Apply on non-host clients (host already applied)
-                    if (NET.role !== 'host') applyWorldModifierByName(data.name);
-                    const div = document.getElementById('card-choices');
-                    if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); }
-                    cardState.active = false; waitingForCard = false;
-                } else if (data && data.type === 'match-end') {
-                    // Show victory modal on clients
-                    try { if (NET.role !== 'host') showVictoryModal(data.winner || 'Opponent', false); } catch (e) {}
-                } else if (data && data.type === 'match-restart') {
-                    // Host requested a restart for all clients
-                    try { hideVictoryModal(); restartGame(); } catch (e) {}
-                } else if (data && data.type === 'victory-vote') {
-                    // Peer sent their vote
-                    try {
-                        const peerRole = data.role;
-                        const choice = data.choice;
-                        window._victoryVotes[peerRole] = choice;
-                        updateVictoryModalStatus();
-                        checkVictoryVotes();
-                    } catch (e) {}
-                } else if (data && data.type === 'victory-continue') {
-                    // Host confirmed continue action
-                    try {
-                        hideVictoryModal();
-                        window._victoryRoundsLeft = 3;
-                        window._victoryRoundsActive = true;
-                    } catch (e) {}
-                } else if (data && data.type === 'card-decline') {
-                    // Host declined the joiner's pick; clear waiting state and log
-                    try { waitingForCard = false; cardState.active = false; } catch (e) {}
-                    try { logDev('[CARD FLOW] Host declined the pick.'); } catch (e) {}
-                    // Optionally, if we stored last offered choices, re-open UI for the chooser
-                    try {
-                        if (window._lastOfferedChoices && Array.isArray(window._lastOfferedChoices.choices) && window._lastOfferedChoices.chooserRole === NET.role) {
-                            // reopen the choices for the chooser
-                            setTimeout(() => netShowPowerupCards(
-                                window._lastOfferedChoices.choices,
-                                window._lastOfferedChoices.chooserRole,
-                                {
-                                    fighterId: window._lastOfferedChoices.fighterId,
-                                    slotIndex: window._lastOfferedChoices.slotIndex
-                                }
-                            ), 250);
-                        }
-                    } catch (e) {}
-                } else {
-                    // fallback to previous handler if any simple sync message comes through
-                    handleGameMessage(data);
-                }
-            }
-        };
-    }
-
-    // Host confirm overlay helpers
-    function showHostConfirmOverlay(text) {
-        try {
-            const overlay = document.getElementById('host-confirm-overlay');
-            const txt = document.getElementById('host-confirm-text');
-            if (txt) txt.innerText = text || 'Remote player selected an option';
-            if (overlay) overlay.style.display = 'block';
-        } catch (e) {}
-    }
-    function hideHostConfirmOverlay() {
-        try { const overlay = document.getElementById('host-confirm-overlay'); if (overlay) overlay.style.display = 'none'; } catch (e) {}
-        try { window._pendingHostConfirm = null; } catch (e) {}
-    }
-
-    // Apply a pending host confirmation immediately (same logic as clicking the host Accept button)
-    function applyHostPendingConfirm(pending) {
-        try {
-            if (!pending) return;
-            if (pending.kind === 'card') {
-                const pendingFighterId = (pending && pending.fighterId != null) ? String(pending.fighterId) : null;
-                let target = null;
-                if (pendingFighterId) {
-                    try { target = getEntityForFighterId(pendingFighterId); } catch (e) { target = null; }
-                }
-                if (!target) {
-                    target = getEntityForRole(pending.pickerRole);
-                }
-                const card = getCardByName(pending.cardName);
-                if (target && card) {
-                    try { card.effect(target); target.addCard(card.name); } catch (e) {}
-                }
-                let fighterRecord = null;
-                if (pendingFighterId && playerRoster && typeof playerRoster.getFighterById === 'function') {
-                    try { fighterRecord = playerRoster.getFighterById(pendingFighterId, { includeEntity: true }) || null; } catch (e) {}
-                }
-                if (!fighterRecord && target) {
-                    try { fighterRecord = getFighterRecordForEntity(target); } catch (e) { fighterRecord = null; }
-                }
-                const fighterIdForBroadcast = pendingFighterId || (fighterRecord && fighterRecord.id != null ? String(fighterRecord.id) : null);
-                const slotIndexForBroadcast = (pending && typeof pending.slotIndex === 'number')
-                    ? pending.slotIndex
-                    : (fighterRecord && typeof fighterRecord.slotIndex === 'number' ? fighterRecord.slotIndex : null);
-                // Broadcast applied so clients close UI
-                try {
-                    if (window.ws && window.ws.readyState === WebSocket.OPEN) {
-                        const payload = { type:'card-apply', pickerRole: pending.pickerRole, card: pending.cardName };
-                        if (fighterIdForBroadcast != null) payload.fighterId = fighterIdForBroadcast;
-                        if (typeof slotIndexForBroadcast === 'number') payload.slotIndex = slotIndexForBroadcast;
-                        window.ws.send(JSON.stringify({ type:'relay', data: payload }));
-                    }
-                } catch (e) {}
-                // Advance local round state as host (same as if notifyPowerupSelectionComplete had run)
-                try {
-                    // Use the applied target entity so selection completes for this loser
-                    try { notifyPowerupSelectionComplete(target, pending.cardName); } catch (e) {}
-                } catch (e) {}
-                // Ensure host UI closes as well
-                try { const div = document.getElementById('card-choices'); if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); } } catch (e) {}
-                // If there was a pending world modifier offer queued for this round, show it now on host and broadcast to joiner
-                try {
-                    if (window._pendingWorldModOffer) {
-                        const offer = window._pendingWorldModOffer;
-                        window._pendingWorldModOffer = null;
-                        try { roundFlowState.pendingWorldModOffer = null; } catch (e) {}
-                        try { waitingForCard = true; } catch (e) {}
-                        try { netShowWorldModifierCards(offer.choices, offer.chooserRole, offer.finalIdx, offer); } catch (e) {}
-                        try {
-                            if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-offer', choices: offer.choices, chooserRole: offer.chooserRole, finalIdx: offer.finalIdx, manual: !!offer.manual } }));
-                        } catch (e) {}
-                    }
-                } catch (e) {}
-                // Advance local round state to avoid stalling (same behavior as when client-side selection completes)
-                try {
-                    try { notifyPowerupSelectionComplete(target, pending.cardName); } catch (e) {}
-                } catch (e) {}
-            } else if (pending.kind === 'mod') {
-                const name = pending.name;
-                try { applyWorldModifierByName(name); } catch (e) {}
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-apply', name } })); } catch (e) {}
-            }
-            try { cardState.active = false; waitingForCard = false; } catch (e) {}
-            try { window._pendingHostConfirm = null; } catch (e) {}
-        } catch (err) { console.warn('applyHostPendingConfirm error', err); }
-    }
-
-    // Wire host confirm buttons (accept/decline)
-    try {
-        const accept = document.getElementById('host-confirm-accept');
-        const decline = document.getElementById('host-confirm-decline');
-        if (accept) accept.addEventListener('click', () => {
-            const pending = window._pendingHostConfirm;
-            hideHostConfirmOverlay();
-            if (!pending) return;
-            if (pending.kind === 'card') {
-                const pendingFighterId = (pending && pending.fighterId != null) ? String(pending.fighterId) : null;
-                let target = null;
-                if (pendingFighterId) {
-                    try { target = getEntityForFighterId(pendingFighterId); } catch (e) { target = null; }
-                }
-                if (!target) {
-                    target = getEntityForRole(pending.pickerRole);
-                }
-                const card = getCardByName(pending.cardName);
-                if (target && card) {
-                    try { card.effect(target); target.addCard(card.name); } catch (e) {}
-                }
-                let fighterRecord = null;
-                if (pendingFighterId && playerRoster && typeof playerRoster.getFighterById === 'function') {
-                    try { fighterRecord = playerRoster.getFighterById(pendingFighterId, { includeEntity: true }) || null; } catch (e) {}
-                }
-                if (!fighterRecord && target) {
-                    try { fighterRecord = getFighterRecordForEntity(target); } catch (e) { fighterRecord = null; }
-                }
-                const fighterIdForBroadcast = pendingFighterId || (fighterRecord && fighterRecord.id != null ? String(fighterRecord.id) : null);
-                const slotIndexForBroadcast = (pending && typeof pending.slotIndex === 'number')
-                    ? pending.slotIndex
-                    : (fighterRecord && typeof fighterRecord.slotIndex === 'number' ? fighterRecord.slotIndex : null);
-                // Broadcast applied so clients close UI
-                try {
-                    if (window.ws && window.ws.readyState === WebSocket.OPEN) {
-                        const payload = { type:'card-apply', pickerRole: pending.pickerRole, card: pending.cardName };
-                        if (fighterIdForBroadcast != null) payload.fighterId = fighterIdForBroadcast;
-                        if (typeof slotIndexForBroadcast === 'number') payload.slotIndex = slotIndexForBroadcast;
-                        window.ws.send(JSON.stringify({ type:'relay', data: payload }));
-                    }
-                } catch (e) {}
-                // Ensure host UI closes as well
-                try { const div = document.getElementById('card-choices'); if (div) { div.style.display='none'; div.innerHTML=''; div.classList.remove('card-bg-visible'); } } catch (e) {}
-                // If there was a pending world modifier offer queued for this round, show it now on host and broadcast to joiner
-                try {
-                    if (window._pendingWorldModOffer) {
-                        const offer = window._pendingWorldModOffer;
-                        window._pendingWorldModOffer = null;
-                        try { roundFlowState.pendingWorldModOffer = null; } catch (e) {}
-                        try { waitingForCard = true; } catch (e) {}
-                        try { netShowWorldModifierCards(offer.choices, offer.chooserRole, offer.finalIdx, offer); } catch (e) {}
-                        try {
-                            if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-offer', choices: offer.choices, chooserRole: offer.chooserRole, finalIdx: offer.finalIdx, manual: !!offer.manual } }));
-                        } catch (e) {}
-                    }
-                } catch (e) {}
-            } else if (pending.kind === 'mod') {
-                const name = pending.name;
-                try { applyWorldModifierByName(name); } catch (e) {}
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'mod-apply', name } })); } catch (e) {}
-            }
-            try { cardState.active = false; waitingForCard = false; } catch (e) {}
-            window._pendingHostConfirm = null;
-        });
-        if (decline) decline.addEventListener('click', () => {
-            const pending = window._pendingHostConfirm;
-            hideHostConfirmOverlay();
-            if (!pending) return;
-            // Notify joiner the pick was declined so they can resume (optional)
-            try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-decline', pickerRole: pending.pickerRole, kind: pending.kind, name: pending.cardName || pending.name } })); } catch (e) {}
-            try { cardState.active = false; waitingForCard = false; } catch (e) {}
-            window._pendingHostConfirm = null;
-        });
-    } catch (e) {}
-
-    // Additional incoming visual-only messages handled for joiners
-    // We'll add these handlers in the same onmessage processing above by observing data.type 'hit-anim' and 'chunks-update'
-
-    // Reconnect button helper: create DOM element if missing and show/hide
-    function ensureReconnectButton() {
-        let btn = document.getElementById('mp-reconnect-btn');
-        if (!btn) {
-            btn = document.createElement('button');
-            btn.id = 'mp-reconnect-btn';
-            btn.innerText = 'Reconnect';
-            btn.style.position = 'fixed';
-            btn.style.right = '18px';
-            btn.style.bottom = '18px';
-            btn.style.zIndex = 9999;
-            btn.style.padding = '10px 14px';
-            btn.style.background = '#2f8bff';
-            btn.style.color = '#fff';
-            btn.style.border = 'none';
-            btn.style.borderRadius = '8px';
-            btn.style.boxShadow = '0 4px 12px rgba(0,0,0,0.35)';
-            btn.style.display = 'none';
-            btn.onclick = function() {
-                // Try reconnect using previously selected session/role
-                if (window.ws && window.ws.readyState === WebSocket.OPEN) {
-                    btn.style.display = 'none';
-                    return;
-                }
-                const role = window.wsRole || NET.role || 'host';
-                const code = window.wsSession || (document.getElementById('mp-session-code') ? document.getElementById('mp-session-code').value : '') || '';
-                connectWebSocket(role, code);
-                btn.innerText = 'Reconnecting...';
-                setTimeout(() => { btn.innerText = 'Reconnect'; }, 4000);
-            };
-            document.body.appendChild(btn);
-        }
-        return btn;
-    }
-
-    function showReconnectButton() { const b = ensureReconnectButton(); b.style.display = 'block'; }
-    function hideReconnectButton() { const b = ensureReconnectButton(); b.style.display = 'none'; b.innerText = 'Reconnect'; }
-
-    // Patch after each connect
-    let oldConnectWebSocket = null;
-    if (typeof connectWebSocket === 'function') oldConnectWebSocket = connectWebSocket;
-    // Helper to normalize user input: allow full invite URLs or plain codes
-    function normalizeJoinCode(input) {
-        if (!input) return '';
-        const trimmed = input.trim();
-        try {
-            // If it's a URL, parse the ?join param
-            const url = new URL(trimmed);
-            const fromParam = url.searchParams.get('join');
-            if (fromParam) return fromParam.trim().toUpperCase();
-        } catch (e) { /* not a URL */ }
-        // Otherwise just strip non-alphanumerics and uppercase
-        return trimmed.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-    }
-
-    connectWebSocket = function(role, code) {
-        if (oldConnectWebSocket) oldConnectWebSocket(role, code);
-        else {
-            if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.close();
-            NET.resetSessionState();
-            NET.setConnected(false);
-            window.wsRole = role;
-            window.wsSession = normalizeJoinCode(code);
-            try {
-                window.ws = new WebSocket(window.MULTIPLAYER_WS_URL);
-            } catch (e) {
-                alert('Could not open WebSocket: ' + e.message);
-                return;
-            }
-            window.ws.onopen = function() {
-                if (role === 'host') {
-                    window.ws.send(JSON.stringify({ type: 'host', code: window.wsSession }));
-                } else if (role === 'joiner') {
-                    window.ws.send(JSON.stringify({ type: 'join', code: window.wsSession }));
-                }
-                NET.setRole(role);
-                NET.setConnected(true);
-                NET.joinerIndex = null;
-                try { hideReconnectButton(); } catch (e) {}
-                let myName = '';
-                try {
-                    const nameInput = document.getElementById('display-name');
-                    myName = nameInput ? (nameInput.value || nameInput.placeholder || '') : '';
-                } catch (e) { myName = ''; }
-                if (myName) {
-                    try { NET.myName = myName.toString().slice(0, 32); } catch (e) { NET.myName = myName; }
-                    try { localStorage.setItem('shape_shot_display_name', NET.myName); } catch (e) {}
-                } else {
-                    NET.myName = myName || '';
-                }
-                if (role === 'host') {
-                    NET.hostName = NET.myName || 'Host';
-                    sendLocalDisplayName();
-                } else {
-                    NET.pendingName = NET.myName || '';
-                }
-                try {
-                    if (typeof setLobbyPlayers === 'function') {
-                        const hostLabel = NET.role === 'host' ? (NET.myName || 'Host') : (NET.hostName || NET.peerName || 'Host');
-                        const joinerLabel = NET.role === 'host' ? (NET.getJoinerName(0) || '') : (NET.myName || '');
-                        setLobbyPlayers(hostLabel, joinerLabel);
-                    }
-                } catch (e) {}
-                try { if (typeof updateCardsUI === 'function') updateCardsUI(); } catch (e) {}
-                if (role === 'host') {
-                    if (player) player.color = HOST_PLAYER_COLOR;
-                    if (enemy) enemy.color = getJoinerColor(0);
-                } else {
-                    const myJoinerIdx = Number.isInteger(NET.joinerIndex) ? NET.joinerIndex : 0;
-                    if (player) player.color = getJoinerColor(myJoinerIdx);
-                    if (enemy) enemy.color = HOST_PLAYER_COLOR;
-                }
-            };
-            patchWsOnMessage();
-            window.ws.onclose = function() {
-                NET.handleDisconnect('Socket closed');
-                try { if (typeof setMpSessionDisplay === 'function') setMpSessionDisplay(''); } catch (e) {}
-            };
-            window.ws.onerror = function() {
-                NET.handleDisconnect('Socket error');
-                try { if (typeof setMpSessionDisplay === 'function') setMpSessionDisplay(''); } catch (e) {}
-            };
-        }
-        setTimeout(patchWsOnMessage, 200);
-    };
-    const overlay = document.getElementById('setup-overlay');
-    const setupWrapper = document.getElementById('setup-wrapper');
-
-    function showSetupUI() {
-        if (!rosterUIBound) {
-            try { bindRosterUI(); } catch (e) {}
-        }
-        if (setupWrapper) setupWrapper.style.display = 'flex';
-        if (overlay) overlay.style.display = 'flex';
-        try { ensureRosterDefaults(); } catch (e) {}
-        try { renderRosterUI(); } catch (e) {}
-    }
-
-    function hideSetupUI() {
-        if (overlay) overlay.style.display = 'none';
-        if (setupWrapper) setupWrapper.style.display = 'none';
-    }
-    const densitySlider = document.getElementById('obstacle-density');
-    const densityValue = document.getElementById('density-value');
-    const sizeSlider = document.getElementById('obstacle-size');
-    const sizeValue = document.getElementById('size-value');
-    const dynamicCheckbox = document.getElementById('dynamic-mode');
-    const dynamicRateRow = document.getElementById('dynamic-rate-row');
-    const dynamicRateSlider = document.getElementById('dynamic-rate');
-    const dynamicRateValue = document.getElementById('dynamic-rate-value');
-    const mapBorderCheckbox = document.getElementById('map-border');
-    // Ensure map border is checked by default on load
-    if (mapBorderCheckbox) mapBorderCheckbox.checked = true;
-    // The world modifier interval slider was moved into the World Master modal.
-    // We'll attempt to find it in the modal when needed; keep references null for now.
-    let worldModifierSlider = document.getElementById('world-modifier-interval') || null;
-    let worldModifierValue = document.getElementById('world-modifier-value') || null;
-    const roundsInput = document.getElementById('rounds-to-win');
-    const managePowerupsBtn = document.getElementById('setup-manage-powerups');
-    const manageWorldModsBtn = document.getElementById('setup-manage-mods');
-    const setupEnableWorldMods = document.getElementById('setup-enable-worldmods');
-    const setupEnablePowerups = document.getElementById('setup-enable-powerups');
-
-    function getSetupDeckUI() {
-        const controller = ensureGlobalDeckController();
-        if (!controller) return null;
-        if (window.gameWorldMasterInstance && window.gameWorldMasterInstance.ui) {
-            try { controller.attachWorldMaster(window.gameWorldMasterInstance); } catch (e) {}
-            return window.gameWorldMasterInstance.ui;
-        }
-        if (controller.ui && controller.uiSource === 'global') {
-            if (controller.uiAdapter) {
-                controller.uiAdapter.minWorldMods = controller.minWorldMods;
-                controller.uiAdapter.minPowerups = controller.minPowerups;
-            }
-            return controller.ui;
-        }
-        if (typeof WorldMasterUI !== 'function') return null;
-        const adapter = {
-            minWorldMods: controller.minWorldMods,
-            minPowerups: controller.minPowerups,
-            availableWorldMods: controller.availableWorldMods,
-            availablePowerups: controller.availablePowerups,
-            autoPick: true,
-            aiSelfPickPowerups: true,
-            toggleWorldMod: (name, enabled) => controller.toggleWorldMod(name, enabled, {}),
-            togglePowerup: (name, enabled) => controller.togglePowerup(name, enabled, {})
-        };
-        controller.uiAdapter = adapter;
-        controller.ui = new WorldMasterUI(adapter, { attachPanel: false, attachCooldownDisplay: false, activeModsPolling: false });
-        controller.uiSource = 'global';
-        return controller.ui;
-    }
-
-    if (managePowerupsBtn) {
-        managePowerupsBtn.onclick = () => {
-            if (typeof window.setupAllowPowerups !== 'undefined' && window.setupAllowPowerups === false) return;
-            const ui = getSetupDeckUI();
-            if (ui && typeof ui.showPowerupDeck === 'function') ui.showPowerupDeck();
-        };
-    }
-    if (manageWorldModsBtn) {
-        manageWorldModsBtn.onclick = () => {
-            if (typeof window.setupAllowWorldMods !== 'undefined' && window.setupAllowWorldMods === false) return;
-            const ui = getSetupDeckUI();
-            if (ui && typeof ui.showWorldModDeck === 'function') ui.showWorldModDeck();
-        };
-    }
-    // Initialize global flags for setup-enabled features (default true)
-    try {
-        window.setupAllowWorldMods = !(setupEnableWorldMods && setupEnableWorldMods.type === 'checkbox' && setupEnableWorldMods.checked === false);
-    } catch (e) { window.setupAllowWorldMods = true; }
-    try {
-        window.setupAllowPowerups = !(setupEnablePowerups && setupEnablePowerups.type === 'checkbox' && setupEnablePowerups.checked === false);
-    } catch (e) { window.setupAllowPowerups = true; }
-    // Reflect initial disabled state on the manage buttons
-    try {
-        const modsBtn = document.getElementById('setup-manage-mods');
-        const pupsBtn = document.getElementById('setup-manage-powerups');
-        if (modsBtn) {
-            if (!window.setupAllowWorldMods) modsBtn.classList.add('disabled'); else modsBtn.classList.remove('disabled');
-        }
-        if (pupsBtn) {
-            if (!window.setupAllowPowerups) pupsBtn.classList.add('disabled'); else pupsBtn.classList.remove('disabled');
-        }
-    } catch (e) {}
-    if (setupEnableWorldMods) setupEnableWorldMods.onchange = () => {
-        window.setupAllowWorldMods = !!setupEnableWorldMods.checked;
-        try { const modsBtn = document.getElementById('setup-manage-mods'); if (modsBtn) { if (!window.setupAllowWorldMods) modsBtn.classList.add('disabled'); else modsBtn.classList.remove('disabled'); } } catch (e) {}
-    };
-    if (setupEnablePowerups) setupEnablePowerups.onchange = () => {
-        window.setupAllowPowerups = !!setupEnablePowerups.checked;
-        try { const pupsBtn = document.getElementById('setup-manage-powerups'); if (pupsBtn) { if (!window.setupAllowPowerups) pupsBtn.classList.add('disabled'); else pupsBtn.classList.remove('disabled'); } } catch (e) {}
-    };
-    
-    densitySlider.oninput = () => { densityValue.textContent = densitySlider.value; };
-    sizeSlider.oninput = () => { sizeValue.textContent = sizeSlider.value; };
-    dynamicCheckbox.onchange = () => {
-        dynamicRateRow.style.display = dynamicCheckbox.checked ? 'flex' : 'none';
-    };
-    dynamicRateSlider.oninput = () => {
-        dynamicRateValue.textContent = parseFloat(dynamicRateSlider.value).toFixed(2);
-    };
-    // If the setup slider exists (fallback), wire its display update. Otherwise, the modal will handle showing the value.
-    try {
-        if (worldModifierSlider && worldModifierValue) {
-            worldModifierSlider.oninput = () => { worldModifierValue.textContent = worldModifierSlider.value; };
-        }
-    } catch (e) {}
-    // If host edits rounds input live, broadcast the change so joiner UI stays in sync
-    try {
-        if (roundsInput) {
-            roundsInput.onchange = roundsInput.oninput = function() {
-                try {
-                    const v = parseInt(roundsInput.value);
-                    if (NET.role === 'host' && NET.connected && window.ws && window.ws.readyState === WebSocket.OPEN && typeof v === 'number' && !isNaN(v) && v > 0) {
-                        window.ws.send(JSON.stringify({ type: 'relay', data: { type: 'rounds-update', rounds: v } }));
-                    }
-                } catch (e) {}
-            };
-        }
-    } catch (e) {}
-    document.getElementById('start-btn').onclick = () => {
-        OBSTACLE_COUNT = parseInt(densitySlider.value);
-        let size = parseInt(sizeSlider.value);
-        OBSTACLE_MIN_SIZE = Math.round(size * 0.6);
-        OBSTACLE_MAX_SIZE = size;
-        DYNAMIC_MODE = !!dynamicCheckbox.checked;
-        DYNAMIC_RATE = parseFloat(dynamicRateSlider.value);
-        MAP_BORDER = !!mapBorderCheckbox.checked;
-        // Read world modifier interval from the modal slider if present, otherwise use the setup slider fallback
-        try {
-            const modalSlider = document.getElementById('wm-world-mod-interval');
-            if (modalSlider && modalSlider.type === 'range') {
-                worldModifierRoundInterval = parseInt(modalSlider.value);
-            } else if (worldModifierSlider) {
-                worldModifierRoundInterval = parseInt(worldModifierSlider.value);
-            }
-        } catch (e) {}
-        // Read rounds-to-win setting
-        try {
-            const roundsInput = document.getElementById('rounds-to-win');
-            const v = roundsInput ? parseInt(roundsInput.value) : NaN;
-            if (typeof v === 'number' && !isNaN(v) && v > 0) ROUNDS_TO_WIN = v; else ROUNDS_TO_WIN = 10;
-    } catch (e) { ROUNDS_TO_WIN = 10; }
-        try { localStorage.setItem('shape_shot_rounds', String(ROUNDS_TO_WIN)); } catch (e) {}
-        // If we're host, inform joiner of the chosen rounds so they stay in sync
-        try {
-            if (NET.role === 'host' && NET.connected && window.ws && window.ws.readyState === WebSocket.OPEN) {
-                window.ws.send(JSON.stringify({ type: 'relay', data: { type: 'rounds-update', rounds: ROUNDS_TO_WIN } }));
-            }
-        } catch (e) {}
-        // Read enemy AI checkbox (on/off)
-        try {
-            const enemyAiCheckbox = document.getElementById('enemy-ai');
-            if (enemyAiCheckbox) {
-                const enabled = !!enemyAiCheckbox.checked;
-                enemyCount = enabled ? 1 : 0;
-                enemyDisabled = !enabled;
-            } else {
-                enemyCount = 1;
-                enemyDisabled = false;
-            }
-        } catch (e) { enemyCount = 1; enemyDisabled = false; }
-    hideSetupUI();
-        // Save chosen display name and populate NET.myName
-        try {
-            const nameInput = document.getElementById('display-name');
-            const myName = nameInput ? (nameInput.value || nameInput.placeholder || '') : '';
-            if (myName) {
-                NET.myName = myName.toString().slice(0,32);
-                try { localStorage.setItem('shape_shot_display_name', NET.myName); } catch (e) {}
-                try { updateCardsUI(); } catch (e) {}
-            }
-        } catch (e) {}
-        // If we're a joiner, inform host of our chosen name (in case we connected earlier)
-        try {
-            if (NET.role === 'joiner' && window.ws && window.ws.readyState === WebSocket.OPEN && NET.myName) {
-                window.ws.send(JSON.stringify({ type: 'relay', data: { type: 'set-name', name: NET.myName } }));
-            }
-        } catch (e) {}
-        // If a saved map is selected, load it into obstacles before starting
-        const sel = document.getElementById('saved-maps');
-        if (sel && sel.value) {
-            if (sel.value === '__RANDOM__') {
-                const key = pickRandomSavedMapKey();
-                if (key) loadSavedMapByKey(key);
-                else generateObstacles();
-            } else {
-                // load the selected key
-                loadSavedMapByKey(sel.value);
-            }
-        } else if (NET.role === 'host' && NET.connected) {
-            // Deterministically generate on host only, then broadcast to joiner
-            generateObstacles();
-        }
-        // Before starting, assign players/AI and configure WorldMaster mode
-        try { assignPlayersAndAI(); } catch (e) { console.warn('assignPlayersAndAI failed', e); }
-        if (!NET.connected) {
-            startGame();
-            return;
-        }
-        let roundStartPayload = null;
-        if (NET.role === 'host') {
-            roundStartPayload = {
-                type: 'round-start',
-                obstacles: serializeObstacles(),
-                names: {
-                    p0: (NET.myName || (player && player.displayName) || 'Player 1'),
-                    p1: (NET.peerName || (enemy && enemy.displayName) || 'Player 2')
-                },
-                dynamic: DYNAMIC_MODE,
-                dynamicRate: DYNAMIC_RATE,
-                mapBorder: MAP_BORDER,
-                worldModInterval: worldModifierRoundInterval
-            };
-        }
-        handleLocalReadyForStart(roundStartPayload);
-        return;
-    };
-
-    // Multiplayer UI wiring
-    const hostBtn = document.getElementById('host-btn');
-    const joinBtn = document.getElementById('join-btn');
-    const mpModal = document.getElementById('multiplayer-modal');
-    const mpHostSection = document.getElementById('mp-host-section');
-    const mpJoinSection = document.getElementById('mp-join-section');
-    const mpCancel = document.getElementById('mp-cancel');
-    const mpSessionCode = document.getElementById('mp-session-code');
-    const mpSessionRow = document.getElementById('mp-session-row');
-    const mpSessionLabel = document.getElementById('mp-session-label');
-    const mpCopyLink = document.getElementById('mp-copy-link');
-    const mpJoinCode = document.getElementById('mp-join-code');
-    const mpJoinConfirm = document.getElementById('mp-join-confirm');
-    const lobbyPlayersRow = document.getElementById('lobby-players');
-    const lobbyHostName = document.getElementById('lobby-host-name');
-    const lobbyJoinerName = document.getElementById('lobby-joiner-name');
-
-    function hideMpModal() {
-        if (mpModal) mpModal.style.display = 'none';
-        if (mpHostSection) mpHostSection.style.display = 'none';
-        if (mpJoinSection) mpJoinSection.style.display = 'none';
-    }
-
-    if (hostBtn) hostBtn.onclick = () => {
-        if (mpModal && mpHostSection) {
-            mpModal.style.display = 'flex';
-            mpHostSection.style.display = 'flex';
-            mpJoinSection.style.display = 'none';
-            // Generate a session code (simple random 6-char alphanumeric)
-            const code = Math.random().toString(36).substr(2, 6).toUpperCase();
-            if (mpSessionCode) mpSessionCode.value = code;
-            if (mpSessionRow && mpSessionLabel) {
-                mpSessionLabel.textContent = code;
-                mpSessionRow.style.display = 'block';
-            }
-            // show lobby players area while waiting
-            try { if (lobbyPlayersRow) lobbyPlayersRow.style.display = 'block'; } catch (e) {}
-            connectWebSocket('host', code);
-        }
-    };
-    if (joinBtn) joinBtn.onclick = () => {
-        if (mpModal && mpJoinSection) {
-            mpModal.style.display = 'flex';
-            mpHostSection.style.display = 'none';
-            mpJoinSection.style.display = 'flex';
-            if (mpJoinCode) {
-                mpJoinCode.value = '';
-                setTimeout(() => mpJoinCode.focus(), 100);
-            }
-        }
-    };
-    // Allow pressing Enter in join code input
-    if (mpJoinCode) {
-        mpJoinCode.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') {
-                if (mpJoinCode.value) {
-                    connectWebSocket('joiner', mpJoinCode.value.trim().toUpperCase());
-                }
-            }
-        });
-    }
-    // Auto-join if ?join=CODE in URL
-    const urlParams = new URLSearchParams(window.location.search);
-    const joinCodeFromUrl = urlParams.get('join');
-    if (joinCodeFromUrl) {
-        if (mpModal && mpJoinSection) {
-            mpModal.style.display = 'flex';
-            mpHostSection.style.display = 'none';
-            mpJoinSection.style.display = 'flex';
-            if (mpJoinCode) {
-                mpJoinCode.value = joinCodeFromUrl.trim().toUpperCase();
-                setTimeout(() => mpJoinCode.focus(), 100);
-            }
-        }
-    }
-    if (mpCancel) mpCancel.onclick = hideMpModal;
-    // Escape key closes modal
-    document.addEventListener('keydown', function(e) {
-        if (e.key === 'Escape' && mpModal && mpModal.style.display !== 'none') {
-            hideMpModal();
-        }
-    });
-    // Copy link button
-    if (mpCopyLink) mpCopyLink.onclick = function() {
-        if (mpSessionCode) {
-            const url = window.location.origin + window.location.pathname + '?join=' + mpSessionCode.value;
-            navigator.clipboard.writeText(url);
-            mpCopyLink.innerText = 'Copied!';
-            setTimeout(() => { mpCopyLink.innerText = 'Copy Link'; }, 1200);
-        }
-    };
-    // Join confirm button (placeholder, to be wired to WebSocket logic)
-    if (mpJoinConfirm) mpJoinConfirm.onclick = function() {
-        if (mpJoinCode && mpJoinCode.value) {
-            connectWebSocket('joiner', mpJoinCode.value);
-        }
-    };
-
-    // Paste button: paste clipboard text into join code input
-    const mpPasteBtn = document.getElementById('mp-paste');
-    if (mpPasteBtn) {
-        mpPasteBtn.addEventListener('click', async function() {
-            try {
-                if (navigator.clipboard && navigator.clipboard.readText) {
-                    const txt = await navigator.clipboard.readText();
-                    if (mpJoinCode) {
-                        // Extract potential code from URL or raw text
-                        let code = txt.trim();
-                        // If it's a URL with ?join=CODE, extract
-                        try {
-                            const u = new URL(code);
-                            const p = new URLSearchParams(u.search);
-                            const j = p.get('join');
-                            if (j) code = j;
-                        } catch (e) { /* not a URL, ignore */ }
-                        mpJoinCode.value = code.toUpperCase();
-                        mpJoinCode.focus();
-                        mpJoinCode.select();
-                    }
-                } else {
-                    // Fallback: prompt paste
-                    const txt = prompt('Paste invite code or link here:');
-                    if (txt && mpJoinCode) {
-                        mpJoinCode.value = txt.trim().toUpperCase();
-                        mpJoinCode.focus();
-                        mpJoinCode.select();
-                    }
-                }
-            } catch (err) {
-                // Graceful fallback on permission denied / error
-                const txt = prompt('Paste invite code or link here:');
-                if (txt && mpJoinCode) {
-                    mpJoinCode.value = txt.trim().toUpperCase();
-                    mpJoinCode.focus();
-                    mpJoinCode.select();
-                }
-            }
-        });
-    }
-
-    // Helper to set or clear session display when code changes
-    function setMpSessionDisplay(code) {
-        if (mpSessionRow && mpSessionLabel) {
-            if (code && code.length) {
-                mpSessionLabel.textContent = code;
-                mpSessionRow.style.display = 'block';
-            } else {
-                mpSessionLabel.textContent = '';
-                mpSessionRow.style.display = 'none';
-            }
-        }
-    }
-
-    // Update lobby players row with names (safe helper)
-    function setLobbyPlayers(hostName, joinerName) {
-        try {
-            if (lobbyPlayersRow) lobbyPlayersRow.style.display = 'block';
-            const defaultHost = (NET.role === 'host') ? (NET.myName || 'Player 1') : (NET.hostName || NET.peerName || 'Player 1');
-            const defaultJoiner = (NET.role === 'host') ? (NET.getJoinerName(0) || NET.peerName || 'Player 2') : (NET.myName || 'Player 2');
-            if (lobbyHostName) lobbyHostName.textContent = hostName || defaultHost;
-            if (lobbyJoinerName) lobbyJoinerName.textContent = joinerName || defaultJoiner;
-        } catch (e) {}
-    }
-
-    // Host broadcasts setup changes (sliders/toggles) to joiner
-    function broadcastSetup() {
-        if (NET.role !== 'host' || !window.ws || window.ws.readyState !== WebSocket.OPEN) return;
-        const setup = {
-            type: 'setup',
-            data: {
-                density: parseInt(densitySlider.value),
-                size: parseInt(sizeSlider.value),
-                dynamic: !!dynamicCheckbox.checked,
-                dynamicRate: parseFloat(dynamicRateSlider.value),
-                mapBorder: !!mapBorderCheckbox.checked,
-                worldModInterval: worldModifierSlider ? parseInt(worldModifierSlider.value) : worldModifierRoundInterval,
-                // Include WorldMaster mode fields
-                wmEnabled: !!worldMasterEnabled,
-                wmPlayerIndex: (typeof worldMasterPlayerIndex === 'number' ? worldMasterPlayerIndex : null),
-                // Also include Enemy AI toggle so joiner can mirror blue AI presence when host is WM
-                enemyAI: (function(){ try { const el = document.getElementById('enemy-ai'); return !!(el && el.checked); } catch(e) { return true; } })()
-            }
-        };
-        try {
-            if (playerRoster && typeof playerRoster.toSerializable === 'function') {
-                setup.data.roster = playerRoster.toSerializable({ includeEntity: false });
-            }
-        } catch (e) {}
-        window.ws.send(JSON.stringify({ type: 'relay', data: setup }));
-    }
-    // Also broadcast when Enemy AI is toggled; update local flags so UI can reflect immediately
-    try {
-        const enemyAiToggle = document.getElementById('enemy-ai');
-        const onAiChange = () => {
-            try {
-                const enabled = !!enemyAiToggle.checked;
-                enemyCount = enabled ? 1 : 0;
-                enemyDisabled = !enabled;
-            } catch (e) {}
-            try { updateCardsUI(); } catch (e) {}
-            try { broadcastSetup(); } catch (e) {}
-        };
-        if (enemyAiToggle) {
-            enemyAiToggle.addEventListener('input', onAiChange);
-            enemyAiToggle.addEventListener('change', onAiChange);
-        }
-    } catch (e) { /* non-fatal */ }
-    [densitySlider,sizeSlider,dynamicCheckbox,dynamicRateSlider,mapBorderCheckbox,worldModifierSlider].forEach(el => {
-        if (el) el.addEventListener('input', () => broadcastSetup());
-        if (el) el.addEventListener('change', () => broadcastSetup());
-    });
-
-    // Apply incoming setup and preview UI for the joiner
-    function applyIncomingSetup(s) {
-        try {
-            densitySlider.value = s.density; densityValue.textContent = densitySlider.value;
-            sizeSlider.value = s.size; sizeValue.textContent = sizeSlider.value;
-            dynamicCheckbox.checked = !!s.dynamic; dynamicRateRow.style.display = s.dynamic ? 'flex' : 'none';
-            dynamicRateSlider.value = s.dynamicRate.toFixed(2); dynamicRateValue.textContent = parseFloat(dynamicRateSlider.value).toFixed(2);
-            mapBorderCheckbox.checked = !!s.mapBorder;
-            worldModifierSlider.value = s.worldModInterval; worldModifierValue.textContent = worldModifierSlider.value;
-            // Mirror Enemy AI toggle from host so UI and game logic align (used for host-is-WM 2p behavior)
-            if (typeof s.enemyAI !== 'undefined') {
-                try {
-                    const enemyAiCheckbox = document.getElementById('enemy-ai');
-                    if (enemyAiCheckbox) enemyAiCheckbox.checked = !!s.enemyAI;
-                    enemyCount = s.enemyAI ? 1 : 0;
-                    enemyDisabled = !s.enemyAI;
-                } catch (e) { /* non-fatal */ }
-            }
-            // Apply WorldMaster settings from host
-            if (typeof s.wmEnabled !== 'undefined') worldMasterEnabled = !!s.wmEnabled;
-            if (typeof s.wmPlayerIndex !== 'undefined') worldMasterPlayerIndex = (s.wmPlayerIndex === null ? null : s.wmPlayerIndex|0);
-            try { updateWorldMasterSetupUI(); } catch (e) {}
-            // Re-assign local roles and configure WM instance/UI as needed
-            try { assignPlayersAndAI(); } catch (e) {}
-            // Apply roster snapshot from host so joiner sees accurate seating
-            if (s.roster && playerRoster && typeof playerRoster.importSerializable === 'function') {
-                try { playerRoster.importSerializable(s.roster, { preserveExternalIds: true }); renderRosterUI(); } catch (err) {}
-            }
-            // Refresh cards UI so labels/rows reflect the new setup immediately on joiner
-            try { updateCardsUI(); } catch (e) {}
-        } catch (e) {}
-    }
-
-    // Helper so radios can broadcast WM changes
-    window.broadcastSetupWM = function() {
-        try { broadcastSetup(); } catch (e) {}
-    };
-}
-
 function showSetupOverlay() {
     showSetupUI();
     resetMultiplayerReadyState();
@@ -9791,16 +8071,17 @@ window.addEventListener('mousemove', e => {
     mouse.y = (e.clientY - rect.top) * (canvas.height / rect.height);
 });
 window.addEventListener('keydown', e => {
-    // Ignore game keybinds if typing in dev console input
     const devInput = document.getElementById('dev-console-input');
-    if (document.activeElement === devInput) return;
-    
+    const activeEl = document.activeElement;
+    const typingInField = activeEl && (activeEl === devInput || activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable);
+    if (typingInField) return;
+
     // Ignore game controls if WorldMaster mode is active
     if (window.disablePlayerControls) {
-        
+
         return;
     }
-    
+
     keys[e.key.toLowerCase()] = true;
     if (e.key === ' ' || e.code === 'Space') {
         // mark keyboard state; collectLocalInput reads keys[] and player.shootQueued may be used as fallback
@@ -9810,16 +8091,17 @@ window.addEventListener('keydown', e => {
     }
 });
 window.addEventListener('keyup', e => {
-    // Ignore game keybinds if typing in dev console input
     const devInput = document.getElementById('dev-console-input');
-    if (document.activeElement === devInput) return;
-    
+    const activeEl = document.activeElement;
+    const typingInField = activeEl && (activeEl === devInput || activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable);
+    if (typingInField) return;
+
     // Ignore game controls if WorldMaster mode is active
     if (window.disablePlayerControls) {
-        
+
         return;
     }
-    
+
     keys[e.key.toLowerCase()] = false;
     if (e.key === ' ' || e.code === 'Space') {
         // clear shoot queued to avoid sticky state
@@ -9938,6 +8220,27 @@ function startGame() {
             if (slot1Entity && slots[1] && slots[1].fighter) {
                 try { playerRoster.setEntityReference(slots[1].fighter.id, slot1Entity); } catch (e) {}
             }
+            // Assign entities for additional human slots (joiners beyond the first)
+            try {
+                for (let i = 2; i < slots.length; i++) {
+                    const slot = slots[i];
+                    if (!slot || !slot.fighter || slot.fighter.kind !== 'human') continue;
+                    let ent = playerRoster.getEntityReference(slot.fighter.id);
+                    if (ent) continue; // already assigned
+                    // Create a new entity for this remote human player
+                    const color = (typeof getRosterFighterColor === 'function') ? getRosterFighterColor(i, slot.fighter) : '#ff5a5a';
+                    const angle = ((i - 2) / Math.max(1, slots.length - 2)) * Math.PI * 2 - Math.PI/2; // distribute starting from top
+                    const radius = Math.min(window.CANVAS_W, window.CANVAS_H) * 0.32;
+                    const px = Math.round(window.CANVAS_W/2 + Math.cos(angle) * radius);
+                    const py = Math.round(window.CANVAS_H/2 + Math.sin(angle) * radius);
+                    ent = new Player(false, color, px, py);
+                    ent.displayName = slot.fighter.name || `Player ${i}`;
+                    ent.score = slot.fighter.score || 0;
+                    ent._isRosterHuman = true;
+                    ent._rosterFighterId = slot.fighter.id;
+                    try { playerRoster.setEntityReference(slot.fighter.id, ent); } catch (e) {}
+                }
+            } catch (e) { console.warn('Failed to assign entities for additional human slots:', e); }
         }
     } catch (e) {}
     // Ensure colors are right for current mode
@@ -10048,7 +8351,7 @@ updateCardsUI();
 // --- Options modal wiring ---
 function saveVolumesToStorage() {
     try {
-        localStorage.setItem('shape_shot_volumes', JSON.stringify({ master: masterVolume, music: musicVolume, sfx: sfxVolume, shot: shotVolume, explosion: explosionVolume, ricochet: ricochetVolume, hit: hitVolume, dash: dashVolume, burning: burningVolume }));
+    localStorage.setItem('shape_shot_volumes', JSON.stringify({ master: masterVolume, music: musicVolume, sfx: sfxVolume, shot: shotVolume, explosion: explosionVolume, ricochet: ricochetVolume, hit: hitVolume, impact: impactVolume, dash: dashVolume, burning: burningVolume }));
     } catch (e) {}
 }
 
@@ -10075,6 +8378,8 @@ function applyVolumeSlidersToUI() {
     const dav = document.getElementById('dash-vol-val');
     const bu = document.getElementById('burning-vol');
     const buv = document.getElementById('burning-vol-val');
+    const imp = document.getElementById('impact-vol');
+    const impv = document.getElementById('impact-vol-val');
     // Map multipliers so slider value 50 represents multiplier 1.0
     if (sh) { sh.value = Math.round(shotVolume * 50); if (shv) shv.innerText = Math.round(sh.value); }
     if (ex) { ex.value = Math.round(explosionVolume * 50); if (exv) exv.innerText = Math.round(ex.value); }
@@ -10082,6 +8387,7 @@ function applyVolumeSlidersToUI() {
     if (hi) { hi.value = Math.round(hitVolume * 50); if (hiv) hiv.innerText = Math.round(hi.value); }
     if (da) { da.value = Math.round(dashVolume * 50); if (dav) dav.innerText = Math.round(da.value); }
     if (bu) { bu.value = Math.round(burningVolume * 50); if (buv) buv.innerText = Math.round(bu.value); }
+    if (imp) { imp.value = Math.round(impactVolume * 50); if (impv) impv.innerText = Math.round(imp.value); }
 }
 
     // Load saved display name into setup input (if present)
@@ -10129,7 +8435,8 @@ document.addEventListener('DOMContentLoaded', function() {
         shotVolume = 1.0;
         explosionVolume = 1.0;
         ricochetVolume = 1.0;
-        hitVolume = 1.0;
+    hitVolume = 1.0;
+    impactVolume = 1.0;
         dashVolume = 1.0;
         burningVolume = 1.0;
         // cursor defaults
@@ -10243,6 +8550,7 @@ document.addEventListener('DOMContentLoaded', function() {
     function updateExplosion(val) { explosionVolume = val / 50; const el = document.getElementById('explosion-vol-val'); if (el) el.innerText = Math.round(val); }
     function updateRicochet(val) { ricochetVolume = val / 50; const el = document.getElementById('ricochet-vol-val'); if (el) el.innerText = Math.round(val); }
     function updateHit(val) { hitVolume = val / 50; const el = document.getElementById('hit-vol-val'); if (el) el.innerText = Math.round(val); }
+    function updateImpact(val) { impactVolume = val / 50; const el = document.getElementById('impact-vol-val'); if (el) el.innerText = Math.round(val); }
     function updateDash(val) { dashVolume = val / 50; const el = document.getElementById('dash-vol-val'); if (el) el.innerText = Math.round(val); }
     function updateBurning(val) { burningVolume = val / 50; const el = document.getElementById('burning-vol-val'); if (el) el.innerText = Math.round(val); }
 
@@ -10257,7 +8565,9 @@ document.addEventListener('DOMContentLoaded', function() {
     if (shotSlider) shotSlider.addEventListener('input', e => updateShot(e.target.value));
     if (explosionSlider) explosionSlider.addEventListener('input', e => updateExplosion(e.target.value));
     if (ricochetSlider) ricochetSlider.addEventListener('input', e => updateRicochet(e.target.value));
-    if (hitSlider) hitSlider.addEventListener('input', e => updateHit(e.target.value));
+    if (hitSlider) hitSlider.addEventListener('input', e => { updateHit(e.target.value); saveVolumesToStorage(); });
+    const impactSlider = document.getElementById('impact-vol');
+    if (impactSlider) impactSlider.addEventListener('input', e => { updateImpact(e.target.value); saveVolumesToStorage(); });
     const dashSlider = document.getElementById('dash-vol');
     if (dashSlider) dashSlider.addEventListener('input', e => updateDash(e.target.value));
     const burningSlider = document.getElementById('burning-vol');
@@ -10274,12 +8584,14 @@ document.addEventListener('DOMContentLoaded', function() {
         const btnHit = document.getElementById('preview-hit');
         const btnDash = document.getElementById('preview-dash');
         const btnBurning = document.getElementById('preview-burning');
+        const btnImpact = document.getElementById('preview-impact');
         if (btnShot) btnShot.addEventListener('click', (e) => { e.stopPropagation(); try { playGunShot(); } catch (ex) {} });
         if (btnExpl) btnExpl.addEventListener('click', (e) => { e.stopPropagation(); try { playExplosion(); } catch (ex) {} });
         if (btnRic) btnRic.addEventListener('click', (e) => { e.stopPropagation(); try { playRicochet(); } catch (ex) {} });
         if (btnHit) btnHit.addEventListener('click', (e) => { e.stopPropagation(); try { playHit(); } catch (ex) {} });
         if (btnDash) btnDash.addEventListener('click', (e) => { e.stopPropagation(); try { playDashWoosh(0.28, 1.0); } catch (ex) {} });
         if (btnBurning) btnBurning.addEventListener('click', (e) => { e.stopPropagation(); try { playBurning(1.0); } catch (ex) {} });
+        if (btnImpact) btnImpact.addEventListener('click', (e) => { e.stopPropagation(); try { playImpact(3.5); } catch (ex) {} });
     } catch (e) { /* ignore if elements missing */ }
 
     // Inject subtle CSS for preview buttons to keep them visually light
@@ -10769,3 +9081,5 @@ devInput.addEventListener('keydown', function(e) {
         devInput.value = '';
     }
 });
+
+

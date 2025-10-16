@@ -91,6 +91,9 @@ class GameEventManager {
             case 'sound-effect':
                 if (typeof applySoundEffectEvent === 'function') applySoundEffectEvent(event.data);
                 break;
+            case 'impact':
+                if (typeof applyImpactEvent === 'function') applyImpactEvent(event.data);
+                break;
             default:
                 if (window.console) console.warn('Unknown game event type:', event.type, event);
         }
