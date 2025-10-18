@@ -13,6 +13,9 @@
             this.speed = owner.bulletSpeed;
             this.angle = angle;
             this.damage = owner.bulletDamage;
+            // Max travel distance in pixels (can be modified by powerups on owner)
+            this.range = (typeof owner.bulletRange === 'number') ? owner.bulletRange : (typeof window !== 'undefined' && typeof window.BULLET_RANGE === 'number' ? window.BULLET_RANGE : 1200);
+            this.distanceTraveled = 0;
             this.pierce = owner.pierce || false;
             this.pierceStacks = owner.pierceStacks || 0;
             this.pierceLimit = this.pierce ? (30 + this.pierceStacks) : 0;
@@ -34,10 +37,26 @@
             this.isLocalPlayerBullet = false; // Set by main.js based on network role
             // Stable ID for host-authoritative snapshots (assigned on host when fired)
             this.id = null;
+            // Trailing effect: store previous positions
+            this.trail = [];
+            // Trail length and visibility: length primarily based on speed but now also increases with damage.
+            // Keep values clamped so extremely fast or high-damage bullets don't create huge trails.
+            const speedBased = Math.round(this.speed / 85); // slightly stronger speed influence (smaller divisor => longer)
+            const damageBased = Math.round(Math.min(6, (this.damage || 0) * 0.6)); // modest contribution from damage, capped
+            this.trailMax = Math.max(2, Math.min(18, speedBased + damageBased));
+            // Trail size: keep a small base but scale more strongly with damage for intensity effects
+            this.trailSizeScale = Math.max(0.08, Math.min(4.0, 0.10 + (this.damage || 0) * 0.09));
+            // Trail alpha: very faint by default, scale with damage but slightly reduced sensitivity
+            this.trailAlphaScale = Math.max(0.02, Math.min(3.0, 0.03 + (this.damage || 0) * 0.06));
         }
         update(dt) {
-            // If Shot Controller is active and playerControlActive, steer toward cursor
-            if (this.shotController && this.playerControlActive && this.isLocalPlayerBullet && typeof window !== 'undefined' && window.mouse) {
+            // If Shot Controller is active and playerControlActive, steer toward cursor.
+            // Allow steering in single-player (NET not connected) even if isLocalPlayerBullet
+            // wasn't explicitly set. In multiplayer, require the bullet to be flagged
+            // as local (`isLocalPlayerBullet`) to avoid joiner simulating host bullets.
+            const netAvailable = (typeof NET !== 'undefined' && NET && NET.connected);
+            const allowLocalSteer = !netAvailable || this.isLocalPlayerBullet;
+            if (this.shotController && this.playerControlActive && allowLocalSteer && typeof window !== 'undefined' && window.mouse) {
                 // Count down homing delay first so bullets maintain initial spread for a short time
                 if (this.homingDelay > 0) {
                     this.homingDelay -= dt;
@@ -61,8 +80,26 @@
                 }
                 }
             }
-            this.x += Math.cos(this.angle) * this.speed * dt;
-            this.y += Math.sin(this.angle) * this.speed * dt;
+            const dx = Math.cos(this.angle) * this.speed * dt;
+            const dy = Math.sin(this.angle) * this.speed * dt;
+            this.x += dx;
+            this.y += dy;
+            // Store trail positions
+            this.trail.push({x: this.x, y: this.y});
+            if (this.trail.length > this.trailMax) this.trail.shift();
+            // Track traveled distance and expire when exceeding range
+            this.distanceTraveled += Math.hypot(dx, dy);
+                if (typeof this.range === 'number' && this.distanceTraveled >= this.range) {
+                    // bullets expire when they reach max range (do not explode automatically)
+                    this.active = false;
+                    return;
+                }
+                // If pierce limit reached, and bullet is inside obstacle, expire silently
+                if (this.pierce && typeof this.pierceLimit === 'number' && this.pierceLimit <= 0 && this.insideObstacle) {
+                    // No explosion, impact, or sound
+                    this.active = false;
+                    return;
+                }
             if (MAP_BORDER) {
                 let bounced = false;
                 if (this.x - this.radius < 0) {
@@ -76,6 +113,14 @@
                         if (this.explosive) {
                             try { if (typeof triggerExplosion === 'function') triggerExplosion(this, this.radius + 2, this.y); } catch (e) {}
                         }
+                        try {
+                            if (typeof globalObj.createImpactLines === 'function') {
+                                // normal for left wall points to the right (1,0)
+                                globalObj.createImpactLines(this.x, this.y, this.damage || 1, (this.owner && this.owner.color) ? this.owner.color : '#ffffff', 0);
+                                try { if (typeof globalObj.playImpact === 'function') globalObj.playImpact(this.damage || 1); } catch (e) {}
+                                try { if (typeof globalObj.createSyncedImpact === 'function' && typeof NET !== 'undefined' && NET && NET.role === 'host') globalObj.createSyncedImpact(this.x, this.y, this.damage || 1, (this.owner && this.owner.color) ? this.owner.color : '#ffffff', 0); } catch (e) {}
+                            }
+                        } catch (e) {}
                         this.active = false;
                     }
                 }
@@ -90,6 +135,14 @@
                         if (this.explosive) {
                             try { if (typeof triggerExplosion === 'function') triggerExplosion(this, CANVAS_W - this.radius - 2, this.y); } catch (e) {}
                         }
+                        try {
+                            if (typeof globalObj.createImpactLines === 'function') {
+                                // normal for right wall points to the left (-1,0)
+                                globalObj.createImpactLines(this.x, this.y, this.damage || 1, (this.owner && this.owner.color) ? this.owner.color : '#ffffff', Math.PI);
+                                try { if (typeof globalObj.playImpact === 'function') globalObj.playImpact(this.damage || 1); } catch (e) {}
+                                try { if (typeof globalObj.createSyncedImpact === 'function' && typeof NET !== 'undefined' && NET && NET.role === 'host') globalObj.createSyncedImpact(this.x, this.y, this.damage || 1, (this.owner && this.owner.color) ? this.owner.color : '#ffffff', Math.PI); } catch (e) {}
+                            }
+                        } catch (e) {}
                         this.active = false;
                     }
                 }
@@ -104,6 +157,14 @@
                         if (this.explosive) {
                             try { if (typeof triggerExplosion === 'function') triggerExplosion(this, this.x, this.radius + 2); } catch (e) {}
                         }
+                        try {
+                            if (typeof globalObj.createImpactLines === 'function') {
+                                // normal for top wall points down (0,1)
+                                globalObj.createImpactLines(this.x, this.y, this.damage || 1, (this.owner && this.owner.color) ? this.owner.color : '#ffffff', Math.PI/2);
+                                try { if (typeof globalObj.playImpact === 'function') globalObj.playImpact(this.damage || 1); } catch (e) {}
+                                try { if (typeof globalObj.createSyncedImpact === 'function' && typeof NET !== 'undefined' && NET && NET.role === 'host') globalObj.createSyncedImpact(this.x, this.y, this.damage || 1, (this.owner && this.owner.color) ? this.owner.color : '#ffffff', Math.PI/2); } catch (e) {}
+                            }
+                        } catch (e) {}
                         this.active = false;
                     }
                 }
@@ -118,6 +179,14 @@
                         if (this.explosive) {
                             try { if (typeof triggerExplosion === 'function') triggerExplosion(this, this.x, CANVAS_H - this.radius - 2); } catch (e) {}
                         }
+                        try {
+                            if (typeof globalObj.createImpactLines === 'function') {
+                                // normal for bottom wall points up (0,-1)
+                                globalObj.createImpactLines(this.x, this.y, this.damage || 1, (this.owner && this.owner.color) ? this.owner.color : '#ffffff', -Math.PI/2);
+                                try { if (typeof globalObj.playImpact === 'function') globalObj.playImpact(this.damage || 1); } catch (e) {}
+                                try { if (typeof globalObj.createSyncedImpact === 'function' && typeof NET !== 'undefined' && NET && NET.role === 'host') globalObj.createSyncedImpact(this.x, this.y, this.damage || 1, (this.owner && this.owner.color) ? this.owner.color : '#ffffff', -Math.PI/2); } catch (e) {}
+                            }
+                        } catch (e) {}
                         this.active = false;
                     }
                 }

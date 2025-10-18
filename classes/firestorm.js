@@ -38,14 +38,38 @@
             
             // Only run game logic (damage/ignition) on host or in single-player (NET.role not 'joiner')
             if (NET.role !== 'joiner') {
-                // Damage and ignite players/enemy (main.js logic, untouched)
-                const participants = [player].concat(enemyDisabled ? [] : [enemy]);
+                // Damage and ignite players/enemy and any roster-controlled fighters
+                const participants = [];
+                if (player) participants.push(player);
+                if (!enemyDisabled && typeof enemy !== 'undefined' && enemy) participants.push(enemy);
+                try {
+                    if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+                        const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+                        for (const f of fighters) {
+                            if (!f || !f.entity) continue;
+                            // Skip worldmaster placeholders
+                            if (f.metadata && f.metadata.isWorldMaster) continue;
+                            const ent = f.entity;
+                            if (!participants.includes(ent)) participants.push(ent);
+                        }
+                    }
+                } catch (e) {}
+
                 for (let p of participants) {
-                    if (p.health > 0 && dist(p.x, p.y, this.x, this.y) < this.radius + p.radius) {
+                    if (!p || p.health <= 0) continue;
+                    if (dist(p.x, p.y, this.x, this.y) < this.radius + p.radius) {
                         if (!p.burning) {
                             p.burning = { time: 0, duration: 3 + Math.random()*1.5 };
                             try { playBurning(p.burning.duration); } catch (e) { /* ignore audio errors */ }
-                            try { if (NET && NET.role === 'host' && NET.connected) GameEvents.emit('burning-start', { entityId: p.id, duration: p.burning.duration }); } catch (e) {}
+                            // Emit roster-aware burning event for joiners: prefer fighterId when available
+                            try {
+                                if (NET && NET.role === 'host' && NET.connected) {
+                                    const payload = { duration: p.burning.duration };
+                                    if (p._rosterFighterId) payload.fighterId = p._rosterFighterId;
+                                    else if (p.id) payload.entityId = p.id;
+                                    try { GameEvents.emit('burning-start', payload); } catch (e) {}
+                                }
+                            } catch (e) {}
                         }
                     }
                 }

@@ -343,6 +343,8 @@
 			this.bulletSpeed = BULLET_SPEED;
 			this.bulletRadius = BULLET_RADIUS;
 			this.bulletDamage = BULLET_DAMAGE;
+			// max travel distance for bullets (pixels)
+			this.bulletRange = BULLET_RANGE;
 			this.shootInterval = SHOOT_INTERVAL;
 			this.timeSinceShot = 0;
 			this.target = { x: this.x, y: this.y };

@@ -677,4 +677,201 @@
     } catch (err) {
         /* no-op */
     }
+
+    // --- Global roster helpers (migrated from main.js) ---
+
+    function getActiveRosterInstance() {
+        try {
+            const roster = globalObj.playerRoster;
+            if (!roster) return null;
+            if (roster instanceof PlayerRoster) return roster;
+            if (typeof roster.getFighters === 'function' && typeof roster.getEntityReference === 'function') {
+                return roster;
+            }
+        } catch (err) { /* ignore */ }
+        return null;
+    }
+
+    function collectRosterEntries(options = {}) {
+        const roster = getActiveRosterInstance();
+        if (!roster) return [];
+        const includeEliminated = options.includeEliminated === true;
+        let fighters = [];
+        try {
+            fighters = roster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+        } catch (err) {
+            fighters = [];
+        }
+        const entries = [];
+        for (const fighter of fighters) {
+            if (!fighter) continue;
+            if (!includeEliminated && fighter.isAlive === false) continue;
+            if (fighter.metadata && fighter.metadata.isWorldMaster) continue;
+            let entity = null;
+            try {
+                entity = roster.getEntityReference(fighter.id) || fighter.entity || null;
+            } catch (err) {
+                entity = fighter && fighter.entity ? fighter.entity : null;
+            }
+            if (!entity) continue;
+            entries.push({ fighter, entity });
+        }
+        return entries;
+    }
+
+    function getFighterRecordForEntity(entity) {
+        if (!entity) return null;
+        const roster = getActiveRosterInstance();
+        if (!roster) return null;
+        let fighters = [];
+        try {
+            fighters = roster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+        } catch (err) {
+            fighters = [];
+        }
+        for (const fighter of fighters) {
+            if (!fighter) continue;
+            let ref = null;
+            try {
+                ref = roster.getEntityReference(fighter.id) || fighter.entity || null;
+            } catch (err) {
+                ref = fighter.entity || null;
+            }
+            if (ref === entity) return fighter;
+        }
+        return null;
+    }
+
+    function resolveChooserRoleForSlot(slotIndex) {
+        if (slotIndex === null || slotIndex === undefined) return 'host';
+        const roster = getActiveRosterInstance();
+        if (roster && typeof roster.getSlots === 'function') {
+            try {
+                const slots = roster.getSlots({ includeDetails: true }) || [];
+                const slot = slots[slotIndex];
+                if (slot && slot.fighter) {
+                    const fighter = slot.fighter;
+                    const meta = fighter.metadata || {};
+                    const control = typeof meta.control === 'string' ? meta.control : null;
+                    if (fighter.kind === 'bot') return 'host';
+                    if (control === 'local' || control === 'host') return 'host';
+                    if (control === 'remote') return 'joiner';
+                    if (Number.isInteger(meta.joinerIndex)) return 'joiner';
+                    if (!Number.isInteger(meta.joinerIndex) && typeof meta.joinerIndex === 'string') {
+                        const parsedMeta = parseInt(meta.joinerIndex, 10);
+                        if (!Number.isNaN(parsedMeta) && parsedMeta >= 0) return 'joiner';
+                    }
+                }
+            } catch (err) {}
+        }
+        if (slotIndex === 0) return 'host';
+        return 'joiner';
+    }
+
+    function resolveJoinerIndexForSlot(slotIndex) {
+        if (slotIndex === null || slotIndex === undefined) return null;
+        const roster = getActiveRosterInstance();
+        if (!roster || typeof roster.getSlots !== 'function') return null;
+        try {
+            const slots = roster.getSlots({ includeDetails: true }) || [];
+            const slot = slots[slotIndex];
+            if (!slot || !slot.fighter) return null;
+            const fighter = slot.fighter;
+            const meta = fighter.metadata || {};
+            if (Number.isInteger(meta.joinerIndex)) return meta.joinerIndex;
+            if (!Number.isInteger(meta.joinerIndex) && typeof meta.joinerIndex === 'string') {
+                const parsedMeta = parseInt(meta.joinerIndex, 10);
+                if (!Number.isNaN(parsedMeta) && parsedMeta >= 0) return parsedMeta;
+            }
+            if (typeof fighter.externalId === 'string' && fighter.externalId.startsWith('net-joiner-')) {
+                const parsed = parseInt(fighter.externalId.replace('net-joiner-', ''), 10);
+                if (!Number.isNaN(parsed) && parsed >= 0) return parsed;
+            }
+        } catch (err) {}
+        return null;
+    }
+
+    function resolveJoinerIndexForEntity(entity) {
+        const record = getFighterRecordForEntity(entity);
+        if (!record) return null;
+        if (record.metadata) {
+            if (Number.isInteger(record.metadata.joinerIndex)) {
+                return record.metadata.joinerIndex;
+            }
+            if (!Number.isInteger(record.metadata.joinerIndex) && typeof record.metadata.joinerIndex === 'string') {
+                const parsedMeta = parseInt(record.metadata.joinerIndex, 10);
+                if (!Number.isNaN(parsedMeta) && parsedMeta >= 0) return parsedMeta;
+            }
+        }
+        if (typeof record.slotIndex === 'number') {
+            return resolveJoinerIndexForSlot(record.slotIndex);
+        }
+        return null;
+    }
+
+    function inferRoleForEntity(entity, options = {}) {
+        if (!entity) return options.defaultRole || null;
+        try {
+            const netAvailable = (typeof globalObj.NET !== 'undefined' && globalObj.NET);
+            if (!netAvailable || !globalObj.NET.connected) {
+                return entity.isPlayer ? 'host' : 'joiner';
+            }
+            const localRole = globalObj.NET.role;
+            if (localRole === 'host') {
+                if (entity === globalObj.player) return 'host';
+                if (entity === globalObj.enemy) return 'joiner';
+            } else if (localRole === 'joiner') {
+                if (entity === globalObj.player) return 'joiner';
+                if (entity === globalObj.enemy) return 'host';
+            }
+            const fighterRecord = getFighterRecordForEntity(entity);
+            if (fighterRecord && typeof fighterRecord.slotIndex === 'number') {
+                return resolveChooserRoleForSlot(fighterRecord.slotIndex);
+            }
+        } catch (err) {
+            /* ignore */
+        }
+        return options.defaultRole || null;
+    }
+
+    function getEntityForFighterId(fighterId) {
+        if (fighterId === null || fighterId === undefined) return null;
+        const roster = getActiveRosterInstance();
+        if (!roster) return null;
+        const normalizedId = String(fighterId);
+        try {
+            if (typeof roster.getEntityReference === 'function') {
+                const direct = roster.getEntityReference(normalizedId) || roster.getEntityReference(fighterId);
+                if (direct) return direct;
+            }
+        } catch (err) { /* ignore */ }
+        const entries = collectRosterEntries({ includeEliminated: true });
+        for (const entry of entries) {
+            if (entry && entry.fighter && String(entry.fighter.id) === normalizedId) {
+                return entry.entity || null;
+            }
+        }
+        return null;
+    }
+
+    function isEntityActive(entity, options = {}) {
+        if (!entity) return false;
+        if (entity.disabled) return false;
+        if (typeof entity.health === 'number' && entity.health <= 0) return false;
+        if (options.skipRosterLookup) return true;
+        const fighterRecord = getFighterRecordForEntity(entity);
+        if (fighterRecord && fighterRecord.isAlive === false) return false;
+        return true;
+    }
+
+    if (typeof globalObj !== 'undefined') {
+        globalObj.collectRosterEntries = collectRosterEntries;
+        globalObj.getFighterRecordForEntity = getFighterRecordForEntity;
+    globalObj.resolveChooserRoleForSlot = resolveChooserRoleForSlot;
+    globalObj.resolveJoinerIndexForSlot = resolveJoinerIndexForSlot;
+    globalObj.resolveJoinerIndexForEntity = resolveJoinerIndexForEntity;
+        globalObj.inferRoleForEntity = inferRoleForEntity;
+        globalObj.getEntityForFighterId = getEntityForFighterId;
+        globalObj.isEntityActive = isEntityActive;
+    }
 })(typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : this));

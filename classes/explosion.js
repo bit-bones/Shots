@@ -56,6 +56,14 @@
                             if (this.isFireshot) {
                                 let stacks = (this.owner && this.owner.fireshotStacks) ? this.owner.fireshotStacks : 1;
                                 p.burning = { time: 0, duration: 1.2 + 1.3 * stacks };
+                                try {
+                                    if (globalObj.NET && globalObj.NET.role === 'host' && globalObj.NET.connected) {
+                                        const payload = { duration: p.burning.duration };
+                                        if (p._rosterFighterId) payload.fighterId = p._rosterFighterId;
+                                        else if (p.id) payload.entityId = p.id;
+                                        try { globalObj.GameEvents.emit('burning-start', payload); } catch (e) {}
+                                    }
+                                } catch (e) {}
                             }
                         }
                     }
@@ -68,7 +76,15 @@
                             h.takeDamage(this.damage, this.owner || null);
                             if (this.isFireshot) {
                                 let stacks = (this.owner && this.owner.fireshotStacks) ? this.owner.fireshotStacks : 1;
-                                h.burning = { time: 0, duration: 1.2 + 1.3 * stacks };
+                                    h.burning = { time: 0, duration: 1.2 + 1.3 * stacks };
+                                    try {
+                                        if (globalObj.NET && globalObj.NET.role === 'host' && globalObj.NET.connected) {
+                                            const payload = { duration: h.burning.duration };
+                                            if (h._rosterFighterId) payload.fighterId = h._rosterFighterId;
+                                            else if (h.id) payload.entityId = h.id;
+                                            try { globalObj.GameEvents.emit('burning-start', payload); } catch (e) {}
+                                        }
+                                    } catch (e) {}
                             }
                             h._lastAttacker = null;
                         }
@@ -95,7 +111,7 @@
                                         const cy = c.y + c.h / 2;
                                         const d2 = (cx - this.x) * (cx - this.x) + (cy - this.y) * (cy - this.y);
                                         if (d2 <= this.radius * this.radius) {
-                                            c.burning = { time: 0, duration: dur };
+                                                c.burning = { time: 0, duration: dur };
                                             // Emit burning event for joiner sync
                                             try {
                                                 const obsIdx = globalObj.obstacles ? globalObj.obstacles.indexOf(o) : -1;
@@ -121,6 +137,11 @@
                                     const d2 = (cx - this.x) * (cx - this.x) + (cy - this.y) * (cy - this.y);
                                     if (d2 <= this.radius * this.radius) {
                                         ic.burning = { time: 0, duration: dur2 };
+                                        try {
+                                            if (globalObj.NET && globalObj.NET.role === 'host' && globalObj.NET.connected) {
+                                                try { globalObj.GameEvents.emit('burning-start', { infestedId: ic.id, duration: dur2 }); } catch (e) {}
+                                            }
+                                        } catch (e) {}
                                     }
                                 }
                             }
