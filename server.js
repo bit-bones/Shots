@@ -1,9 +1,16 @@
 // Minimal WebSocket server for multiplayer relay
 // Run with: node server.js
+const http = require('http');
 const WebSocket = require('ws');
 const PORT = process.env.PORT || 3001;
 const MAX_JOINERS = 4; // Allows host + up to four additional players (supports 5 roster slots)
-const wss = new WebSocket.Server({ port: PORT });
+
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Shots multiplayer relay running');
+});
+
+const wss = new WebSocket.Server({ server });
 
 const sessions = new Map();
 
@@ -158,4 +165,6 @@ wss.on('connection', function connection(ws) {
     });
 });
 
-console.log('WebSocket server running on port', PORT);
+server.listen(PORT, () => {
+    console.log('WebSocket server running on port', PORT);
+});
