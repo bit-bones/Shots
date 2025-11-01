@@ -6,10 +6,28 @@ function setupOverlayInit() {
     window.wsSession = null;
     window.remotePlayerState = { x: 0, y: 0, shoot: false, dash: false };
     window.lastSentAction = {};
-    // Configurable server URL: prefer ?ws=, otherwise try same origin, fallback to localhost
-    const paramWs = new URLSearchParams(window.location.search).get('ws');
-    const defaultWs = (location.protocol === 'https:' ? 'wss://' : 'ws://') + (location.hostname || 'localhost') + ':3001';
-    window.MULTIPLAYER_WS_URL = paramWs || defaultWs;
+    function getConfiguredWsUrl() {
+        const paramWs = new URLSearchParams(window.location.search).get('ws');
+        if (paramWs) return paramWs;
+
+        try {
+            const meta = document.querySelector('meta[name="ws-relay"]');
+            if (meta && meta.content) return meta.content.trim();
+        } catch (_) {}
+
+        const isSecure = location.protocol === 'https:';
+        const host = location.hostname || 'localhost';
+
+        if (isSecure) {
+            const portSeg = location.port && location.port !== '443' ? `:${location.port}` : '';
+            return `wss://${host}${portSeg}`;
+        }
+
+        const portSeg = location.port ? `:${location.port}` : ':3001';
+        return `ws://${host}${portSeg}`;
+    }
+
+    window.MULTIPLAYER_WS_URL = getConfiguredWsUrl();
 
     window.sendAction = function(action) {
         if (window.ws && window.ws.readyState === WebSocket.OPEN) {
