@@ -1219,6 +1219,8 @@ function setupOverlayInit() {
 
     function showReconnectButton() { const b = ensureReconnectButton(); b.style.display = 'block'; }
     function hideReconnectButton() { const b = ensureReconnectButton(); b.style.display = 'none'; b.innerText = 'Reconnect'; }
+    window.showReconnectButton = showReconnectButton;
+    window.hideReconnectButton = hideReconnectButton;
 
     // Patch after each connect
     let oldConnectWebSocket = null;
@@ -1705,6 +1707,20 @@ function setupOverlayInit() {
 
     // Paste button: paste clipboard text into join code input
     const mpPasteBtn = document.getElementById('mp-paste');
+    [mpSessionRow, mpSessionLabel].forEach((el) => {
+        if (!el) return;
+        el.addEventListener('contextmenu', function(ev) {
+            try {
+                if (typeof NET === 'undefined' || !NET.connected) return;
+                if (!mpSessionLabel || !mpSessionLabel.textContent.trim()) return;
+                if (mpSessionRow && mpSessionRow.style.display === 'none') return;
+                ev.preventDefault();
+                showRosterContextMenu('session', ev.clientX, ev.clientY);
+            } catch (err) {
+                ev.preventDefault();
+            }
+        });
+    });
     if (mpPasteBtn) {
         mpPasteBtn.addEventListener('click', async function() {
             try {

@@ -1419,25 +1419,59 @@ function hideRosterContextMenu() {
     _rosterContextEl = null;
 }
 
-function showRosterContextMenu(slotIndex, x, y) {
+function showRosterContextMenu(target, x, y) {
     hideRosterContextMenu();
     try {
-        const desc = describeRosterSlot(slotIndex);
-        const fighter = desc && desc.fighter ? desc.fighter : null;
-        if (!fighter || fighter.kind !== 'bot') return;
+        const menuItems = [];
+        if (target === 'session') {
+            if (typeof NET === 'undefined' || !NET.connected) return;
+            if (NET.role === 'host') {
+                menuItems.push({
+                    label: 'Close Lobby',
+                    action: () => {
+                        hideRosterContextMenu();
+                        closeHostedLobby();
+                    }
+                });
+            } else if (NET.role === 'joiner') {
+                menuItems.push({
+                    label: 'Leave Lobby',
+                    action: () => {
+                        hideRosterContextMenu();
+                        leaveLobbyAsJoiner();
+                    }
+                });
+            } else {
+                return;
+            }
+        } else {
+            const slotIndex = target;
+            const desc = describeRosterSlot(slotIndex);
+            const fighter = desc && desc.fighter ? desc.fighter : null;
+            if (!fighter || fighter.kind !== 'bot') return;
+            menuItems.push({
+                label: 'Rename',
+                action: () => {
+                    hideRosterContextMenu();
+                    beginInlineRenameForSlot(slotIndex);
+                }
+            });
+        }
+        if (!menuItems.length) return;
         const menu = document.createElement('div');
         menu.className = 'roster-context-menu';
         Object.assign(menu.style, { position: 'absolute', left: x + 'px', top: y + 'px', zIndex: 20000, background: '#111', color: '#fff', padding: '6px', borderRadius: '6px', boxShadow: '0 6px 18px rgba(0,0,0,0.6)' });
-        const rename = document.createElement('div');
-        rename.className = 'roster-context-item';
-        rename.textContent = 'Rename';
-        rename.style.cursor = 'pointer';
-        rename.onclick = (ev) => {
-            ev && ev.stopPropagation && ev.stopPropagation();
-            hideRosterContextMenu();
-            beginInlineRenameForSlot(slotIndex);
-        };
-        menu.appendChild(rename);
+        menuItems.forEach(item => {
+            const entry = document.createElement('div');
+            entry.className = 'roster-context-item';
+            entry.textContent = item.label;
+            entry.style.cursor = 'pointer';
+            entry.onclick = (ev) => {
+                if (ev && ev.stopPropagation) ev.stopPropagation();
+                item.action();
+            };
+            menu.appendChild(entry);
+        });
         document.body.appendChild(menu);
         _rosterContextEl = menu;
         setTimeout(() => {
@@ -1445,6 +1479,54 @@ function showRosterContextMenu(slotIndex, x, y) {
             window.addEventListener('click', closer);
         }, 0);
     } catch (e) { console.warn('Failed to show roster context menu', e); }
+}
+
+function closeHostedLobby() {
+    if (typeof NET === 'undefined' || NET.role !== 'host' || !NET.connected) return;
+    try {
+        if (window.ws) {
+            try { window.ws.onclose = null; } catch (e) {}
+            try { window.ws.onerror = null; } catch (e) {}
+        }
+        NET.handleDisconnect('Host closed lobby');
+        try { if (typeof hideReconnectButton === 'function') hideReconnectButton(); } catch (e) {}
+        try { if (typeof setMpSessionDisplay === 'function') setMpSessionDisplay(''); } catch (e) {}
+        try {
+            const mpModal = document.getElementById('multiplayer-modal');
+            if (mpModal) mpModal.style.display = 'none';
+        } catch (e) {}
+        window.wsRole = null;
+        window.wsSession = null;
+        try { NET.setRole(null); } catch (e) { NET.role = null; }
+        try { window.ws = null; } catch (e) {}
+        try { hideRosterContextMenu(); } catch (e) {}
+    } catch (err) {
+        console.warn('Failed to close multiplayer lobby', err);
+    }
+}
+
+function leaveLobbyAsJoiner() {
+    if (typeof NET === 'undefined' || NET.role !== 'joiner' || !NET.connected) return;
+    try {
+        if (window.ws) {
+            try { window.ws.onclose = null; } catch (e) {}
+            try { window.ws.onerror = null; } catch (e) {}
+            try { window.ws.close(); } catch (e) {}
+        }
+        NET.handleDisconnect('Joiner left lobby');
+        try { if (typeof hideReconnectButton === 'function') hideReconnectButton(); } catch (e) {}
+        try { if (typeof setMpSessionDisplay === 'function') setMpSessionDisplay(''); } catch (e) {}
+        try {
+            const mpModal = document.getElementById('multiplayer-modal');
+            if (mpModal) mpModal.style.display = 'none';
+        } catch (e) {}
+        window.wsRole = null;
+        window.wsSession = null;
+        try { window.ws = null; } catch (e) {}
+        try { NET.setRole(null); } catch (e) { NET.role = null; }
+    } catch (err) {
+        console.warn('Failed to leave multiplayer lobby', err);
+    }
 }
 
 function beginInlineRenameForSlot(slotIndex) {
@@ -1940,20 +2022,6 @@ document.addEventListener('DOMContentLoaded', () => {
             // Hide the multiplayer modal
             const mpModal = document.getElementById('multiplayer-modal');
             if (mpModal) mpModal.style.display = 'none';
-            // If session is already created, keep it active and joinable
-            // If not, create session now (simulate host/invite click)
-            if (typeof NET !== 'undefined' && NET && NET.role === 'host' && NET.connected) {
-                // Session is already active, do nothing
-            } else {
-                // If not connected, trigger host/invite logic
-                if (typeof startHostSession === 'function') {
-                    startHostSession();
-                } else if (typeof hostBtn === 'object' && hostBtn && typeof hostBtn.click === 'function') {
-                    hostBtn.click();
-                }
-            }
-            // Ensure session code remains visible in roster and joiners can connect
-            try { if (typeof setMpSessionDisplay === 'function') setMpSessionDisplay(); } catch (e) {}
         });
     }
     // --- Prevent browser menus and stuck movement when clicking outside canvas ---
