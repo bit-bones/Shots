@@ -722,6 +722,23 @@ function setupOverlayInit() {
                                     }
                                 } catch (err) {}
                                 try { cardState.active = false; waitingForCard = false; } catch (err) {}
+                                // Ensure any selection pause flags are cleared on clients
+                                try {
+                                    if (typeof roundFlowState !== 'undefined' && roundFlowState) {
+                                        roundFlowState.awaitingCardSelection = false;
+                                        roundFlowState.awaitingCardFighterId = null;
+                                        roundFlowState.awaitingCardEntity = null;
+                                        roundFlowState.awaitingCardChooserRole = null;
+                                        roundFlowState.awaitingCardSlotIndex = null;
+                                        roundFlowState.awaitingCardJoinerIndex = null;
+                                    }
+                                } catch (e) {}
+                                // If a local CardDraftManager exists on this client, cancel any stale draft
+                                try {
+                                    if (typeof cardDraftManager !== 'undefined' && cardDraftManager && typeof cardDraftManager.hasActiveDraft === 'function' && cardDraftManager.hasActiveDraft() && typeof cardDraftManager.cancelDraft === 'function') {
+                                        cardDraftManager.cancelDraft({ reason: 'selection-complete-remote' });
+                                    }
+                                } catch (e) {}
                             };
                             const mirrored = highlightRemoteSelection();
                             if (mirrored) {
@@ -738,13 +755,98 @@ function setupOverlayInit() {
                         if (div) { div.style.display = 'none'; div.innerHTML = ''; div.classList.remove('card-bg-visible'); }
                     } catch (e) {}
                     try { cardState.active = false; waitingForCard = false; } catch (e) {}
+                    // Ensure any selection pause flags are cleared on clients (fallback path)
+                    try {
+                        if (typeof roundFlowState !== 'undefined' && roundFlowState) {
+                            roundFlowState.awaitingCardSelection = false;
+                            roundFlowState.awaitingCardFighterId = null;
+                            roundFlowState.awaitingCardEntity = null;
+                            roundFlowState.awaitingCardChooserRole = null;
+                            roundFlowState.awaitingCardSlotIndex = null;
+                            roundFlowState.awaitingCardJoinerIndex = null;
+                        }
+                    } catch (err) {}
+                    // Cancel any stale client-side draft state
+                    try {
+                        if (typeof cardDraftManager !== 'undefined' && cardDraftManager && typeof cardDraftManager.hasActiveDraft === 'function' && cardDraftManager.hasActiveDraft() && typeof cardDraftManager.cancelDraft === 'function') {
+                            cardDraftManager.cancelDraft({ reason: 'selection-complete-remote' });
+                        }
+                    } catch (err) {}
                 } else if (data && data.type === 'card-hover') {
                     // Mirror hover state for non-chooser clients
                     try {
                         const chooserRole = data.chooserRole;
                         const idx = typeof data.idx === 'number' ? data.idx : -1;
+                        const shouldForward = (() => {
+                            try {
+                                if (!NET || !NET.connected) return false;
+                                if (NET.role !== 'host') return false;
+                                if (!window.ws || window.ws.readyState !== WebSocket.OPEN) return false;
+                                if (data.forwardedByHost) return false;
+                                if (typeof data.joinerIndex === 'number') return true;
+                                if (chooserRole === 'joiner') return true;
+                            } catch (err) {}
+                            return false;
+                        })();
+                        if (shouldForward) {
+                            try {
+                                const forwardPayload = Object.assign({}, data, { forwardedByHost: true });
+                                window.ws.send(JSON.stringify({ type: 'relay', data: forwardPayload }));
+                            } catch (err) {}
+                        }
                         const div = document.getElementById('card-choices');
                         if (div && div.childNodes && div.childNodes.length > 0) {
+                            const fighterIdMsg = (data && data.fighterId != null) ? String(data.fighterId) : null;
+                            const slotIndexMsg = (typeof data.slotIndex === 'number') ? data.slotIndex : null;
+                            const joinerIndexMsg = (() => {
+                                try {
+                                    if (typeof coerceJoinerIndex === 'function') return coerceJoinerIndex(data ? data.joinerIndex : null);
+                                } catch (err) {}
+                                return (typeof data.joinerIndex === 'number' && data.joinerIndex >= 0) ? Math.floor(data.joinerIndex) : null;
+                            })();
+                            const inlineColor = (() => {
+                                const raw = (typeof data.color === 'string') ? data.color.trim() : '';
+                                return raw && raw.length ? raw : null;
+                            })();
+                            let rosterRecord = null;
+                            if (fighterIdMsg) {
+                                try {
+                                    if (playerRoster && typeof playerRoster.getFighterById === 'function') {
+                                        rosterRecord = playerRoster.getFighterById(fighterIdMsg, { includeEntity: true }) || null;
+                                    }
+                                } catch (err) { rosterRecord = null; }
+                            }
+                            const deriveAccentColor = () => {
+                                if (inlineColor) return inlineColor;
+                                let slotForColor = slotIndexMsg;
+                                if (rosterRecord) {
+                                    if (typeof rosterRecord.slotIndex === 'number') slotForColor = rosterRecord.slotIndex;
+                                    try {
+                                        const colorFromRecord = getRosterFighterColor(slotForColor, rosterRecord);
+                                        if (colorFromRecord && colorFromRecord.trim().length) return colorFromRecord;
+                                        if (rosterRecord.color && rosterRecord.color.trim().length) return rosterRecord.color;
+                                    } catch (err) {}
+                                }
+                                if (slotForColor != null) {
+                                    try {
+                                        const slots = (playerRoster && typeof playerRoster.getSlots === 'function') ? playerRoster.getSlots({ includeDetails: true }) : [];
+                                        const slotEntry = Array.isArray(slots) && slotForColor >= 0 && slotForColor < slots.length ? slots[slotForColor] : null;
+                                        const slotFighter = slotEntry && slotEntry.fighter ? slotEntry.fighter : null;
+                                        const colorFromSlot = getRosterFighterColor(slotForColor, slotFighter);
+                                        if (colorFromSlot && colorFromSlot.trim().length) return colorFromSlot;
+                                    } catch (err) {}
+                                }
+                                if (joinerIndexMsg != null) {
+                                    try {
+                                        const joinerColor = getJoinerColor(joinerIndexMsg);
+                                        if (joinerColor && joinerColor.trim().length) return joinerColor;
+                                    } catch (err) {}
+                                }
+                                const chooserEntity = getEntityForRole(chooserRole);
+                                if (chooserEntity && chooserEntity.color) return chooserEntity.color;
+                                return '#65c6ff';
+                            };
+                            const accentColor = deriveAccentColor();
                             // Remove existing highlights
                             for (let n = 0; n < div.childNodes.length; ++n) {
                                 const c = div.childNodes[n];
@@ -764,24 +866,21 @@ function setupOverlayInit() {
                             }
                             if (idx >= 0 && idx < div.childNodes.length) {
                                 const card = div.childNodes[idx];
-                                // chooserRole color mapping: map role to the correct local entity
-                                const chooserEntity = getEntityForRole(chooserRole);
-                                const color = chooserEntity && chooserEntity.color ? chooserEntity.color : null;
                                 try {
                                     card.classList.add('selected', 'centered');
                                     card.style.zIndex = 10;
                                     // store original transform if not present
                                     if (!card._origTransform) card._origTransform = card.style.transform;
                                     card.style.transform = 'translate(-50%, -60px) scale(1.18) rotate(0deg)';
-                                    if (color) {
-                                        card.style.setProperty('border', '3px solid ' + color, 'important');
-                                        card.style.setProperty('box-shadow', '0 6px 18px ' + color, 'important');
-                                        card.style.setProperty('color', color, 'important');
-                                        const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', color, 'important');
+                                    if (accentColor) {
+                                        card.style.setProperty('border', '3px solid ' + accentColor, 'important');
+                                        card.style.setProperty('box-shadow', '0 6px 18px ' + accentColor, 'important');
+                                        card.style.setProperty('color', accentColor, 'important');
+                                        const sm = card.querySelector('small'); if (sm) sm.style.setProperty('color', accentColor, 'important');
                                         if (!card._accentClass) card._accentClass = 'card-accent-' + Math.floor(Math.random()*1000000);
                                         if (!card._accentStyle) {
                                             const styleEl = document.createElement('style');
-                                            styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${color}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${color}55 0%, #0000 100%) !important; }`;
+                                            styleEl.innerText = `.${card._accentClass}::after{ background: radial-gradient(ellipse at center, ${accentColor}33 0%, #0000 100%) !important; } .${card._accentClass}.centered::after{ background: radial-gradient(ellipse at center, ${accentColor}55 0%, #0000 100%) !important; }`;
                                             document.head.appendChild(styleEl);
                                             card._accentStyle = styleEl;
                                         }

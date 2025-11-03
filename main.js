@@ -613,15 +613,27 @@ function notifyPowerupSelectionComplete(loserEntity, selectedCardName) {
             shouldBroadcastSelection = true;
         }
     }
-    if (fighterRecord && fighterRecord.id && fighterRecord.id === expectedId) {
+    const resolvedFighterIdForDraft = (() => {
+        if (fighterRecord && fighterRecord.id != null) return String(fighterRecord.id);
+        if (expectedId != null) return String(expectedId);
+        return null;
+    })();
+    if (cardDraftManager && typeof cardDraftManager.hasActiveDraft === 'function' && cardDraftManager.hasActiveDraft()) {
+        const selection = selectedCardName ? { id: selectedCardName, name: selectedCardName } : null;
         try {
-            if (cardDraftManager && typeof cardDraftManager.hasActiveDraft === 'function' && cardDraftManager.hasActiveDraft()) {
-                const selection = selectedCardName ? { id: selectedCardName, name: selectedCardName } : null;
-                cardDraftManager.recordSelection(String(fighterRecord.id), selection, { source: 'powerup-ui' });
+            if (resolvedFighterIdForDraft && typeof cardDraftManager.recordSelection === 'function') {
+                const meta = fighterRecord ? { source: 'powerup-ui' } : { source: 'powerup-ui', fallback: true };
+                cardDraftManager.recordSelection(resolvedFighterIdForDraft, selection, meta);
+            }
+        } catch (err) {
+            console.warn('[Draft] Failed to record card selection', err);
+        }
+        try {
+            if (typeof cardDraftManager.cancelDraft === 'function' && cardDraftManager.hasActiveDraft()) {
                 cardDraftManager.cancelDraft({ reason: 'selection-complete' });
             }
         } catch (err) {
-            console.warn('[Draft] Failed to finalize card selection', err);
+            console.warn('[Draft] Failed to cancel draft after selection', err);
         }
     }
     roundFlowState.awaitingCardSelection = false;
@@ -631,6 +643,16 @@ function notifyPowerupSelectionComplete(loserEntity, selectedCardName) {
     roundFlowState.awaitingCardSlotIndex = null;
     roundFlowState.awaitingCardJoinerIndex = null;
     waitingForCard = false;
+    // Force unpause for local player entity if not eliminated (joiner path)
+    if (typeof NET !== 'undefined' && NET.role === 'joiner' && player) {
+        // Only clear disabled if player is not eliminated
+        if (typeof player.health === 'number' && player.health > 0) {
+            player.disabled = false;
+            player.dashActive = false;
+            player.teledashWarmupActive = false;
+            player.teledashPendingTeleport = false;
+        }
+    }
     if (shouldBroadcastSelection && typeof window !== 'undefined' && window.ws && window.ws.readyState === WebSocket.OPEN) {
         try {
             window.ws.send(JSON.stringify({
@@ -1067,6 +1089,23 @@ function hostEvaluateEliminations() {
 let rosterUIBound = false;
 let rosterInitialized = false;
 let localFighterId = null;
+
+function resetRosterToLocalDefaults() {
+    try {
+        if (playerRoster && typeof playerRoster.reset === 'function') {
+            playerRoster.reset({ forgetExternal: true });
+        }
+    } catch (err) {
+        console.warn('[Roster] Failed to reset roster state', err);
+    }
+    try { isMultiplayer = false; } catch (e) {}
+    try { lobbyPlayers = []; } catch (e) {}
+    rosterInitialized = false;
+    try { renderRosterUI(); } catch (err) {}
+    try { updateWorldMasterSetupUI(); } catch (err) {}
+    try { updateCardsUI(); } catch (err) {}
+    try { assignPlayersAndAI(); } catch (err) {}
+}
 
 const HOST_PLAYER_COLOR = '#65c6ff';
 // Joiner colors for slots 2..5: red, yellow, green, purple
@@ -3574,8 +3613,9 @@ const NET = {
     },
     // Read local input (joiner). We map to existing variables.
     collectLocalInput() {
-    // If player entity is not active (eliminated/disabled), return neutral input
-    try { if (!isEntityActive(player)) return { up: false, down: false, left: false, right: false, shoot: false, dash: false, aimX: 0, aimY: 0 }; } catch (e) {}
+    // If player entity is not active (eliminated/disabled), return neutral input.
+    // Use skipRosterLookup to avoid stale roster flags on joiner clients incorrectly suppressing input.
+    try { if (!isEntityActive(player, { skipRosterLookup: true })) return { up: false, down: false, left: false, right: false, shoot: false, dash: false, aimX: 0, aimY: 0 }; } catch (e) {}
 
     // Shoot: continuous while held. Use keyboard state or legacy player.shootQueued as a fallback.
     const spacePressed = !!keys[' '] || !!keys['space'] || !!player.shootQueued;
@@ -3636,6 +3676,7 @@ const NET = {
         // Revert colors to single-player default
     if (player) player.color = HOST_PLAYER_COLOR;
     if (enemy) enemy.color = getJoinerColor(0);
+        try { resetRosterToLocalDefaults(); } catch (e) {}
         // Stop current game loop and show setup so both players are forced back to lobby
         try { stopGame(); } catch (e) {}
         // Show reconnect button to allow the user to attempt to reconnect to the same session
@@ -4267,17 +4308,51 @@ function gameLoop(ts) {
     // Always run NET frame so networking continues while card UI is active
     try { if (NET && typeof NET.onFrame === 'function') NET.onFrame(dt); } catch (e) {}
     const selectionPaused = isSelectionPauseActive();
-    if (!selectionPaused) {
-        update(dt);
-    } else {
-        // Keep WorldMaster cooldowns/UI ticking during card UI
-        try {
-            if (window.WorldMasterIntegration && typeof window.WorldMasterIntegration.updateWorldMaster === 'function') {
-                window.WorldMasterIntegration.updateWorldMaster(dt);
-            } else if (window.gameWorldMasterInstance && typeof window.gameWorldMasterInstance.update === 'function') {
-                window.gameWorldMasterInstance.update(dt);
+    // Debug: log selectionPaused and player state
+    if (typeof NET !== 'undefined' && NET.role === 'joiner') {
+        if (selectionPaused && player && typeof player.health === 'number' && player.health > 0 && !player.disabled) {
+            console.warn('[DEBUG] Forcing selection pause OFF for joiner: player is alive and not disabled');
+            // Force clear selection pause flags
+            if (typeof roundFlowState !== 'undefined') {
+                roundFlowState.awaitingCardSelection = false;
+                roundFlowState.awaitingCardFighterId = null;
+                roundFlowState.awaitingCardEntity = null;
+                roundFlowState.awaitingCardChooserRole = null;
+                roundFlowState.awaitingCardSlotIndex = null;
+                roundFlowState.awaitingCardJoinerIndex = null;
+                roundFlowState.roundTransitionActive = false;
             }
-        } catch (e) {}
+            if (typeof waitingForCard !== 'undefined') waitingForCard = false;
+            if (typeof cardState !== 'undefined') cardState.active = false;
+            if (cardDraftManager && typeof cardDraftManager.cancelDraft === 'function' && cardDraftManager.hasActiveDraft && cardDraftManager.hasActiveDraft()) {
+                cardDraftManager.cancelDraft({ reason: 'force-unpause' });
+            }
+            update(dt);
+        } else if (!selectionPaused) {
+            update(dt);
+        } else {
+            // Keep WorldMaster cooldowns/UI ticking during card UI
+            try {
+                if (window.WorldMasterIntegration && typeof window.WorldMasterIntegration.updateWorldMaster === 'function') {
+                    window.WorldMasterIntegration.updateWorldMaster(dt);
+                } else if (window.gameWorldMasterInstance && typeof window.gameWorldMasterInstance.update === 'function') {
+                    window.gameWorldMasterInstance.update(dt);
+                }
+            } catch (e) {}
+        }
+    } else {
+        if (!selectionPaused) {
+            update(dt);
+        } else {
+            // Keep WorldMaster cooldowns/UI ticking during card UI
+            try {
+                if (window.WorldMasterIntegration && typeof window.WorldMasterIntegration.updateWorldMaster === 'function') {
+                    window.WorldMasterIntegration.updateWorldMaster(dt);
+                } else if (window.gameWorldMasterInstance && typeof window.gameWorldMasterInstance.update === 'function') {
+                    window.gameWorldMasterInstance.update(dt);
+                }
+            } catch (e) {}
+        }
     }
     draw();
     animFrameId = requestAnimationFrame(gameLoop);
@@ -5356,6 +5431,7 @@ function update(dt) {
                 // Shooting per-joiner (host authoritative)
                 remoteEntity.timeSinceShot = (remoteEntity.timeSinceShot || 0) + dt;
                 if (NET.remoteShootQueuedMap && NET.remoteShootQueuedMap[jIdx] && remoteEntity.timeSinceShot >= remoteEntity.shootInterval) {
+                    if (!isEntityActive(remoteEntity)) continue;
                     const wantsShoot = !!(ri && ri.shoot);
                     if (wantsShoot) {
                         const aimX = (ri && typeof ri.aimX === 'number') ? ri.aimX : player.x;
@@ -5372,6 +5448,66 @@ function update(dt) {
                 }
                 // Clear transient flags on this per-joiner input record
                 if (ri) { ri.shoot = false; ri.dash = false; }
+            }
+        } catch (e) { /* defensive */ }
+        // Dash continuation for roster players
+        try {
+            const rosterEntities = [];
+            if (typeof playerRoster !== 'undefined' && playerRoster && typeof playerRoster.getFighters === 'function') {
+                const fighters = playerRoster.getFighters({ includeUnassigned: false, includeEntity: true }) || [];
+                for (const f of fighters) {
+                    if (!f || !f.entity) continue;
+                    if (f.isAlive === false) continue;
+                    const ent = f.entity;
+                    if (!ent) continue;
+                    if (ent === player || ent === enemy) continue;  // Skip legacy
+                    rosterEntities.push(ent);
+                }
+            }
+            for (const ent of rosterEntities) {
+                if (!ent) continue;
+                if (!isEntityActive(ent)) {
+                    if (ent.dashActive) {
+                        ent.dashActive = false;
+                        ent.dashTime = 0;
+                    }
+                    continue;
+                }
+                if (ent.dashActive) {
+                    let dashSet = getDashSettings(ent);
+                    if (isTeledashEnabled(ent)) {
+                        // For roster players, use simplified teledash without blockers for now
+                        updateTeledashWarmup(ent, dt, dashSet, () => ({ x: ent.x, y: ent.y }), { obstacles, others: [] });
+                    } else {
+                        let dashVx = ent.dashDir.x * ent.speed * dashSet.speedMult;
+                        let dashVy = ent.dashDir.y * ent.speed * dashSet.speedMult;
+                        let oldx = ent.x, oldy = ent.y;
+                        ent.x += dashVx * dt; ent.y += dashVy * dt;
+                        ent.x = clamp(ent.x, ent.radius, window.CANVAS_W - ent.radius);
+                        ent.y = clamp(ent.y, ent.radius, CANVAS_H - ent.radius);
+                        let collided = false;
+                        // For roster players, check collision with active entities
+                        const activeEntities = [player, enemy].concat(rosterEntities.filter(e => e !== ent && isEntityActive(e)));
+                        for (const other of activeEntities) {
+                            if (ent.ram && dist(ent.x, ent.y, other.x, other.y) < ent.radius + other.radius) {
+                                if (isEntityActive(other)) {
+                                    let dmg = 18 + (ent.ramStacks || 0) * 6;
+                                    other._lastAttacker = ent;
+                                    other.takeDamage(dmg);
+                                    other._lastAttacker = null;
+                                    ent.x = oldx; ent.y = oldy; collided = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!collided) {
+                            for (let o of obstacles) { if (o.circleCollide(ent.x, ent.y, ent.radius)) { ent.x = oldx; ent.y = oldy; collided = true; break; } }
+                        }
+                        ent.dashTime -= dt; if (ent.dashTime <= 0 || collided) ent.dashActive = false;
+                    }
+                } else {
+                    ent.dashCooldown = Math.max(0, ent.dashCooldown - dt);
+                }
             }
         } catch (e) { /* defensive */ }
     } else {
@@ -7222,7 +7358,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
     const slotMatchesLocal = !!(localSlotIndex !== null && resolvedSlotIndex !== null && localSlotIndex === resolvedSlotIndex);
     const fighterIdMatchesLocal = !!(localFighterIdStr && fighterId && localFighterIdStr === fighterId);
     const externalIdMatchesLocal = !!(localExternalId && loserRecord && typeof loserRecord.externalId === 'string' && loserRecord.externalId === localExternalId);
-    const joinerMatchesLocal = !!(joinerIndexFromOptions !== null && localJoinerIndex !== null && joinerIndexFromOptions === localJoinerIndex);
+    const joinerMatchesLocal = !!(joinerIndexPayload !== null && localJoinerIndex !== null && joinerIndexPayload === localJoinerIndex);
     const metadataSuggestsLocal = (() => {
         if (!loserRecord || !loserRecord.metadata) return false;
         const meta = loserRecord.metadata;
@@ -7255,6 +7391,27 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
         if (NET.role === 'joiner' && chooserRole === 'host') {
             isLocalChooser = false;
         } else if (NET.role === 'host' && chooserRole === 'joiner') {
+            isLocalChooser = false;
+        }
+    }
+    const isSpectatorController = (() => {
+        try { return window.localPlayerIndex === -1; } catch (err) { return false; }
+    })();
+    if (!isSpectatorController && typeof NET !== 'undefined' && NET && NET.connected && chooserRole === 'joiner') {
+        if (NET.role === 'joiner') {
+            const localIdx = Number.isInteger(NET.joinerIndex) ? NET.joinerIndex : null;
+            if (joinerIndexPayload !== null) {
+                if (localIdx === null || localIdx !== joinerIndexPayload) {
+                    isLocalChooser = false;
+                }
+            } else if (!metadataSuggestsLocal) {
+                isLocalChooser = false;
+            }
+        } else if (NET.role === 'host') {
+            if (!metadataSuggestsLocal) {
+                isLocalChooser = false;
+            }
+        } else {
             isLocalChooser = false;
         }
     }
@@ -7314,6 +7471,7 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
     cardState.active = true;
     div.innerHTML = '';
     div.style.pointerEvents = 'auto';
+    const hoverColorPayload = (typeof loserColor === 'string' && loserColor.trim().length) ? loserColor : null;
     const handRadius = 220, cardWidth = 170, cardHeight = 220; const baseAngle = Math.PI/2, spread = Math.PI/1.1;
     for (let i = 0; i < choices.length; ++i) {
         const opt = choices[i];
@@ -7347,7 +7505,22 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                     card.classList.add(card._accentClass);
                 } catch (ex) {}
                 // send hover signal to remote peer
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-hover', chooserRole: chooserRole, idx: i } })); } catch (e) {}
+                try {
+                    if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+                        window.ws.send(JSON.stringify({
+                            type: 'relay',
+                            data: {
+                                type: 'card-hover',
+                                chooserRole: chooserRole,
+                                idx: i,
+                                color: hoverColorPayload,
+                                fighterId: fighterIdForMessage,
+                                slotIndex: slotIndexForMessage,
+                                joinerIndex: joinerIndexPayload
+                            }
+                        }));
+                    }
+                } catch (e) {}
             } catch (e) {}
         };
         card.onmouseleave = () => {
@@ -7363,7 +7536,22 @@ function netShowPowerupCards(choiceNames, chooserRole, opts) {
                     if (card._accentClass) card.classList.remove(card._accentClass);
                     if (card._accentStyle) { card._accentStyle.remove(); card._accentStyle = null; }
                 } catch (ex) {}
-                try { if (window.ws && window.ws.readyState === WebSocket.OPEN) window.ws.send(JSON.stringify({ type:'relay', data:{ type:'card-hover', chooserRole: chooserRole, idx: -1 } })); } catch (e) {}
+                try {
+                    if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+                        window.ws.send(JSON.stringify({
+                            type: 'relay',
+                            data: {
+                                type: 'card-hover',
+                                chooserRole: chooserRole,
+                                idx: -1,
+                                color: hoverColorPayload,
+                                fighterId: fighterIdForMessage,
+                                slotIndex: slotIndexForMessage,
+                                joinerIndex: joinerIndexPayload
+                            }
+                        }));
+                    }
+                } catch (e) {}
             } catch (e) {}
         };
 
@@ -8154,7 +8342,7 @@ window.addEventListener('keydown', e => {
     if (e.key === ' ' || e.code === 'Space') {
         // mark keyboard state; collectLocalInput reads keys[] and player.shootQueued may be used as fallback
         // keep player.shootQueued for legacy code paths
-        try { if (!isEntityActive(player)) return; } catch (e) {}
+        try { if (!isEntityActive(player, { skipRosterLookup: true })) return; } catch (e) {}
         player.shootQueued = true;
     }
 });
@@ -8395,7 +8583,7 @@ if (canvas) {
                 return;
             }
             // queue a shoot action (legacy/compat path) only if player is active
-            try { if (!isEntityActive(player)) return; } catch (e) {}
+            try { if (!isEntityActive(player, { skipRosterLookup: true })) return; } catch (e) {}
             if (player) player.shootQueued = true;
         }
     });
