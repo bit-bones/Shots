@@ -11,7 +11,20 @@ class NetworkManager {
     this.joinerName = null;
         this.connected = false;
         this.ws = null;
-        this.serverUrl = 'ws://localhost:3001';
+        // Determine server URL in this order:
+        // 1. `window.SERVER_URL` if explicitly provided by the page (recommended for deployments)
+        // 2. Construct from `window.location` (useful when server is co-hosted with frontend)
+        // 3. Fallback to localhost for local development
+        if (typeof window !== 'undefined' && window.SERVER_URL) {
+            this.serverUrl = window.SERVER_URL;
+        } else if (typeof window !== 'undefined' && window.location) {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const host = window.location.hostname || 'localhost';
+            const port = window.location.port ? (':' + window.location.port) : '';
+            this.serverUrl = `${protocol}//${host}${port}`;
+        } else {
+            this.serverUrl = 'ws://localhost:3001';
+        }
         
         // Joiners (host only)
         this.joiners = []; // Array of {index, name, connected}
