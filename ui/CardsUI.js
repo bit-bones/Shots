@@ -22,11 +22,18 @@ class CardsUI {
             this.rows.push(row);
         }
         
-        // Create world modifiers row
+        // Create world modifiers row (render into bottom container under canvas)
         this.worldRow = document.createElement('div');
         this.worldRow.id = 'cards-row-world';
         this.worldRow.style.display = 'none';
-        this.container.appendChild(this.worldRow);
+        // Prefer an existing bottom container; create if not present
+        this.worldContainer = document.getElementById('world-cards-bottom');
+        if (!this.worldContainer) {
+            this.worldContainer = document.createElement('div');
+            this.worldContainer.id = 'world-cards-bottom';
+            document.body.appendChild(this.worldContainer);
+        }
+        this.worldContainer.appendChild(this.worldRow);
     }
 
     update(fighters, activeWorldModifiers = []) {
