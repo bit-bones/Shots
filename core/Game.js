@@ -327,7 +327,12 @@ class Game {
 
                     if (savedStyle || savedColor) {
                         // Send cursor update without fighterId/slotIndex; host will map via joinerIndex
-                        this.network.sendCursorUpdate(savedStyle, savedColor, null, null);
+                        this.network.sendMessage('cursor-update', {
+                            style: savedStyle,
+                            color: savedColor,
+                            fighterId: null,
+                            slotIndex: null
+                        });
                     }
                     // Send again shortly after to avoid race where host hasn't assigned the joiner slot yet
                     setTimeout(() => {
@@ -335,7 +340,12 @@ class Game {
                             const savedStyle2 = localStorage.getItem('shape_shot_cursor') || null;
                             const savedColor2 = localStorage.getItem('shape_shot_color') || null;
                             if (savedStyle2 || savedColor2) {
-                                this.network.sendCursorUpdate(savedStyle2, savedColor2, null, null);
+                                this.network.sendMessage('cursor-update', {
+                                    style: savedStyle2,
+                                    color: savedColor2,
+                                    fighterId: null,
+                                    slotIndex: null
+                                });
                             }
                         } catch (e) {}
                     }, 450);
