@@ -651,10 +651,32 @@
             transform: translateY(0);
             filter: brightness(1.08);
         }
+        /* Game wrapper so we can anchor elements relative to the canvas */
+        #game-wrapper {
+            position: relative;
+            display: inline-block;
+        }
+
+        /* Bottom world cards line anchored under the canvas */
+        #world-cards-bottom {
+            position: absolute;
+            left: 50%;
+            transform: translateX(-50%);
+            top: calc(100% + 12px);
+            z-index: 10;
+            pointer-events: none;
+            min-width: 450px;
+            font-family: sans-serif;
+            display: flex;
+            justify-content: center;
+        }
     </style>
 </head>
 <body>
-    <canvas id="game" width="1300" height="650"></canvas>
+    <div id="game-wrapper">
+        <canvas id="game" width="1300" height="650"></canvas>
+        <div id="world-cards-bottom"></div>
+    </div>
     <div id="card-choices"></div>
     
     <div id="setup-wrapper" style="display: flex; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 20; align-items: stretch; gap: 24px;">
