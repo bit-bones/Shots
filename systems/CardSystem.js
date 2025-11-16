@@ -58,6 +58,12 @@ class CardSystem {
         this.firestormPreSpawnPos = null;
         this.firestormPreSpawnTimer = 0;
         this.firestormPreSpawnDelay = 2.0;
+
+        // Start-of-round activation configuration
+        this.startPowerupStacks = new Map();
+        this.startWorldModStacks = new Map();
+        this._startPowerupsApplied = false;
+        this._startWorldModsApplied = false;
         
         this.healersActive = false;
         this.healersSpawned = false;
@@ -68,6 +74,10 @@ class CardSystem {
         this.healerPreSpawnPos = null;
         this.healerNextSpawnPos = null;
         this.healerTelegraphDuration = 1.1; // Seconds of pre-spawn warning
+        
+        // Clutter state
+        this.clutterActive = false;
+        this.clutterCardsPulled = 0;
         
         // Track how many Firestorm cards have been pulled
         this.firestormCardsPulled = 0;
@@ -117,6 +127,100 @@ class CardSystem {
      */
     isWorldModEnabled(cardName) {
         return this.enabledWorldMods.has(cardName);
+    }
+
+    
+    // Start activation configuration helpers
+    setStartPowerupStacks(cardName, stacks) {
+        if (!cardName) return;
+        const parsed = Number(stacks);
+        const normalized = Number.isFinite(parsed) ? Math.floor(parsed) : 0;
+        const clamped = Math.max(0, Math.min(5, normalized));
+        if (clamped > 0) {
+            this.startPowerupStacks.set(cardName, clamped);
+        } else {
+            this.startPowerupStacks.delete(cardName);
+        }
+        this._startPowerupsApplied = false;
+    }
+
+    getStartPowerupStacks(cardName) {
+        return this.startPowerupStacks.has(cardName) ? this.startPowerupStacks.get(cardName) : 0;
+    }
+
+    clearStartPowerupStacks() {
+        this.startPowerupStacks.clear();
+        this._startPowerupsApplied = false;
+    }
+
+    setStartWorldModStacks(cardName, stacks) {
+        if (!cardName) return;
+        const parsed = Number(stacks);
+        const normalized = Number.isFinite(parsed) ? Math.floor(parsed) : 0;
+        const clamped = Math.max(0, Math.min(5, normalized));
+        if (clamped > 0) {
+            this.startWorldModStacks.set(cardName, clamped);
+        } else {
+            this.startWorldModStacks.delete(cardName);
+        }
+        this._startWorldModsApplied = false;
+    }
+
+    getStartWorldModStacks(cardName) {
+        return this.startWorldModStacks.has(cardName) ? this.startWorldModStacks.get(cardName) : 0;
+    }
+
+    clearStartWorldModStacks() {
+        this.startWorldModStacks.clear();
+        this._startWorldModsApplied = false;
+    }
+
+    getStartPowerupEntries() {
+        return Array.from(this.startPowerupStacks.entries());
+    }
+
+    getStartWorldModEntries() {
+        return Array.from(this.startWorldModStacks.entries());
+    }
+
+    resetStartActivationState() {
+        this._startPowerupsApplied = false;
+        this._startWorldModsApplied = false;
+    }
+
+    applyStartWorldMods() {
+        if (this._startWorldModsApplied) return;
+        const entries = this.getStartWorldModEntries();
+        if (!entries.length) {
+            this._startWorldModsApplied = true;
+            return;
+        }
+        for (const [modName, stacks] of entries) {
+            const count = Math.max(0, stacks | 0);
+            for (let i = 0; i < count; i++) {
+                this.applyWorldMod(modName);
+            }
+        }
+        this._startWorldModsApplied = true;
+    }
+
+    applyStartPowerupsToFighters(fighters) {
+        if (this._startPowerupsApplied) return;
+        const entries = this.getStartPowerupEntries();
+        if (!entries.length || !Array.isArray(fighters)) {
+            this._startPowerupsApplied = true;
+            return;
+        }
+        for (const fighter of fighters) {
+            if (!fighter || typeof fighter.applyCard !== 'function') continue;
+            for (const [cardName, stacks] of entries) {
+                const count = Math.max(0, stacks | 0);
+                for (let i = 0; i < count; i++) {
+                    fighter.applyCard(cardName);
+                }
+            }
+        }
+        this._startPowerupsApplied = true;
     }
     
     // Card Offering Methods
@@ -239,12 +343,16 @@ class CardSystem {
                 this.healersActive = true;
                 this.healersCardsPulled++;
                 break;
+            case 'Clutter':
+                this.clutterActive = true;
+                this.clutterCardsPulled++;
+                break;
             default:
                 console.warn('[CardSystem] Unknown world modifier:', modName);
         }
     }
 
-    update(dt, obstacles, infestedChunks, firestorms, healers) {
+    update(dt, obstacles, infestedChunks, firestorms, healers, looseChunks) {
         // Update Infestation
         if (this.infestationActive) {
             this.infestationTimer += dt;
@@ -258,7 +366,7 @@ class CardSystem {
                 // Check if we can spawn (limit based on cards pulled)
                 const activeInfestedChunks = infestedChunks.filter(c => c.active).length;
                 if (activeInfestedChunks < this.infestationCardsPulled) {
-                    this.spawnInfestedChunk(obstacles, infestedChunks);
+                    this.spawnInfestedChunk(obstacles, infestedChunks, looseChunks);
                 }
                 this.infestationTimer = 0;
             }
@@ -275,8 +383,12 @@ class CardSystem {
                         if (c.spontaneousGlow && !c.destroyed) glowingCount++;
                     }
                 }
+                // Also count glowing loose chunks
+                for (let lc of looseChunks) {
+                    if (lc.spontaneousGlow && !lc.destroyed) glowingCount++;
+                }
                 if (glowingCount < this.spontaneousCardsPulled) {
-                    this.spontaneousCombust(obstacles);
+                    this.spontaneousCombust(obstacles, looseChunks);
                 }
                 this.spontaneousTimer = 0;
             }
@@ -385,33 +497,65 @@ class CardSystem {
         }
     }
 
-    spawnInfestedChunk(obstacles, infestedChunks) {
-        let validObstacles = obstacles.filter(o => !o.destroyed && o.chunks.some(c => !c.destroyed));
-        if (validObstacles.length === 0) return;
+    spawnInfestedChunk(obstacles, infestedChunks, looseChunks) {
+        // Collect all valid chunks from obstacles and loose chunks
+        let validChunks = [];
         
-        let obstacle = validObstacles[randInt(0, validObstacles.length - 1)];
-        let validChunks = obstacle.chunks.filter(c => !c.destroyed);
+        // Add chunks from obstacles
+        for (let o of obstacles) {
+            if (!o.destroyed) {
+                for (let c of o.chunks) {
+                    if (!c.destroyed) {
+                        validChunks.push({ chunk: c, obstacle: o, type: 'obstacle' });
+                    }
+                }
+            }
+        }
+        
+        // Add loose chunks
+        for (let lc of looseChunks) {
+            if (!lc.destroyed) {
+                validChunks.push({ chunk: lc, obstacle: null, type: 'loose' });
+            }
+        }
+        
         if (validChunks.length === 0) return;
         
-        let chunk = validChunks[randInt(0, validChunks.length - 1)];
-        let infestedChunk = new InfestedChunk(chunk, obstacle, false);
+        let selected = validChunks[randInt(0, validChunks.length - 1)];
+        let infestedChunk = new InfestedChunk(selected.chunk, selected.obstacle, false);
         infestedChunks.push(infestedChunk);
         
         // Original chunk is marked as destroyed in InfestedChunk constructor
     }
 
-    spontaneousCombust(obstacles) {
-        let validObstacles = obstacles.filter(o => !o.destroyed);
-        if (validObstacles.length === 0) return;
+    spontaneousCombust(obstacles, looseChunks) {
+        // Collect all valid chunks from obstacles and loose chunks
+        let validChunks = [];
         
-        let obstacle = validObstacles[randInt(0, validObstacles.length - 1)];
-        let validChunks = obstacle.chunks.filter(c => !c.destroyed);
+        // Add chunks from obstacles
+        for (let o of obstacles) {
+            if (!o.destroyed) {
+                for (let c of o.chunks) {
+                    if (!c.destroyed) {
+                        validChunks.push({ chunk: c, type: 'obstacle' });
+                    }
+                }
+            }
+        }
+        
+        // Add loose chunks
+        for (let lc of looseChunks) {
+            if (!lc.destroyed) {
+                validChunks.push({ chunk: lc, type: 'loose' });
+            }
+        }
+        
         if (validChunks.length === 0) return;
         
-        let chunk = validChunks[randInt(0, validChunks.length - 1)];
+        let selected = validChunks[randInt(0, validChunks.length - 1)];
         // Set spontaneous glow instead of direct burning
         const glowDuration = 20.0 + Math.random() * 20.0; // 20-40 seconds glow
-        chunk.spontaneousGlow = { time: 0, duration: glowDuration };
+        selected.chunk.spontaneousGlow = { time: 0, duration: glowDuration };
     }
 
     spawnRandomObstacle(obstacles) {
@@ -695,6 +839,9 @@ class CardSystem {
         this.healerPreSpawnPos = null;
         this.healerNextSpawnPos = null;
         this.healerTelegraphDuration = 1.1;
+        this.clutterActive = false;
+        this.clutterCardsPulled = 0;
+        this.resetStartActivationState();
     }
 }
 

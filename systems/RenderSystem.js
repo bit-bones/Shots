@@ -225,6 +225,14 @@ class RenderSystem {
             }
         }
     }
+
+    drawLooseChunks(looseChunks) {
+        for (let chunk of looseChunks) {
+            if (!chunk.destroyed || chunk.flying) {
+                chunk.draw(this.ctx);
+            }
+        }
+    }
     
     drawHealers(healers) {
         for (let healer of healers) {
@@ -376,6 +384,7 @@ class RenderSystem {
         
         if (gameState.obstacles) this.drawObstacles(gameState.obstacles);
         if (gameState.infestedChunks) this.drawInfestedChunks(gameState.infestedChunks);
+        if (gameState.looseChunks) this.drawLooseChunks(gameState.looseChunks);
         if (gameState.firestorms) this.drawFirestorms(gameState.firestorms);
         if (gameState.cardSystem) {
             this.drawFirestormPreSpawn(gameState.cardSystem);
@@ -395,13 +404,8 @@ class RenderSystem {
             this.drawScoreboard(gameState.fighters, gameState.scoreboardEntries || null);
         }
         
-        if (gameState.roundNum && gameState.totalRounds) {
-            this.drawRoundInfo(gameState.roundNum, gameState.totalRounds);
-        }
-        
-        if (gameState.activeMods) {
-            this.drawWorldModBadges(gameState.activeMods);
-        }
+        // World modifier badges are rendered in the DOM (bottom bar).
+        // Removed canvas rendering to avoid duplicate badge display.
         
         if (gameState.winner) {
             this.drawVictoryScreen(gameState.winner, gameState.fighters);

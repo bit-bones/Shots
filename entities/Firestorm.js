@@ -22,7 +22,7 @@ class Firestorm {
         this.particleTimer = 0;
     }
 
-    update(dt, obstacles, fighters, healers = [], infestedChunks = []) {
+    update(dt, obstacles, fighters, healers = [], infestedChunks = [], looseChunks = []) {
         this.life += dt;
         this.time += dt;
 
@@ -53,6 +53,21 @@ class Firestorm {
         // Damage and ignite infested chunks
         for (let chunk of infestedChunks) {
             if (!chunk.active) continue;
+            const cx = chunk.x + chunk.w / 2;
+            const cy = chunk.y + chunk.h / 2;
+            const d = Math.hypot(cx - this.x, cy - this.y);
+            if (d < this.radius + Math.max(chunk.w, chunk.h) / 2) {
+                if (!chunk.burning) {
+                    const duration = 2.5 + Math.random() * 1.5;
+                    chunk.burning = { time: 0, duration, power: 1, nextTick: 0.44 + Math.random() * 0.22 };
+                    Firestorm._playBurningSound(duration);
+                }
+            }
+        }
+
+        // Damage and ignite loose chunks
+        for (let chunk of looseChunks) {
+            if (chunk.destroyed) continue;
             const cx = chunk.x + chunk.w / 2;
             const cy = chunk.y + chunk.h / 2;
             const d = Math.hypot(cx - this.x, cy - this.y);

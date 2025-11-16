@@ -539,7 +539,8 @@ const WORLD_MODIFIERS = [
     { name: "Spontaneous", desc: "Chunks combust spontaneously." },
     { name: "Dynamic", desc: "Obstacles spawn and despawn randomly." },
     { name: "Firestorm", desc: "Storms of fire appear around the map." },
-    { name: "Healers", desc: "Wandering healers that restore health." }
+    { name: "Healers", desc: "Wandering healers that restore health." },
+    { name: "Clutter", desc: "Loosens obstacle chunks." }
 ];
 
 // Cursor style options

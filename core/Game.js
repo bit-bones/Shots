@@ -56,6 +56,7 @@ class Game {
         // Entities
         this.bullets = [];
         this.obstacles = [];
+        this.looseChunks = [];
         this.explosions = [];
         this.firestorms = [];
         this.infestedChunks = [];
@@ -103,6 +104,9 @@ class Game {
         this._lastModeSettingsDigest = null;
         this._lastModeDescription = null;
         this._lastModeKey = null;
+
+        // Death animation waiting
+        this.waitingForDeathAnimations = false;
     }
 
     _configureAudioStorageForInitialRole() {
@@ -146,8 +150,25 @@ class Game {
         if (typeof Fighter !== 'undefined' && typeof Fighter.setAudioManager === 'function') {
             Fighter.setAudioManager(this.audio);
         }
+        // Load saved display name from localStorage
+        let savedDisplayName = 'Player 1';
+        try {
+            const saved = localStorage.getItem('shape_shot_display_name');
+            if (saved && saved.trim().length > 0) {
+                savedDisplayName = saved.trim();
+            }
+        } catch (e) {
+            console.warn('[Game] Failed to load display name from localStorage:', e);
+        }
+        
         // Initialize default roster
         this.roster.initializeDefaults();
+        
+        // Update local player name with saved display name
+        const localPlayer = this.roster.getSlot(0);
+        if (localPlayer) {
+            localPlayer.name = savedDisplayName;
+        }
         
         // Load saved rounds to win from localStorage
         try {
@@ -684,6 +705,12 @@ class Game {
 
     startMatch() {
         this.roster.resetFighters();
+        // Reset card runtime state and apply any configured start-of-round activations
+        this.cards.reset();
+        this.cards.applyStartWorldMods();
+        const fightersForStart = this.roster.getAllFighters();
+        this.cards.applyStartPowerupsToFighters(fightersForStart);
+        
         // Create AI for bots only (not for remote joiners)
         this.botAIs = [];
         for (let bot of this.roster.getBotFighters()) {
@@ -770,6 +797,7 @@ class Game {
 
     generateObstacles(count, size) {
         this.obstacles = [];
+        this.looseChunks = [];
         let tries = 0;
         let fighters = this.roster.getAllFighters();
         
@@ -778,13 +806,17 @@ class Game {
         const minSize = Math.max(40, size - sizeRange);
         const maxSize = Math.min(200, size + sizeRange);
         
-        while (this.obstacles.length < count && tries < 100) {
+        // Determine how many obstacles should be loose chunks
+        const clutterCount = this.cards.clutterActive ? Math.min(this.cards.clutterCardsPulled, count) : 0;
+        let looseChunksCreated = 0;
+        
+        while (this.obstacles.length + Math.floor(looseChunksCreated / 6) < count && tries < 100) {
             tries++;
             let obstacleSize = rand(minSize, maxSize);
             let w = obstacleSize, h = obstacleSize;
             let x = rand(60, CANVAS_W - w - 60);
             let y = rand(60, CANVAS_H - h - 60);
-            let obs = new Obstacle(x, y, w, h);
+            
             let centerX = x + w / 2;
             let centerY = y + h / 2;
             let safe = true;
@@ -801,14 +833,52 @@ class Game {
             // Check overlap with existing obstacles
             if (safe) {
                 for (let o of this.obstacles) {
-                    if (this.rectsOverlap(obs, o)) {
+                    if (this.rectsOverlap({x, y, w, h}, o)) {
                         safe = false;
                         break;
                     }
                 }
             }
             
-            if (safe) this.obstacles.push(obs);
+            // Check overlap with existing loose chunks
+            if (safe) {
+                for (let chunk of this.looseChunks) {
+                    if (this.rectsOverlap({x, y, w, h}, chunk)) {
+                        safe = false;
+                        break;
+                    }
+                }
+            }
+            
+            if (safe) {
+                // Decide if this obstacle should be loose chunks
+                const shouldBeLoose = looseChunksCreated < clutterCount * 6; // 6 chunks per obstacle
+                
+                if (shouldBeLoose) {
+                    // Create loose chunks instead of obstacle
+                    const grid = 6;
+                    let chunkW = w / grid;
+                    let chunkH = h / grid;
+                    
+                    for (let i = 0; i < grid; i++) {
+                        for (let j = 0; j < grid; j++) {
+                            if (typeof LooseChunk !== 'undefined') {
+                                this.looseChunks.push(new LooseChunk(
+                                    x + i * chunkW,
+                                    y + j * chunkH,
+                                    chunkW,
+                                    chunkH
+                                ));
+                            } else {
+                                console.warn('LooseChunk class not available, skipping loose chunk creation');
+                            }
+                        }
+                    }
+                    looseChunksCreated += 6;
+                } else {
+                    this.obstacles.push(new Obstacle(x, y, w, h));
+                }
+            }
         }
     }
     
@@ -834,7 +904,23 @@ class Game {
         this.lastTime = now;
         
         this.update(dt);
-        this.render.render(this.getGameState());
+        
+        // Update DOM round counter
+        const gameState = this.getGameState();
+        if (gameState.roundNum && gameState.totalRounds) {
+            const roundCounter = document.getElementById('round-counter');
+            if (roundCounter) {
+                roundCounter.textContent = `Round ${gameState.roundNum}`;
+                roundCounter.style.display = '';
+            }
+        } else {
+            const roundCounter = document.getElementById('round-counter');
+            if (roundCounter) {
+                roundCounter.style.display = 'none';
+            }
+        }
+        
+        this.render.render(gameState);
         
         // Update card badges UI (separate from canvas rendering)
         this.cardsUI.update(this.roster.getAllFighters(), this.cards.activeMods);
@@ -1012,6 +1098,15 @@ class Game {
             f.update(dt);
         }
 
+        // Check if waiting for death animations to finish
+        if (this.waitingForDeathAnimations) {
+            const anyDying = fighters.some(f => f && f.dying);
+            if (!anyDying) {
+                this.waitingForDeathAnimations = false;
+                this._processCardSelectionQueue();
+            }
+        }
+
         let queuedGunshots = 0;
         for (let f of fighters) {
             if (typeof f.drainPendingBurstBullets === 'function') {
@@ -1030,7 +1125,7 @@ class Game {
         
         // Update bullets
         for (let b of this.bullets) {
-            const bounced = b.update(dt, this.mapBorderEnabled);
+            const bounced = b.update(dt, false);
             if (bounced && this.audio && typeof this.audio.playRicochet === 'function') {
                 this.audio.playRicochet();
             }
@@ -1041,6 +1136,12 @@ class Game {
         for (let o of this.obstacles) {
             o.update(dt);
         }
+        
+        // Update loose chunks
+        for (let chunk of this.looseChunks) {
+            chunk.update(dt);
+        }
+        this.looseChunks = this.looseChunks.filter(c => !c.destroyed || c.flying);
         
         // Handle spontaneous explosions
         for (let o of this.obstacles) {
@@ -1065,13 +1166,13 @@ class Game {
         
         // Update explosions
         for (let e of this.explosions) {
-            e.update(dt, this.obstacles, fighters, this.healers, this.infestedChunks);
+            e.update(dt, this.obstacles, fighters, this.healers, this.infestedChunks, this.looseChunks);
         }
         this.explosions = this.explosions.filter(e => !e.done);
         
         // Update firestorms
         for (let f of this.firestorms) {
-            f.update(dt, this.obstacles, fighters, this.healers, this.infestedChunks);
+            f.update(dt, this.obstacles, fighters, this.healers, this.infestedChunks, this.looseChunks);
         }
         this.firestorms = this.firestorms.filter(f => !f.done);
         this._updateFirestormAudio();
@@ -1099,12 +1200,12 @@ class Game {
         this.healers = this.healers.filter(h => h.active);
         
         // Update world modifiers
-        this.cards.update(dt, this.obstacles, this.infestedChunks, this.firestorms, this.healers);
+        this.cards.update(dt, this.obstacles, this.infestedChunks, this.firestorms, this.healers, this.looseChunks);
         this._updateFirestormAudio();
         
         // Update collisions
         if (this.match.isRoundActive()) {
-            this.collision.update(this.bullets, fighters, this.obstacles, this.explosions, this.healers, this.infestedChunks);
+            this.collision.update(this.bullets, fighters, this.obstacles, this.explosions, this.healers, this.infestedChunks, this.looseChunks);
         }
 
         if (this.impactLines && this.impactLines.length) {
@@ -1117,6 +1218,13 @@ class Game {
                 if (c.destroyed && c.spontaneousGlow && !c.spontaneousExploded) {
                     this._triggerSpontaneousExplosion(c);
                 }
+            }
+        }
+        
+        // Check for destroyed spontaneous glowing loose chunks and trigger immediate explosions
+        for (let lc of this.looseChunks) {
+            if (lc.destroyed && lc.spontaneousGlow && !lc.spontaneousExploded) {
+                this._triggerSpontaneousExplosion(lc);
             }
         }
         
@@ -1172,7 +1280,8 @@ class Game {
                                     queuedAny = true;
                                 }
                                 if (queuedAny) {
-                                    this._processCardSelectionQueue();
+                                    this.waitingForDeathAnimations = true;
+                                    // Don't call _processCardSelectionQueue yet
                                 }
                             }
                         }
@@ -1858,6 +1967,7 @@ class Game {
             explosions: this.explosions,
             firestorms: this.firestorms,
             infestedChunks: this.infestedChunks,
+            looseChunks: this.looseChunks,
             healers: this.healers,
             roundNum: this.match.getRoundNum(),
             totalRounds: this.match.getRoundsToWin(),
@@ -2011,6 +2121,13 @@ class Game {
             return StateSerializer.serialize(chunk);
         });
 
+        const looseState = this.looseChunks.map(chunk => {
+            if (typeof chunk.serialize === 'function') {
+                return chunk.serialize();
+            }
+            return StateSerializer.serialize(chunk);
+        });
+
         const obstacleState = this.obstacles.map(obstacle => {
             if (typeof obstacle.serialize === 'function') {
                 return obstacle.serialize();
@@ -2033,6 +2150,7 @@ class Game {
             explosions: explosionState,
             firestorms: firestormState,
             infestedChunks: infestedState,
+            looseChunks: looseState,
             obstacles: obstacleState,
             healers: healerState,
             activeMods: this.cards.activeMods.slice(),
@@ -2107,6 +2225,7 @@ class Game {
         this.explosions = [];
         this.firestorms = [];
         this.infestedChunks = [];
+        this.looseChunks = [];
         this.healers = [];
         this.impactLines = [];
         this.audio.stopFirestormBurning();
@@ -2126,6 +2245,12 @@ class Game {
         this._lastModeSettingsDigest = null;
         this._lastModeDescription = null;
         this._lastModeKey = null;
+
+        // Hide round counter when resetting game
+        const roundCounter = document.getElementById('round-counter');
+        if (roundCounter) {
+            roundCounter.style.display = 'none';
+        }
 
         if (this.modeManager) {
             this.modeManager.onRosterChanged();
@@ -2156,10 +2281,15 @@ class Game {
         this.explosions = [];
         this.firestorms = [];
         this.infestedChunks = [];
+        this.looseChunks = [];
         this.healers = [];
         this.impactLines = [];
         
-        this.pendingWorldMod = null; // Clear any pending world mod selection
+        // Hide round counter when resetting round
+        const roundCounter = document.getElementById('round-counter');
+        if (roundCounter) {
+            roundCounter.style.display = 'none';
+        }
         
         // Read obstacle settings from UI (same as match start)
         const densitySlider = document.getElementById('obstacle-density');
@@ -2410,6 +2540,13 @@ class Game {
         this.roster.updateFighter(fighterId, { name: trimmed });
         this.setupUI.render();
 
+        // Save display name to localStorage
+        try {
+            localStorage.setItem('shape_shot_display_name', trimmed);
+        } catch (e) {
+            console.warn('[Game] Failed to save display name to localStorage:', e);
+        }
+
         if (!this.network || !this.network.connected) {
             return;
         }
@@ -2509,8 +2646,12 @@ class Game {
         if (!fighter) return null;
         let nearest = null;
         let nearestDist = Infinity;
+        const fighterTeamId = fighter.metadata && fighter.metadata.teamId;
         for (const other of fighters) {
             if (!other || other === fighter || !other.alive) continue;
+            // In team modes, don't target teammates
+            const otherTeamId = other.metadata && other.metadata.teamId;
+            if (fighterTeamId && otherTeamId && fighterTeamId === otherTeamId) continue;
             const d = dist(fighter.x, fighter.y, other.x, other.y);
             if (!Number.isFinite(d)) continue;
             if (d < nearestDist) {
@@ -2613,6 +2754,9 @@ class Game {
 
         const infestedStates = Array.isArray(state.infestedChunks) ? state.infestedChunks : [];
         this.infestedChunks = infestedStates.map(data => InfestedChunk.fromState(data)).filter(Boolean);
+
+        const looseStates = Array.isArray(state.looseChunks) ? state.looseChunks : [];
+        this.looseChunks = looseStates.map(data => LooseChunk.fromState(data)).filter(Boolean);
 
         const healerStates = Array.isArray(state.healers) ? state.healers : [];
         this.healers = healerStates.map(data => Healer.fromState(data)).filter(Boolean);
@@ -3174,6 +3318,7 @@ class Game {
         this.explosions = [];
         this.firestorms = [];
         this.infestedChunks = [];
+        this.looseChunks = [];
         this.healers = [];
         this.impactLines = [];
         this._updateFirestormAudio();

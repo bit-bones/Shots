@@ -250,6 +250,14 @@ class TeamEliminationMode extends GameMode {
                 .map(t => t.id);
             const losingFighters = this._getAllFighters().filter(f => f && this._getTeamId(f) && this._getTeamId(f) !== winnerTeamId);
             const losingFighterIds = losingFighters.map(f => f.id);
+            
+            // Force eliminate losing fighters to trigger death animations
+            for (const fighter of losingFighters) {
+                if (fighter && !fighter.eliminated && !fighter.dying) {
+                    fighter.forceEliminate({ amount: 22 });
+                }
+            }
+            
             this.match.roundActive = false;
             this.match.roundEndTimer = this.match.roundEndDuration;
             const shouldOfferWorldMod = (this.match.roundNum % this.match.worldModInterval) === 0;

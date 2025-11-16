@@ -676,6 +676,7 @@
     <div id="game-wrapper">
         <canvas id="game" width="1300" height="650"></canvas>
         <div id="world-cards-bottom"></div>
+        <div id="round-counter" style="position: absolute; left: 50%; transform: translateX(-50%); top: calc(100% + 40px); z-index: 10; pointer-events: none; font-family: sans-serif; font-size: 22px; font-weight: bold; color: #fff; text-align: center; display: none;"></div>
     </div>
     <div id="card-choices"></div>
     
@@ -756,17 +757,7 @@
                 <input type="checkbox" id="map-border" checked>
             </div>
         </div>
-        <!-- Enemy AI setting removed (roster system manages AI/bots) -->
-        <div class="setup-row">
-            <label for="saved-maps">Saved Map:</label>
-            <select id="saved-maps">
-                <option value="">(none)</option>
-            </select>
-            <button id="delete-saved-map" style="margin-left:8px;">Delete</button>
-            <button id="open-map-editor" style="margin-left:6px;">Map Editor</button>
-        </div>
-        
-        <div style="display:flex; gap:10px; margin-bottom:10px;">
+<!-- Enemy AI setting removed (roster system manages AI/bots) -->        <div style="display:flex; gap:10px; margin-bottom:10px;">
             <button id="manage-powerups-btn">PowerUp Cards</button>
             <button id="manage-worldmods-btn">World Mod Cards</button>
         </div>
@@ -799,18 +790,33 @@
                     <input id="mp-join-code" style="font-size:1.2em; text-align:center; width:180px; background:#181c23; color:#65c6ff; border:1.5px solid #65c6ff; border-radius:7px; padding:6px 10px;" />
                 </div>
                 <div style="display:flex; gap:8px; align-items:center;">
-                    <button id="mp-join-confirm" style="margin-bottom:10px; padding:6px 10px; border-radius:7px; background:#65c6ff; color:#181c23; border:none; cursor:pointer; font-weight:700;">Join</button>
-                    <button id="mp-paste" style="padding:6px 10px; border-radius:7px; background:#65c6ff; color:#181c23; border:none; cursor:pointer;">Paste</button>
+                    <button id="mp-join-confirm" style="padding:6px 10px; border-radius:7px; background:#65c6ff; color:#181c23; border:none; cursor:pointer; font-weight:700;">Join</button>
+                    <button id="mp-paste" style="padding:6px 10px; border-radius:7px; background:#65c6ff; color:#181c23; border:none; cursor:pointer; font-weight:700;">Paste</button>
                 </div>
             </div>
             <button id="mp-close" style="margin-top:8px; padding:6px 10px; border-radius:7px; background:#3d4351; color:#fff; border:none; cursor:pointer;">Close</button>
         </div>
     </div>
 
-    <!-- Options Modal -->
-    <div id="options-overlay" style="display:none; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2100;">
+    <!-- Main Options Modal -->
+    <div id="main-options-overlay" style="display:none; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2100;">
         <div style="background:rgba(25,28,32,0.99); border-radius:12px; padding:20px 22px; width:360px; box-shadow:0 8px 40px #000a; color:#fff;">
-            <h3 style="margin:4px 0 10px 0; color:#65c6ff;">Options</h3>
+            <h3 style="margin:4px 0 20px 0; color:#65c6ff;">Options</h3>
+            <div style="display:flex; flex-direction:column; gap:12px;">
+                <button id="audio-options-btn" style="padding:12px 16px; background:#2f3440; color:#fff; border:none; border-radius:8px; cursor:pointer; font-size:1em; text-align:left;">🔊 Audio Settings</button>
+                <button id="video-options-btn" style="padding:12px 16px; background:#2f3440; color:#fff; border:none; border-radius:8px; cursor:pointer; font-size:1em; text-align:left;">🎥 Video Settings</button>
+                <button id="controls-options-btn" style="padding:12px 16px; background:#2f3440; color:#fff; border:none; border-radius:8px; cursor:pointer; font-size:1em; text-align:left;">🎮 Controls Settings</button>
+            </div>
+            <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:20px;">
+                <button id="main-options-back-btn">Back</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Audio Options Modal -->
+    <div id="audio-options-overlay" style="display:none; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2101;">
+        <div style="background:rgba(25,28,32,0.99); border-radius:12px; padding:20px 22px; width:360px; box-shadow:0 8px 40px #000a; color:#fff;">
+            <h3 style="margin:4px 0 10px 0; color:#65c6ff;">Audio Settings</h3>
             <div style="margin-bottom:10px;"><label style="display:block;">Master Volume: <span id="master-vol-val" style="color:#ffda72; margin-left:8px;">100</span></label>
                 <input id="master-vol" type="range" min="0" max="100" value="100" style="width:100%;" /></div>
             <div style="margin-bottom:10px;"><label style="display:block;">Music Volume: <span id="music-vol-val" style="color:#ffda72; margin-left:8px;">100</span></label>
@@ -860,6 +866,17 @@
                 </div>
                 <button class="sfx-preview" id="preview-burning" title="Preview Burning" style="width:30px; height:24px;">▶</button>
             </div>
+            <div style="display:flex; gap:8px; justify-content:flex-end;">
+                <button id="audio-options-defaults">Defaults</button>
+                <button id="audio-options-back-btn">Back</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Video Options Modal -->
+    <div id="video-options-overlay" style="display:none; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2101;">
+        <div style="background:rgba(25,28,32,0.99); border-radius:12px; padding:20px 22px; width:360px; box-shadow:0 8px 40px #000a; color:#fff;">
+            <h3 style="margin:4px 0 10px 0; color:#65c6ff;">Video Settings</h3>
             <div style="margin-top:10px; font-size:0.95em; color:#cfd8e3;">
                 <label style="display:block; margin-bottom:6px;">Cursor Style:</label>
                 <select id="cursor-style" style="width:100%; padding:6px; background:#13161a; color:#fff; border:1px solid #2f3440; border-radius:6px;">
@@ -882,7 +899,36 @@
                 </label>
             </div>
             <div style="display:flex; gap:8px; justify-content:flex-end;">
-                <button id="options-back-btn">Back</button>
+                <button id="video-options-defaults">Defaults</button>
+                <button id="video-options-back-btn">Back</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Controls Options Modal -->
+    <div id="controls-options-overlay" style="display:none; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2101;">
+        <div style="background:rgba(25,28,32,0.99); border-radius:12px; padding:20px 22px; width:380px; box-shadow:0 8px 40px #000a; color:#fff;">
+            <h3 style="margin:4px 0 20px 0; color:#65c6ff;">Controls Settings</h3>
+            <div style="display:flex; flex-direction:column; gap:16px;">
+                <!-- Shoot Control -->
+                <div style="display:flex; align-items:center; gap:8px;">
+                    <label style="min-width:50px; font-size:0.95em; color:#cfd8e3;">Shoot:</label>
+                    <input id="shoot-primary" type="text" value="LMB" readonly style="flex:1; padding:6px 6px; background:#13161a; color:#fff; border:1px solid #2f3440; border-radius:6px; text-align:center; font-size:0.9em;" />
+                    <input id="shoot-secondary" type="text" value="Space" readonly style="flex:1; padding:6px 6px; background:#13161a; color:#fff; border:1px solid #2f3440; border-radius:6px; text-align:center; font-size:0.9em;" />
+                </div>
+                <!-- Dash Control -->
+                <div style="display:flex; align-items:center; gap:8px;">
+                    <label style="min-width:50px; font-size:0.95em; color:#cfd8e3;">Dash:</label>
+                    <input id="dash-primary" type="text" value="RMB" readonly style="flex:1; padding:6px 6px; background:#13161a; color:#fff; border:1px solid #2f3440; border-radius:6px; text-align:center; font-size:0.9em;" />
+                    <input id="dash-secondary" type="text" value="Shift" readonly style="flex:1; padding:6px 6px; background:#13161a; color:#fff; border:1px solid #2f3440; border-radius:6px; text-align:center; font-size:0.9em;" />
+                </div>
+            </div>
+            <div style="margin-top:20px; font-size:0.85em; color:#888; text-align:center;">
+                Click on a control box to rebind it
+            </div>
+            <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:16px;">
+                <button id="controls-options-defaults">Defaults</button>
+                <button id="controls-options-back-btn">Back</button>
             </div>
         </div>
     </div>
@@ -932,35 +978,7 @@
         </form>
     </div>
 
-    <!-- Map Editor Modal -->
-    <div id="map-editor-modal" style="display:none; position:fixed; left:0; top:0; right:0; bottom:0; z-index:2000; background:rgba(0,0,0,0.6); align-items:center; justify-content:center;">
-        <div style="background:#1f2329; padding:14px; border-radius:8px; width:940px; max-width:95%; display:flex; gap:12px;">
-            <div style="flex:1 1 0;">
-                <canvas id="map-editor-canvas" width="780" height="420" style="background:#2a2f36; display:block; border:1px solid #3b424a;"></canvas>
-            </div>
-            <div style="width:200px; color:#ddd;">
-                <h3 style="margin:6px 0 8px 0; color:#fff; font-size:16px;">Map Editor</h3>
-                <label>Square Size: <span id="editor-size-val">80</span></label>
-                <input id="editor-size" type="range" min="24" max="220" value="80" style="width:100%;" />
-                <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
-                    <input type="checkbox" id="editor-grid-snap" />
-                    <label for="editor-grid-snap" style="margin:0;">Grid Snap</label>
-                </div>
-                <div style="margin-top:8px;">
-                    <button id="editor-place" style="width:100%; margin-bottom:6px;">Place Mode</button>
-                    <button id="editor-erase" style="width:100%; margin-bottom:6px;">Erase Mode</button>
-                </div>
-                <div style="margin-top:8px;">
-                    <input id="editor-map-name" placeholder="Map name" style="width:100%; padding:6px; background:#222; color:#fff; border:1px solid #3b424a;" />
-                    <button id="editor-save" style="width:100%; margin-top:6px;">Save Map</button>
-                    <button id="editor-clear" style="width:100%; margin-top:6px;">Clear</button>
-                </div>
-                <div style="margin-top:10px;">
-                    <button id="editor-close" style="width:100%;">Close Editor</button>
-                </div>
-            </div>
-        </div>
-    </div>
+
 
     <script>
     document.addEventListener('DOMContentLoaded', function() {
@@ -1029,6 +1047,22 @@
     #dev-console-form { margin: 0; padding: 0 18px; }
     #dev-console-fixed.hidden {
         display: none;
+    }
+    </style>
+    <style>
+    /* Control binding input styles */
+    #controls-options-overlay input[type="text"] {
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+    #controls-options-overlay input[type="text"]:hover {
+        background: #1a1e27;
+        border-color: #3d4351;
+    }
+    #controls-options-overlay input[type="text"]:focus {
+        outline: none;
+        background: #2f3440;
+        border-color: #ffd86b;
     }
     </style>
 </body>

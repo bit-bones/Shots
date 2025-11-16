@@ -432,10 +432,223 @@ class CollisionSystem {
         }
     }
 
+    // Check bullet vs loose chunk collisions
+    checkBulletLooseChunkCollisions(bullets, looseChunks, explosions) {
+        for (let b of bullets) {
+            if (!b.active) continue;
+            
+            for (let chunk of looseChunks) {
+                if (chunk.destroyed) continue;
+                
+                let ownerStacks = (b.owner && b.owner.obliteratorStacks) ? b.owner.obliteratorStacks : 0;
+                let powerMul = 1 + 0.35 * ownerStacks;
+                let power = (b.damage / 18) * powerMul;
+                
+                const fireStacks = b.fireshot ? Math.max(1, b.fireshotStacks || (b.owner && b.owner.fireshotStacks) || 1) : 0;
+                let hit = chunk.chipAt(b.x, b.y, b.radius * 1.8, power, b.obliterator, false, fireStacks);
+                
+                if (hit) {
+                    // Create explosion if explosive
+                    if (b.explosive) {
+                        explosions.push(new Explosion(
+                            b.x, b.y,
+                            EXPLOSION_BASE_RADIUS,
+                            b.owner.color,
+                            b.damage * 0.5,
+                            b.owner,
+                            b.obliterator,
+                            b.fireshot
+                        ));
+                        if (this.audioManager) {
+                            this.audioManager.playExplosion();
+                        }
+                    }
+                    
+                    // Deactivate bullet if not piercing
+                    if (!b.pierce) {
+                        b.active = false;
+                        break;
+                    }
+                    if (b.pierceRemaining > 0) {
+                        b.pierceRemaining--;
+                        this._pushBulletForward(b, b.radius * 1.1 + 4);
+                        continue;
+                    }
+                    b.active = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Check fighter vs loose chunk collisions
+    checkFighterLooseChunkCollisions(fighters, looseChunks) {
+        for (let f of fighters) {
+            if (!f.alive) continue;
+            
+            for (let chunk of looseChunks) {
+                if (chunk.destroyed) continue;
+                
+                if (chunk.circleCollide(f.x, f.y, f.radius)) {
+                    // Push chunk away from fighter
+                    let angle = Math.atan2(chunk.y + chunk.h/2 - f.y, chunk.x + chunk.w/2 - f.x);
+                    let overlap = f.radius + Math.max(chunk.w, chunk.h)/2 - dist(f.x, f.y, chunk.x + chunk.w/2, chunk.y + chunk.h/2);
+                    
+                    if (overlap > 0) {
+                        let pushForce = overlap * 200; // Adjust force as needed
+                        chunk.applyForce(Math.cos(angle) * pushForce, Math.sin(angle) * pushForce);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check loose chunk vs loose chunk collisions
+    checkLooseChunkLooseChunkCollisions(looseChunks) {
+        for (let i = 0; i < looseChunks.length; i++) {
+            for (let j = i + 1; j < looseChunks.length; j++) {
+                let chunk1 = looseChunks[i];
+                let chunk2 = looseChunks[j];
+                
+                if (chunk1.destroyed || chunk2.destroyed) continue;
+                
+                if (chunk1.rectCollide(chunk2)) {
+                    // Resolve collision by pushing them apart
+                    let dx = (chunk2.x + chunk2.w/2) - (chunk1.x + chunk1.w/2);
+                    let dy = (chunk2.y + chunk2.h/2) - (chunk1.y + chunk1.h/2);
+                    let dist = Math.sqrt(dx * dx + dy * dy);
+                    
+                    if (dist > 0) {
+                        let overlap = (Math.max(chunk1.w, chunk1.h) + Math.max(chunk2.w, chunk2.h)) / 2 - dist;
+                        if (overlap > 0) {
+                            let nx = dx / dist;
+                            let ny = dy / dist;
+                            let pushForce = overlap * 100; // Adjust force
+                            
+                            chunk1.applyForce(-nx * pushForce, -ny * pushForce);
+                            chunk2.applyForce(nx * pushForce, ny * pushForce);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check loose chunk vs obstacle collisions
+    checkLooseChunkObstacleCollisions(looseChunks, obstacles) {
+        for (let chunk of looseChunks) {
+            if (chunk.destroyed) continue;
+            
+            for (let obstacle of obstacles) {
+                if (obstacle.destroyed) continue;
+                
+                if (chunk.rectCollide(obstacle)) {
+                    // Resolve collision by pushing chunk away from obstacle
+                    let chunkCenterX = chunk.x + chunk.w/2;
+                    let chunkCenterY = chunk.y + chunk.h/2;
+                    let obstacleCenterX = obstacle.x + obstacle.w/2;
+                    let obstacleCenterY = obstacle.y + obstacle.h/2;
+                    
+                    let dx = chunkCenterX - obstacleCenterX;
+                    let dy = chunkCenterY - obstacleCenterY;
+                    let dist = Math.sqrt(dx * dx + dy * dy);
+                    
+                    if (dist > 0) {
+                        let nx = dx / dist;
+                        let ny = dy / dist;
+                        
+                        // Calculate overlap
+                        let closestX = clamp(chunkCenterX, obstacle.x, obstacle.x + obstacle.w);
+                        let closestY = clamp(chunkCenterY, obstacle.y, obstacle.y + obstacle.h);
+                        let distToEdge = Math.sqrt((chunkCenterX - closestX) ** 2 + (chunkCenterY - closestY) ** 2);
+                        let chunkRadius = Math.max(chunk.w, chunk.h) / 2;
+                        let overlap = chunkRadius - distToEdge;
+                        
+                        if (overlap > 0) {
+                            let pushForce = overlap * 200; // Stronger force for obstacles
+                            chunk.applyForce(nx * pushForce, ny * pushForce);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check bullet vs border collisions
+    checkBulletBorderCollisions(bullets, explosions) {
+        for (let b of bullets) {
+            if (!b.active) continue;
+
+            let hit = false;
+            let nx = 0, ny = 0;
+            let penetration = b.radius * 0.25;
+
+            if (b.x - b.radius < 0) {
+                hit = true;
+                nx = 1;
+                ny = 0;
+                penetration = b.radius - b.x;
+            } else if (b.x + b.radius > CANVAS_W) {
+                hit = true;
+                nx = -1;
+                ny = 0;
+                penetration = b.radius - (CANVAS_W - b.x);
+            } else if (b.y - b.radius < 0) {
+                hit = true;
+                nx = 0;
+                ny = 1;
+                penetration = b.radius - b.y;
+            } else if (b.y + b.radius > CANVAS_H) {
+                hit = true;
+                nx = 0;
+                ny = -1;
+                penetration = b.radius - (CANVAS_H - b.y);
+            }
+
+            if (hit) {
+                const collision = { collided: true, nx, ny, penetration: Math.max(0, penetration) };
+
+                if (this._tryRicochet(b, collision)) {
+                    if (this.audioManager) {
+                        this.audioManager.playRicochet();
+                    }
+                    continue;
+                }
+
+                if (b.explosive) {
+                    explosions.push(new Explosion(
+                        b.x, b.y,
+                        EXPLOSION_BASE_RADIUS,
+                        b.owner ? b.owner.color : '#ffffff',
+                        b.damage * 0.5,
+                        b.owner,
+                        b.obliterator,
+                        b.fireshot
+                    ));
+                    if (this.audioManager) {
+                        this.audioManager.playExplosion();
+                    }
+                }
+
+                if (this.impactCallback) {
+                    const baseAngle = Math.atan2(ny, nx);
+                    this.impactCallback(b.x, b.y, b.damage || 1, b.owner ? b.owner.color : '#ffffff', baseAngle);
+                }
+
+                if (this.audioManager) {
+                    this.audioManager.playImpact(b.damage || 1);
+                }
+
+                b.active = false;
+            }
+        }
+    }
+
     // Update all collisions
-    update(bullets, fighters, obstacles, explosions, healers = [], infestedChunks = []) {
+    update(bullets, fighters, obstacles, explosions, healers = [], infestedChunks = [], looseChunks = []) {
         this.checkBulletFighterCollisions(bullets, fighters, explosions);
         this.checkBulletObstacleCollisions(bullets, obstacles, explosions);
+        this.checkBulletBorderCollisions(bullets, explosions);
         this.checkFighterObstacleCollisions(fighters, obstacles);
         this.checkDashCollisions(fighters, obstacles);
 
@@ -447,6 +660,14 @@ class CollisionSystem {
         // Check infested chunk collisions if present
         if (infestedChunks && infestedChunks.length > 0) {
             this.checkBulletInfestedCollisions(bullets, infestedChunks, explosions);
+        }
+        
+        // Check loose chunk collisions if present
+        if (looseChunks && looseChunks.length > 0) {
+            this.checkBulletLooseChunkCollisions(bullets, looseChunks, explosions);
+            this.checkFighterLooseChunkCollisions(fighters, looseChunks);
+            this.checkLooseChunkLooseChunkCollisions(looseChunks);
+            this.checkLooseChunkObstacleCollisions(looseChunks, obstacles);
         }
     }
 }

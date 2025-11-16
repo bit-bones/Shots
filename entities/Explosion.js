@@ -35,7 +35,7 @@ class Explosion {
         }
     }
 
-    update(dt, obstacles, fighters, healers = [], infestedChunks = []) {
+    update(dt, obstacles, fighters, healers = [], infestedChunks = [], looseChunks = []) {
         this.time += dt;
         const fireStacks = this.isFireshot ? Math.max(1, (this.owner && this.owner.fireshotStacks) || 1) : 0;
         
@@ -125,6 +125,48 @@ class Explosion {
                         if (!infestedAudioPlayed && typeof Fighter !== 'undefined' && Fighter._audioManager && typeof Fighter._audioManager.playBurning === 'function') {
                             Fighter._audioManager.playBurning(burnDuration);
                             infestedAudioPlayed = true;
+                        }
+                    }
+                }
+            }
+
+            // Damage loose chunks
+            if (Array.isArray(looseChunks)) {
+                for (let lc of looseChunks) {
+                    if (lc.destroyed) continue;
+                    let ownerStacks = (this.owner && this.owner.obliteratorStacks) ? this.owner.obliteratorStacks : 0;
+                    let powerMul = 1 + 0.35 * ownerStacks;
+                    let explosionPower = (this.damage / 18) * 0.6 * powerMul;
+                    lc.chipAt(this.x, this.y, this.radius, explosionPower, this.obliterator, true, fireStacks);
+
+                    if (this.obliterator && fireStacks > 0) {
+                        const cx = lc.x + lc.w / 2;
+                        const cy = lc.y + lc.h / 2;
+                        const dx = cx - this.x;
+                        const dy = cy - this.y;
+                        if ((dx * dx + dy * dy) <= this.radius * this.radius) {
+                            lc.burning = {
+                                time: 0,
+                                duration: 1.2 + 1.3 * fireStacks,
+                                power: fireStacks
+                            };
+                        }
+                    }
+
+                    // Apply extra explosion force if chunk wasn't destroyed
+                    if (!lc.destroyed) {
+                        const cx = lc.x + lc.w / 2;
+                        const cy = lc.y + lc.h / 2;
+                        const dx = cx - this.x;
+                        const dy = cy - this.y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist <= this.radius && dist > 0) {
+                            // Extra force for explosions, scales with fighter's bullet damage
+                            const bulletDamage = (this.owner && this.owner.bulletDamage) ? this.owner.bulletDamage : 6;
+                            const extraForce = explosionPower * (bulletDamage * 2000);
+                            const forceX = (dx / dist) * extraForce;
+                            const forceY = (dy / dist) * extraForce;
+                            lc.applyForce(forceX, forceY);
                         }
                     }
                 }

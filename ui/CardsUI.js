@@ -56,7 +56,7 @@ class CardsUI {
             // Build cards HTML
             let cardsHtml = this.buildCardsHtml(cards);
             
-            // Color-code by fighter (matches original)
+            // Color-code by fighter
             const colors = ['#65c6ff', '#ff5a5a', '#ffe066', '#2ecc71'];
             const color = fighter.color || colors[i];
             
@@ -64,7 +64,7 @@ class CardsUI {
             row.style.display = '';
         }
 
-        // Update world modifiers row
+        // Update world modifiers row (rendered under the canvas)
         if (activeWorldModifiers && activeWorldModifiers.length > 0) {
             const worldHtml = this.buildCardsHtml(activeWorldModifiers);
             this.worldRow.innerHTML = `<div class="cards-list"><span style="font-weight:bold; color:#a06cc7;">World Cards:</span> ${worldHtml}</div>`;

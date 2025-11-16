@@ -12,7 +12,51 @@ class InputManager {
         this.dashRequested = false;
         this.shootRequested = false;
         
+        // Load control bindings
+        this.loadControlBindings();
+        
         this.setupListeners();
+    }
+
+    loadControlBindings() {
+        // Default control bindings
+        this.controls = {
+            'shoot-primary': 'LMB',
+            'shoot-secondary': 'Space',
+            'dash-primary': 'RMB',
+            'dash-secondary': 'Shift'
+        };
+
+        // Load from localStorage
+        try {
+            Object.keys(this.controls).forEach(key => {
+                const saved = localStorage.getItem(`shape_shot_control_${key}`);
+                if (saved) {
+                    this.controls[key] = saved;
+                }
+            });
+        } catch (e) {
+            console.warn('Failed to load control bindings:', e);
+        }
+    }
+
+    reloadControlBindings() {
+        this.loadControlBindings();
+    }
+
+    normalizeKeyName(key) {
+        if (key === ' ') return 'Space';
+        if (key.length === 1) return key.toUpperCase();
+        return key;
+    }
+
+    getMouseButtonName(button) {
+        switch (button) {
+            case 0: return 'LMB';
+            case 1: return 'MMB';
+            case 2: return 'RMB';
+            default: return `Mouse${button}`;
+        }
     }
 
     setupListeners() {
@@ -20,14 +64,16 @@ class InputManager {
         document.addEventListener('keydown', (e) => {
             this.keys[e.key] = true;
             
-            // Dash on Shift
-            if (e.key === 'Shift') {
+            // Check for dash keys
+            const dashKey = this.normalizeKeyName(e.key);
+            if (dashKey === this.controls['dash-primary'] || dashKey === this.controls['dash-secondary']) {
                 this.dashRequested = true;
                 e.preventDefault();
             }
             
-            // Shoot on Space
-            if (e.key === ' ') {
+            // Check for shoot keys
+            const shootKey = this.normalizeKeyName(e.key);
+            if (shootKey === this.controls['shoot-primary'] || shootKey === this.controls['shoot-secondary']) {
                 this.shootRequested = true;
                 e.preventDefault();
             }
@@ -46,12 +92,14 @@ class InputManager {
 
         // Mouse click
         this.canvas.addEventListener('mousedown', (e) => {
-            if (e.button === 0) {
-                // Left click: shoot
+            const mouseButton = this.getMouseButtonName(e.button);
+            
+            if (mouseButton === this.controls['shoot-primary'] || mouseButton === this.controls['shoot-secondary']) {
+                // Shoot action
                 this.mouseDown = true;
                 this.mouseJustPressed = true;
-            } else if (e.button === 2) {
-                // Right click: dash
+            } else if (mouseButton === this.controls['dash-primary'] || mouseButton === this.controls['dash-secondary']) {
+                // Dash action
                 this.dashRequested = true;
                 e.preventDefault();
             }
