@@ -1,5 +1,6 @@
 // Minimal WebSocket server for multiplayer relay (2-4 players)
 // Run with: node server.js
+console.log('Starting server...');
 const http = require('http');
 const WebSocket = require('ws');
 const PORT = process.env.PORT || 3001;

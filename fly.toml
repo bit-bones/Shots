@@ -23,9 +23,9 @@ primary_region = 'iad'
     soft_limit = 20
 
   [[services.ports]]
-    port = 80
-    handlers = ["http"]
-    # HTTP on port 80 will be forwarded to internal_port 8080
+    port = 443
+    handlers = ["tls", "http"]
+    # Terminate TLS and forward HTTP to internal_port 8080
 
 [[vm]]
   size = 'shared-cpu-1x'
