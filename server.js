@@ -166,6 +166,7 @@ wss.on('connection', function connection(ws) {
     });
 });
 
-server.listen(PORT, () => {
+// Bind to 0.0.0.0 explicitly to ensure both IPv4 and IPv6 reachability inside containers
+server.listen(PORT, '0.0.0.0', () => {
     console.log('WebSocket server running on port', PORT);
 });
