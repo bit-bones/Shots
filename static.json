@@ -1,0 +1,11 @@
+{
+  "root": ".",
+  "routes": {
+    "/**": "index.html"
+  },
+  "headers": {
+    "/**": {
+      "Cache-Control": "no-cache"
+    }
+  }
+}

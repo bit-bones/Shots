@@ -3,29 +3,14 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'shots-game'
+app = 'shots'
 primary_region = 'iad'
 
 [build]
-  # Use the project Dockerfile to build the image (avoid remote buildpack failures)
-  dockerfile = "Dockerfile"
+  buildpacks = ["https://github.com/heroku/heroku-buildpack-static.git"]
 
 [env]
-  PORT = '8080'
-
-[[services]]
-  protocol = "tcp"
-  internal_port = 8080
-
-  [services.concurrency]
-    type = "connections"
-    hard_limit = 25
-    soft_limit = 20
-
-  [[services.ports]]
-    port = 443
-    handlers = ["tls", "http"]
-    # Terminate TLS and forward HTTP to internal_port 8080
+  # No PORT needed for static
 
 [[vm]]
   size = 'shared-cpu-1x'
