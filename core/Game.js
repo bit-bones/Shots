@@ -65,7 +65,6 @@ class Game {
         
         // AI
         this.botAIs = [];
-        
         // State
         this.running = false;
         this.lastTime = 0;
@@ -79,12 +78,24 @@ class Game {
         this.chooseCardOnStart = true;
         this.cardSelectionQueue = [];
         this.initialCardDraftActive = false;
+        this.setupOptions = {
+            obstacleDensity: 7,
+            obstacleSize: 110,
+            worldModInterval: 3,
+            mapBorder: true,
+            roundsToWin: 10,
+            chooseCardOnStart: true
+        };
+        this._lastSetupBroadcastDigest = null;
+        this.cardManagementUIRef = null;
         
         // Multiplayer state
         this.isMultiplayer = false;
         this.lastStateBroadcast = 0;
         this.stateBroadcastInterval = 1000 / 20; // 20hz state updates
         this.firestormAudioActive = false;
+        this._lastEnvironmentSync = 0;
+        this._environmentSyncInterval = 250; // milliseconds between full environment payloads
         
         // Audio state tracking for joiners
         this._previousBulletIds = new Set();
@@ -95,8 +106,8 @@ class Game {
 
         // Joiner snapshot smoothing
         this._snapshotBuffer = [];
-        this._snapshotInterpolationDelay = 20; // milliseconds of intentional delay
-        this._snapshotMaxBuffer = 10;
+        this._snapshotInterpolationDelay = 10; // milliseconds of intentional delay
+        this._snapshotMaxBuffer = 5;
         this._hasAppliedInitialSnapshot = false;
         this._remoteScoreboardEntries = null;
         this._lastReceivedModePayload = null;
@@ -205,6 +216,13 @@ class Game {
         const roundsInput = document.getElementById('rounds-to-win');
         if (roundsInput) {
             roundsInput.addEventListener('change', () => {
+                if (!this.canModifySetupControls()) {
+                    const current = Number.isFinite(this.setupOptions.roundsToWin)
+                        ? this.setupOptions.roundsToWin
+                        : 10;
+                    roundsInput.value = String(current);
+                    return;
+                }
                 if (this.isMultiplayer && this.network.role === 'host' && this.network.connected) {
                     try {
                         const roundsValue = parseInt(roundsInput.value, 10);
@@ -215,11 +233,19 @@ class Game {
                         console.warn('[Game] Failed to broadcast rounds update:', e);
                     }
                 }
+                const parsed = parseInt(roundsInput.value, 10);
+                if (Number.isFinite(parsed)) {
+                    this.handleLocalSetupOptionChange('roundsToWin', parsed);
+                }
             });
         }
 
         if (chooseCardCheckbox) {
             chooseCardCheckbox.addEventListener('change', () => {
+                if (!this.canModifySetupControls()) {
+                    chooseCardCheckbox.checked = !!this.chooseCardOnStart;
+                    return;
+                }
                 const enabled = !!chooseCardCheckbox.checked;
                 this.chooseCardOnStart = enabled;
                 try {
@@ -230,8 +256,45 @@ class Game {
                 if (this.isMultiplayer && this.network.role === 'host' && this.network.connected) {
                     this.network.sendMessage('start-card-setting', { enabled });
                 }
+                this.handleLocalSetupOptionChange('chooseCardOnStart', enabled);
             });
         }
+
+        const densitySlider = document.getElementById('obstacle-density');
+        if (densitySlider) {
+            const densityValue = parseInt(densitySlider.value, 10);
+            if (Number.isFinite(densityValue)) {
+                this.handleLocalSetupOptionChange('obstacleDensity', densityValue, { broadcast: false });
+            }
+        }
+
+        const sizeSlider = document.getElementById('obstacle-size');
+        if (sizeSlider) {
+            const sizeValue = parseInt(sizeSlider.value, 10);
+            if (Number.isFinite(sizeValue)) {
+                this.handleLocalSetupOptionChange('obstacleSize', sizeValue, { broadcast: false });
+            }
+        }
+
+        const worldModSlider = document.getElementById('world-modifier-interval');
+        if (worldModSlider) {
+            const worldValue = parseInt(worldModSlider.value, 10);
+            if (Number.isFinite(worldValue)) {
+                this.handleLocalSetupOptionChange('worldModInterval', worldValue, { broadcast: false });
+            }
+        }
+
+        const mapBorderCheckbox = document.getElementById('map-border');
+        if (mapBorderCheckbox) {
+            this.handleLocalSetupOptionChange('mapBorder', !!mapBorderCheckbox.checked, { broadcast: false });
+        }
+
+        const roundsInputInitValue = roundsInput ? parseInt(roundsInput.value, 10) : null;
+        if (Number.isFinite(roundsInputInitValue)) {
+            this.handleLocalSetupOptionChange('roundsToWin', roundsInputInitValue, { broadcast: false });
+        }
+
+        this.handleLocalSetupOptionChange('chooseCardOnStart', this.chooseCardOnStart, { broadcast: false });
         
         // Bind setup UI
         this.setupUI.bind();
@@ -250,6 +313,7 @@ class Game {
             return true;
         });
         this.setupUI.show();
+        this._updateSetupControlPermissions();
     }
 
     _setupNetworkCallbacks() {
@@ -262,6 +326,7 @@ class Game {
             this._clearReadyStates(false);
             // Show session code in UI
             this.setupUI.showSessionCode(code);
+            this._updateSetupControlPermissions();
         };
         
         this.network.onPeerJoined = (joinerIndex, joinerName) => {
@@ -281,6 +346,17 @@ class Game {
             // Always broadcast roster state to all joiners (including the new one)
             // This ensures the new joiner sees the correct roster immediately
             this._broadcastRosterUpdate();
+            this._broadcastSetupState(true);
+            if (Number.isFinite(joinerIndex)) {
+                this._broadcastSetupState(true, joinerIndex);
+                setTimeout(() => {
+                    try {
+                        this._broadcastSetupState(true, joinerIndex);
+                    } catch (err) {
+                        console.warn('[Game] Failed to resend setup snapshot to joiner', err);
+                    }
+                }, 350);
+            }
             this.setupUI.setMultiplayerMode(true);
             this._broadcastReadyStates();
 
@@ -299,6 +375,7 @@ class Game {
             // Remove from roster
             this.setupUI.onPeerLeft(joinerIndex);
             this._broadcastRosterUpdate();
+            this._broadcastSetupState();
             if (this.network.role === 'host') {
                 this._updateReadyState(joinerIndex + 1, false);
             }
@@ -312,6 +389,32 @@ class Game {
             this.setupUI.onJoinedAsJoiner(code, joinerIndex, joinerName || null);
             this.setupUI.setMultiplayerMode(true);
             this._clearReadyStates(false);
+            this._updateSetupControlPermissions();
+
+            try {
+                if (this.network && this.network.connected && this.network.role === 'joiner') {
+                    setTimeout(() => {
+                        try {
+                            if (this.network && this.network.connected && this.network.role === 'joiner') {
+                                this.network.sendMessage('setup-sync-request', { reason: 'initial' });
+                            }
+                        } catch (syncErr) {
+                            console.warn('[Game] Failed to send setup-sync-request', syncErr);
+                        }
+                    }, 500);
+                    setTimeout(() => {
+                        try {
+                            if (this.network && this.network.connected && this.network.role === 'joiner') {
+                                this.network.sendMessage('setup-sync-request', { reason: 'initial_retry' });
+                            }
+                        } catch (retryErr) {
+                            console.warn('[Game] Failed to resend setup-sync-request', retryErr);
+                        }
+                    }, 1500);
+                }
+            } catch (syncErr) {
+                console.warn('[Game] Failed to send setup-sync-request', syncErr);
+            }
             
             // Request initial roster state from host
             // The host will respond with a state broadcast
@@ -328,6 +431,8 @@ class Game {
                     if (savedStyle || savedColor) {
                         // Send cursor update without fighterId/slotIndex; host will map via joinerIndex
                         this.network.sendMessage('cursor-update', {
+                            cursorStyle: savedStyle,
+                            cursorColor: savedColor,
                             style: savedStyle,
                             color: savedColor,
                             fighterId: null,
@@ -341,6 +446,8 @@ class Game {
                             const savedColor2 = localStorage.getItem('shape_shot_color') || null;
                             if (savedStyle2 || savedColor2) {
                                 this.network.sendMessage('cursor-update', {
+                                    cursorStyle: savedStyle2,
+                                    cursorColor: savedColor2,
                                     style: savedStyle2,
                                     color: savedColor2,
                                     fighterId: null,
@@ -407,6 +514,7 @@ class Game {
                 } catch (e) {
                     console.warn('[Game] Failed to save rounds to localStorage on joiner:', e);
                 }
+                this.handleLocalSetupOptionChange('roundsToWin', roundsValue, { broadcast: false, allowJoiner: true });
             }
         };
 
@@ -443,6 +551,7 @@ class Game {
             } catch (e) {
                 console.warn('[Game] Failed to save choose-card-on-start setting on joiner:', e);
             }
+            this.handleLocalSetupOptionChange('chooseCardOnStart', enabled, { broadcast: false, allowJoiner: true });
         };
         
         this.network.onRoundReset = (data) => {
@@ -462,6 +571,24 @@ class Game {
         this.network.onError = (message) => {
             console.error('[Game] Network error:', message);
             alert('Network error: ' + message);
+        };
+
+        this.network.onSetupUpdate = (payload, targetJoinerIndex) => {
+            this._applySetupUpdate(payload, targetJoinerIndex);
+        };
+
+        this.network.onSetupSyncRequest = (data) => {
+            if (this.network.role !== 'host' || !data) return;
+            const joinerIndex = typeof data.joinerIndex === 'number' ? data.joinerIndex : null;
+            if (joinerIndex === null) return;
+            this._broadcastSetupState(true, joinerIndex);
+            setTimeout(() => {
+                try {
+                    this._broadcastSetupState(true, joinerIndex);
+                } catch (err) {
+                    console.warn('[Game] Failed to resend setup snapshot for sync request', err);
+                }
+            }, 300);
         };
     }
 
@@ -579,6 +706,9 @@ class Game {
         }
         if (!this.isMultiplayer || (this.network && this.network.role === 'host')) {
             this._broadcastRosterUpdate();
+            if (this.network && this.network.role === 'host') {
+                this._broadcastSetupState();
+            }
         }
     }
 
@@ -589,6 +719,9 @@ class Game {
         this._syncModeUIState({ suppressRender: false });
         if (!this.isMultiplayer || (this.network && this.network.role === 'host')) {
             this._broadcastRosterUpdate();
+            if (this.network && this.network.role === 'host') {
+                this._broadcastSetupState();
+            }
         }
     }
 
@@ -646,6 +779,9 @@ class Game {
         }
         if (!this.isMultiplayer || (this.network && this.network.role === 'host')) {
             this._broadcastRosterUpdate();
+            if (this.network && this.network.role === 'host') {
+                this._broadcastSetupState();
+            }
         }
     }
 
@@ -691,7 +827,9 @@ class Game {
         if (payload.state) {
             this.modeManager.applySerializableState(payload.state);
         }
-        this.modeManager.onRosterChanged();
+            if (this.network && this.network.role === 'host') {
+                this._broadcastSetupState();
+            }
         this._lastModeFlagsDigest = null;
         this._lastModeSettingsDigest = null;
         this._lastModeDescription = null;
@@ -710,6 +848,9 @@ class Game {
         }
         if (!this.isMultiplayer || (this.network && this.network.role === 'host')) {
             this._broadcastRosterUpdate();
+        }
+        if (this.isMultiplayer && this.network && this.network.role === 'host' && this.network.connected) {
+            this._broadcastSetupState();
         }
     }
 
@@ -890,6 +1031,8 @@ class Game {
                 }
             }
         }
+
+        this._lastEnvironmentSync = 0;
     }
     
     rectsOverlap(a, b) {
@@ -2074,8 +2217,23 @@ class Game {
         }
     }
 
-    createNetworkSnapshot() {
+    createNetworkSnapshot(options = {}) {
+        const opts = options || {};
         const fighters = this.roster.getAllFighters();
+
+        const now = Date.now();
+        const interval = Number.isFinite(this._environmentSyncInterval)
+            ? this._environmentSyncInterval
+            : 250;
+        let includeEnvironment = !!opts.forceEnvironment;
+        if (!includeEnvironment) {
+            if (!this._lastEnvironmentSync || (now - this._lastEnvironmentSync) >= interval) {
+                includeEnvironment = true;
+            }
+        }
+        if (includeEnvironment) {
+            this._lastEnvironmentSync = now;
+        }
 
         const fighterState = fighters.map(fighter => {
             if (typeof fighter.serialize === 'function') {
@@ -2124,45 +2282,47 @@ class Game {
             });
         });
 
-        const infestedState = this.infestedChunks.map(chunk => {
-            if (typeof chunk.serialize === 'function') {
-                return chunk.serialize();
-            }
-            return StateSerializer.serialize(chunk);
-        });
-
-        const looseState = this.looseChunks.map(chunk => {
-            if (typeof chunk.serialize === 'function') {
-                return chunk.serialize();
-            }
-            return StateSerializer.serialize(chunk);
-        });
-
-        const obstacleState = this.obstacles.map(obstacle => {
-            if (typeof obstacle.serialize === 'function') {
-                return obstacle.serialize();
-            }
-            return StateSerializer.serialize(obstacle);
-        });
-
-        const healerState = this.healers.map(healer => {
-            if (typeof healer.serialize === 'function') {
-                return healer.serialize();
-            }
-            return StateSerializer.serialize(healer, {
-                exclude: ['_lastAttacker']
+        let infestedState = null;
+        let looseState = null;
+        let obstacleState = null;
+        let healerState = null;
+        if (includeEnvironment) {
+            infestedState = this.infestedChunks.map(chunk => {
+                if (typeof chunk.serialize === 'function') {
+                    return chunk.serialize();
+                }
+                return StateSerializer.serialize(chunk);
             });
-        });
 
-        return {
+            looseState = this.looseChunks.map(chunk => {
+                if (typeof chunk.serialize === 'function') {
+                    return chunk.serialize();
+                }
+                return StateSerializer.serialize(chunk);
+            });
+
+            obstacleState = this.obstacles.map(obstacle => {
+                if (typeof obstacle.serialize === 'function') {
+                    return obstacle.serialize();
+                }
+                return StateSerializer.serialize(obstacle);
+            });
+
+            healerState = this.healers.map(healer => {
+                if (typeof healer.serialize === 'function') {
+                    return healer.serialize();
+                }
+                return StateSerializer.serialize(healer, {
+                    exclude: ['_lastAttacker']
+                });
+            });
+        }
+
+        const snapshot = {
             fighters: fighterState,
             bullets: bulletState,
             explosions: explosionState,
             firestorms: firestormState,
-            infestedChunks: infestedState,
-            looseChunks: looseState,
-            obstacles: obstacleState,
-            healers: healerState,
             activeMods: this.cards.activeMods.slice(),
             usedWorldMods: Object.assign({}, this.cards.usedWorldMods),
             firestormPreSpawnPos: this.cards.firestormPreSpawnPos ? {
@@ -2211,8 +2371,23 @@ class Game {
             cardSelection: selectionState,
             mapBorder: this.mapBorderEnabled,
             worldModInterval: this.match.worldModInterval,
-            timestamp: Date.now()
+            timestamp: now
         };
+
+        if (includeEnvironment) {
+            snapshot.infestedChunks = infestedState;
+            snapshot.looseChunks = looseState;
+            snapshot.obstacles = obstacleState;
+            snapshot.healers = healerState;
+            snapshot.usedWorldMods = Object.assign({}, this.cards.usedWorldMods);
+        } else {
+            snapshot.infestedChunks = null;
+            snapshot.looseChunks = null;
+            snapshot.obstacles = null;
+            snapshot.healers = null;
+        }
+
+        return snapshot;
     }
 
     reset() {
@@ -2224,6 +2399,10 @@ class Game {
 
         this.pendingWorldMod = null; // Clear any pending world mod selection
         this.mapBorderEnabled = true;
+        this._lastSetupBroadcastDigest = null;
+        if (this.setupOptions) {
+            this.setupOptions.mapBorder = true;
+        }
         const borderToggle = document.getElementById('map-border');
         if (borderToggle) {
             borderToggle.checked = true;
@@ -2262,6 +2441,8 @@ class Game {
             roundCounter.style.display = 'none';
         }
 
+        this._lastEnvironmentSync = 0;
+
         if (this.modeManager) {
             this.modeManager.onRosterChanged();
             this._syncModeUIState({ suppressRender: false });
@@ -2278,6 +2459,7 @@ class Game {
         this._previousFighterHealths.clear();
         this._previousFighterDashActive.clear();
         this._audioStateInitialized = false;
+        this._updateSetupControlPermissions();
     }
 
     resetRound() {
@@ -2375,6 +2557,7 @@ class Game {
                         this.roster.updateFighter(localFighter.id, updates);
                         this.setupUI.render();
                         this._broadcastRosterUpdate();
+                        this._broadcastSetupState();
                     }
                 }
             } catch (e) { console.warn('[Game] Failed to set host cursor metadata', e); }
@@ -2406,10 +2589,484 @@ class Game {
             return;
         }
 
-        const snapshot = this.createNetworkSnapshot();
+        const snapshot = this.createNetworkSnapshot({ forceEnvironment: true });
         if (snapshot) {
             this.network.broadcastState(snapshot);
         }
+    }
+
+    handleLocalSetupOptionChange(key, value, options = {}) {
+        if (!key) return;
+        const opts = options || {};
+        if (this.isMultiplayer && this.network && this.network.role === 'joiner' && !opts.allowJoiner) {
+            return;
+        }
+        if (!this.setupOptions) this.setupOptions = {};
+
+        let normalizedValue = value;
+
+        if (key === 'chooseCardOnStart') {
+            normalizedValue = !!value;
+            this.chooseCardOnStart = normalizedValue;
+        } else if (key === 'mapBorder') {
+            normalizedValue = !!value;
+            this.mapBorderEnabled = normalizedValue;
+        } else if (key === 'roundsToWin') {
+            if (Number.isFinite(value)) {
+                const clamped = Math.min(Math.max(Math.round(value), 1), 50);
+                normalizedValue = clamped;
+                if (this.match) {
+                    this.match.roundsToWin = clamped;
+                }
+            } else {
+                return;
+            }
+        } else if (key === 'worldModInterval') {
+            if (Number.isFinite(value)) {
+                const clamped = Math.min(Math.max(Math.round(value), 1), 10);
+                normalizedValue = clamped;
+                if (this.match) {
+                    this.match.worldModInterval = clamped;
+                }
+            } else {
+                return;
+            }
+        } else if (key === 'obstacleDensity' || key === 'obstacleSize') {
+            if (Number.isFinite(value)) {
+                const rounded = Math.round(value);
+                if (key === 'obstacleDensity') {
+                    normalizedValue = Math.min(Math.max(rounded, 2), 15);
+                } else {
+                    normalizedValue = Math.min(Math.max(rounded, 40), 200);
+                }
+            } else {
+                return;
+            }
+        }
+
+        this.setupOptions[key] = normalizedValue;
+
+        if (opts.broadcast === false) {
+            return;
+        }
+
+        if (this.isMultiplayer && this.network && this.network.connected && this.network.role === 'host') {
+            this._broadcastSetupState();
+        }
+    }
+
+    handleCardSettingsChanged() {
+        if (!this.cards) return;
+        this.cards.resetStartActivationState();
+        if (this.cardManagementUIRef && typeof this.cardManagementUIRef.refreshAll === 'function') {
+            this.cardManagementUIRef.refreshAll();
+        }
+        if (this.isMultiplayer && this.network && this.network.connected && this.network.role === 'host') {
+            this._broadcastSetupState();
+        }
+    }
+
+    setCardManagementUI(ui) {
+        this.cardManagementUIRef = ui || null;
+        const canControl = this.canModifySetupControls();
+        if (this.cardManagementUIRef && typeof this.cardManagementUIRef.setInteractionEnabled === 'function') {
+            this.cardManagementUIRef.setInteractionEnabled(canControl);
+        }
+        if (this.cardManagementUIRef && typeof this.cardManagementUIRef.refreshAll === 'function') {
+            this.cardManagementUIRef.refreshAll();
+        }
+    }
+
+    canModifySetupControls() {
+        if (!this.isMultiplayer) return true;
+        return !!(this.network && this.network.role === 'host');
+    }
+
+    _setSetupControlsEnabled(enabled) {
+        const ids = ['obstacle-density', 'obstacle-size', 'world-modifier-interval', 'rounds-to-win'];
+        const disabled = !enabled;
+        ids.forEach((id) => {
+            const input = typeof document !== 'undefined' ? document.getElementById(id) : null;
+            if (input && typeof input.disabled !== 'undefined') {
+                input.disabled = disabled;
+            }
+        });
+        const mapBorderCheckbox = typeof document !== 'undefined' ? document.getElementById('map-border') : null;
+        if (mapBorderCheckbox && typeof mapBorderCheckbox.disabled !== 'undefined') {
+            mapBorderCheckbox.disabled = disabled;
+        }
+        const chooseCardCheckbox = typeof document !== 'undefined' ? document.getElementById('choose-card-on-start') : null;
+        if (chooseCardCheckbox && typeof chooseCardCheckbox.disabled !== 'undefined') {
+            chooseCardCheckbox.disabled = disabled;
+        }
+    }
+
+    _updateSetupControlPermissions() {
+        const canControl = this.canModifySetupControls();
+        this._setSetupControlsEnabled(canControl);
+        if (this.setupUI) {
+            this.setupUI.setSettingsLocked(!canControl);
+            if (this.isMultiplayer) {
+                this.setupUI.isJoinerView = !canControl;
+            } else {
+                this.setupUI.isJoinerView = false;
+            }
+            this.setupUI.updateStartButtonState();
+            if (typeof this.setupUI.render === 'function') {
+                this.setupUI.render();
+            }
+        }
+        if (this.cardManagementUIRef && typeof this.cardManagementUIRef.setInteractionEnabled === 'function') {
+            this.cardManagementUIRef.setInteractionEnabled(canControl);
+        }
+    }
+
+    _buildCardSettingsSnapshot() {
+        if (!this.cards) return null;
+
+        const toSortedArray = (iterable) => {
+            const arr = Array.from(iterable || []);
+            arr.sort();
+            return arr;
+        };
+
+        const normalizeStartEntries = (entries) => {
+            if (!Array.isArray(entries)) return [];
+            const mapped = entries.map((entry) => {
+                if (!entry) return null;
+                if (Array.isArray(entry) && entry.length >= 2) {
+                    return [entry[0], entry[1]];
+                }
+                if (typeof entry === 'object' && entry.name !== undefined) {
+                    return [entry.name, entry.count];
+                }
+                return null;
+            }).filter(Boolean);
+            mapped.sort((a, b) => {
+                const aName = (a && a[0]) ? a[0].toString() : '';
+                const bName = (b && b[0]) ? b[0].toString() : '';
+                return aName.localeCompare(bName);
+            });
+            return mapped;
+        };
+
+        return {
+            powerups: toSortedArray(this.cards.enabledPowerups),
+            worldMods: toSortedArray(this.cards.enabledWorldMods),
+            startPowerups: normalizeStartEntries(this.cards.getStartPowerupEntries()),
+            startWorldMods: normalizeStartEntries(this.cards.getStartWorldModEntries()),
+            powerupsEnabled: !!this.cards.powerupsEnabled,
+            worldModsEnabled: !!this.cards.worldModsEnabled
+        };
+    }
+
+    _applyCardSettingsSnapshot(snapshot = {}) {
+        if (!this.cards || !snapshot) return;
+
+        const { powerups, worldMods, startPowerups, startWorldMods, powerupsEnabled, worldModsEnabled } = snapshot;
+
+        if (Array.isArray(powerups)) {
+            this.cards.enabledPowerups.clear();
+            for (const name of powerups) {
+                if (typeof name === 'string') {
+                    this.cards.enabledPowerups.add(name);
+                }
+            }
+        }
+
+        if (Array.isArray(worldMods)) {
+            this.cards.enabledWorldMods.clear();
+            for (const name of worldMods) {
+                if (typeof name === 'string') {
+                    this.cards.enabledWorldMods.add(name);
+                }
+            }
+        }
+
+        if (Array.isArray(startPowerups)) {
+            this.cards.clearStartPowerupStacks();
+            for (const entry of startPowerups) {
+                if (!entry) continue;
+                if (Array.isArray(entry) && entry.length >= 2) {
+                    this.cards.setStartPowerupStacks(entry[0], entry[1]);
+                } else if (typeof entry === 'object' && entry.name !== undefined) {
+                    this.cards.setStartPowerupStacks(entry.name, entry.count);
+                }
+            }
+        }
+
+        if (Array.isArray(startWorldMods)) {
+            this.cards.clearStartWorldModStacks();
+            for (const entry of startWorldMods) {
+                if (!entry) continue;
+                if (Array.isArray(entry) && entry.length >= 2) {
+                    this.cards.setStartWorldModStacks(entry[0], entry[1]);
+                } else if (typeof entry === 'object' && entry.name !== undefined) {
+                    this.cards.setStartWorldModStacks(entry.name, entry.count);
+                }
+            }
+        }
+
+        if (typeof powerupsEnabled === 'boolean') {
+            this.cards.powerupsEnabled = powerupsEnabled;
+        }
+        if (typeof worldModsEnabled === 'boolean') {
+            this.cards.worldModsEnabled = worldModsEnabled;
+        }
+
+        this.cards.resetStartActivationState();
+
+        if (this.cardManagementUIRef && typeof this.cardManagementUIRef.refreshAll === 'function') {
+            this.cardManagementUIRef.refreshAll();
+        }
+    }
+
+    _buildSetupStateSnapshot() {
+        const fighters = [];
+        if (this.roster && Array.isArray(this.roster.slots)) {
+            for (let i = 0; i < this.roster.maxSlots; i++) {
+                const fighter = this.roster.getSlot(i);
+                if (!fighter) {
+                    fighters.push(null);
+                    continue;
+                }
+
+                fighters.push({
+                    id: fighter.id,
+                    slotIndex: fighter.slotIndex,
+                    name: fighter.name,
+                    color: fighter.color,
+                    isBot: !!fighter.isBot,
+                    isLocal: !!fighter.isLocal,
+                    metadata: StateSerializer.cloneValue(fighter.metadata || {}),
+                    ready: !!this.readyStates[fighter.slotIndex]
+                });
+            }
+        }
+
+        return {
+            fighters,
+            readyStates: Object.assign({}, this.readyStates || {}),
+            options: Object.assign({}, this.setupOptions || {}),
+            mode: this._buildModeNetworkPayload(),
+            cards: this._buildCardSettingsSnapshot()
+        };
+    }
+
+    _broadcastSetupState(force = false, targetJoinerIndex = null) {
+        if (!this.network || this.network.role !== 'host' || !this.network.connected) return;
+
+        const payload = this._buildSetupStateSnapshot();
+
+        if (typeof targetJoinerIndex === 'number') {
+            this.network.broadcastSetupUpdate(payload, targetJoinerIndex);
+            return;
+        }
+
+        let digest = null;
+        try {
+            digest = JSON.stringify(payload);
+        } catch (e) {
+            digest = null;
+        }
+
+        if (!force && digest && this._lastSetupBroadcastDigest === digest) {
+            return;
+        }
+
+        if (digest) {
+            this._lastSetupBroadcastDigest = digest;
+        } else {
+            this._lastSetupBroadcastDigest = null;
+        }
+
+        this.network.broadcastSetupUpdate(payload);
+    }
+
+    _applySetupUpdate(data, targetJoinerIndex = null) {
+        if (!data) return;
+
+        if (data.options && typeof data.options === 'object') {
+            this.setupOptions = Object.assign({}, this.setupOptions || {}, data.options);
+        }
+
+        const isJoiner = this.network && this.network.role === 'joiner';
+        if (typeof targetJoinerIndex === 'number' && isJoiner) {
+            if (this.network.joinerIndex !== targetJoinerIndex) {
+                return;
+            }
+        } else if (typeof targetJoinerIndex === 'number') {
+            return;
+        }
+
+        if (!isJoiner) {
+            return;
+        }
+
+        if (!this.isMultiplayer) {
+            this.isMultiplayer = true;
+        }
+
+        if (Array.isArray(data.fighters)) {
+            this._applySetupFighterSnapshot(data.fighters);
+        }
+
+        if (data.readyStates && typeof data.readyStates === 'object') {
+            this._applyReadyStatesFromHost(data.readyStates);
+        }
+
+        if (data.options && typeof data.options === 'object') {
+            this._applySetupOptionSnapshot(data.options);
+        }
+
+        if (data.cards && typeof data.cards === 'object') {
+            this._applyCardSettingsSnapshot(data.cards);
+        }
+
+        if (data.mode) {
+            this._applyModeNetworkPayload(data.mode, { skipRosterRefresh: true });
+        }
+
+        if (this.setupUI) {
+            try {
+                this.setupUI.render();
+            } catch (e) {
+                console.warn('[Game] setupUI.render failed during setup update apply', e);
+            }
+            // Ensure control permissions reflect current role/state (joiner vs host)
+            try {
+                this._updateSetupControlPermissions();
+            } catch (e) {
+                console.warn('[Game] Failed to update setup control permissions after applying setup update', e);
+            }
+        }
+    }
+
+    _applySetupFighterSnapshot(entries) {
+        if (!Array.isArray(entries) || !this.roster) return;
+        const bySlot = new Map();
+        entries.forEach((entry, index) => {
+            if (!entry) return;
+            const slot = Number.isFinite(entry.slotIndex) ? entry.slotIndex : index;
+            if (!Number.isFinite(slot)) return;
+            bySlot.set(slot, entry);
+        });
+
+        const localSlot = (this.network && this.network.role === 'joiner' && typeof this.network.joinerIndex === 'number')
+            ? this.network.joinerIndex + 1
+            : null;
+
+        for (let slotIndex = 0; slotIndex < this.roster.maxSlots; slotIndex++) {
+            const entry = bySlot.has(slotIndex) ? bySlot.get(slotIndex) : null;
+            if (!entry) {
+                this.roster.clearSlot(slotIndex);
+                continue;
+            }
+
+            const metadata = Object.assign({}, entry.metadata || {});
+            const isLocal = (localSlot !== null && slotIndex === localSlot);
+
+            if (isLocal) {
+                metadata.remote = false;
+                metadata.joinerIndex = this.network.joinerIndex;
+            } else if (!entry.isBot) {
+                if (typeof metadata.remote !== 'boolean') {
+                    metadata.remote = true;
+                }
+                if (typeof metadata.joinerIndex !== 'number' && slotIndex > 0) {
+                    metadata.joinerIndex = slotIndex - 1;
+                }
+            }
+
+            const updates = {
+                name: entry.name,
+                color: entry.color,
+                isBot: !!entry.isBot,
+                isLocal,
+                metadata
+            };
+
+            let fighter = this.roster.getSlot(slotIndex);
+            if (!fighter || fighter.id !== entry.id) {
+                fighter = this.roster.assignSlot(slotIndex, entry.isBot ? 'bot' : 'human', entry.name, metadata, {
+                    forceId: entry.id,
+                    isLocalOverride: isLocal,
+                    isBotOverride: !!entry.isBot,
+                    colorOverride: entry.color
+                });
+            } else {
+                this.roster.updateFighter(fighter.id, updates);
+            }
+        }
+    }
+
+    _applySetupOptionSnapshot(options = {}) {
+        const normalized = Object.assign({}, this.setupOptions || {});
+
+        const density = Number(options.obstacleDensity);
+        if (Number.isFinite(density)) {
+            const rounded = Math.round(density);
+            const clampedDensity = Math.min(Math.max(rounded, 2), 15);
+            normalized.obstacleDensity = clampedDensity;
+            const slider = document.getElementById('obstacle-density');
+            if (slider) slider.value = String(clampedDensity);
+            const label = document.getElementById('density-value');
+            if (label) label.textContent = String(clampedDensity);
+        }
+
+        const size = Number(options.obstacleSize);
+        if (Number.isFinite(size)) {
+            const clampedSize = Math.min(Math.max(Math.round(size), 40), 200);
+            normalized.obstacleSize = clampedSize;
+            const slider = document.getElementById('obstacle-size');
+            if (slider) slider.value = String(clampedSize);
+            const label = document.getElementById('size-value');
+            if (label) label.textContent = String(clampedSize);
+        }
+
+        const worldInterval = Number(options.worldModInterval);
+        if (Number.isFinite(worldInterval)) {
+            const clampedInterval = Math.min(Math.max(Math.round(worldInterval), 1), 10);
+            normalized.worldModInterval = clampedInterval;
+            const slider = document.getElementById('world-modifier-interval');
+            if (slider) slider.value = String(clampedInterval);
+            const label = document.getElementById('world-modifier-value');
+            if (label) label.textContent = String(clampedInterval);
+            if (this.match) {
+                this.match.worldModInterval = clampedInterval;
+            }
+        }
+
+        if (options.hasOwnProperty('mapBorder')) {
+            const mapBorderEnabled = !!options.mapBorder;
+            normalized.mapBorder = mapBorderEnabled;
+            const checkbox = document.getElementById('map-border');
+            if (checkbox) checkbox.checked = mapBorderEnabled;
+            this.mapBorderEnabled = mapBorderEnabled;
+        }
+
+        if (options.hasOwnProperty('roundsToWin')) {
+            const rounds = Number(options.roundsToWin);
+            if (Number.isFinite(rounds)) {
+                const clampedRounds = Math.min(Math.max(Math.round(rounds), 1), 50);
+                normalized.roundsToWin = clampedRounds;
+                const roundsInput = document.getElementById('rounds-to-win');
+                if (roundsInput) roundsInput.value = String(clampedRounds);
+                if (this.match) {
+                    this.match.roundsToWin = clampedRounds;
+                }
+            }
+        }
+
+        if (options.hasOwnProperty('chooseCardOnStart')) {
+            const enableCards = !!options.chooseCardOnStart;
+            normalized.chooseCardOnStart = enableCards;
+            const checkbox = document.getElementById('choose-card-on-start');
+            if (checkbox) checkbox.checked = enableCards;
+            this.chooseCardOnStart = enableCards;
+        }
+
+        this.setupOptions = normalized;
     }
 
     _handleReadyToggle(slotIndex) {
@@ -2458,6 +3115,7 @@ class Game {
 
         if (this.isMultiplayer && this.network && this.network.role === 'host' && this.network.connected) {
             this._broadcastRosterUpdate();
+            this._broadcastSetupState();
         }
     }
 
@@ -2501,6 +3159,7 @@ class Game {
         if (this.network.role === 'host') {
             if (options.broadcast === false) return true;
             this._broadcastReadyStates();
+            this._broadcastSetupState();
             return true;
         }
         if (this.network.role === 'joiner') {
@@ -2536,6 +3195,7 @@ class Game {
         }
         if (broadcast && this.isMultiplayer && this.network && this.network.role === 'host') {
             this._broadcastReadyStates();
+            this._broadcastSetupState();
         }
     }
 
@@ -2598,14 +3258,22 @@ class Game {
         this.roster.updateFighter(fighter.id, { name: requestedName });
         this.setupUI.render();
         this._broadcastRosterUpdate();
+        this._broadcastSetupState();
     }
 
     _handleCursorUpdateFromJoiner(data) {
         if (!data || this.network.role !== 'host') return;
 
         const joinerIndex = typeof data.joinerIndex === 'number' ? data.joinerIndex : null;
-        const style = typeof data.cursorStyle === 'string' ? data.cursorStyle.trim().slice(0, 32) : null;
-        const color = typeof data.cursorColor === 'string' ? data.cursorColor.trim().slice(0, 32) : null;
+        const rawStyle = typeof data.cursorStyle === 'string'
+            ? data.cursorStyle
+            : (typeof data.style === 'string' ? data.style : null);
+        const rawColor = typeof data.cursorColor === 'string'
+            ? data.cursorColor
+            : (typeof data.color === 'string' ? data.color : null);
+
+        const style = rawStyle ? rawStyle.trim().slice(0, 32) : null;
+        const color = rawColor ? rawColor.trim().slice(0, 32) : null;
         const fighterId = data.fighterId || null;
         const slotIndex = typeof data.slotIndex === 'number' ? data.slotIndex : null;
 
@@ -2629,6 +3297,7 @@ class Game {
         this.roster.updateFighter(fighter.id, updates);
         this.setupUI.render();
         this._broadcastRosterUpdate();
+        this._broadcastSetupState();
     }
     
     _resolveAimTarget(fighter, requestedX, requestedY, fighters = []) {
@@ -2762,14 +3431,20 @@ class Game {
         const firestormStates = Array.isArray(state.firestorms) ? state.firestorms : [];
         this.firestorms = firestormStates.map(data => Firestorm.fromState(data)).filter(Boolean);
 
-        const infestedStates = Array.isArray(state.infestedChunks) ? state.infestedChunks : [];
-        this.infestedChunks = infestedStates.map(data => InfestedChunk.fromState(data)).filter(Boolean);
+        if (Array.isArray(state.infestedChunks)) {
+            const infestedStates = state.infestedChunks;
+            this.infestedChunks = infestedStates.map(data => InfestedChunk.fromState(data)).filter(Boolean);
+        }
 
-        const looseStates = Array.isArray(state.looseChunks) ? state.looseChunks : [];
-        this.looseChunks = looseStates.map(data => LooseChunk.fromState(data)).filter(Boolean);
+        if (Array.isArray(state.looseChunks)) {
+            const looseStates = state.looseChunks;
+            this.looseChunks = looseStates.map(data => LooseChunk.fromState(data)).filter(Boolean);
+        }
 
-        const healerStates = Array.isArray(state.healers) ? state.healers : [];
-        this.healers = healerStates.map(data => Healer.fromState(data)).filter(Boolean);
+        if (Array.isArray(state.healers)) {
+            const healerStates = state.healers;
+            this.healers = healerStates.map(data => Healer.fromState(data)).filter(Boolean);
+        }
 
         if (Array.isArray(state.obstacles)) {
             const obstacleStates = state.obstacles;
@@ -2826,14 +3501,16 @@ class Game {
             this.cards.usedWorldMods = Object.assign({}, state.usedWorldMods);
         }
 
-        if (state.firestormPreSpawnPos) {
-            this.cards.firestormPreSpawnPos = {
-                x: state.firestormPreSpawnPos.x,
-                y: state.firestormPreSpawnPos.y,
-                radius: state.firestormPreSpawnPos.radius
-            };
-        } else {
-            this.cards.firestormPreSpawnPos = null;
+        if (Object.prototype.hasOwnProperty.call(state, 'firestormPreSpawnPos')) {
+            if (state.firestormPreSpawnPos) {
+                this.cards.firestormPreSpawnPos = {
+                    x: state.firestormPreSpawnPos.x,
+                    y: state.firestormPreSpawnPos.y,
+                    radius: state.firestormPreSpawnPos.radius
+                };
+            } else {
+                this.cards.firestormPreSpawnPos = null;
+            }
         }
 
         if (typeof state.firestormCardsPulled === 'number') {
@@ -2855,25 +3532,29 @@ class Game {
         if (typeof state.healerRespawnDelay === 'number') {
             this.cards.healerRespawnDelay = state.healerRespawnDelay;
         }
-        if (state.healerPreSpawnPos) {
-            this.cards.healerPreSpawnPos = {
-                x: state.healerPreSpawnPos.x,
-                y: state.healerPreSpawnPos.y,
-                radius: state.healerPreSpawnPos.radius || 0,
-                progress: state.healerPreSpawnPos.progress || 0,
-                timeRemaining: state.healerPreSpawnPos.timeRemaining || 0
-            };
-        } else {
-            this.cards.healerPreSpawnPos = null;
+        if (Object.prototype.hasOwnProperty.call(state, 'healerPreSpawnPos')) {
+            if (state.healerPreSpawnPos) {
+                this.cards.healerPreSpawnPos = {
+                    x: state.healerPreSpawnPos.x,
+                    y: state.healerPreSpawnPos.y,
+                    radius: state.healerPreSpawnPos.radius || 0,
+                    progress: state.healerPreSpawnPos.progress || 0,
+                    timeRemaining: state.healerPreSpawnPos.timeRemaining || 0
+                };
+            } else {
+                this.cards.healerPreSpawnPos = null;
+            }
         }
 
-        if (state.healerNextSpawnPos) {
-            this.cards.healerNextSpawnPos = {
-                x: state.healerNextSpawnPos.x,
-                y: state.healerNextSpawnPos.y
-            };
-        } else {
-            this.cards.healerNextSpawnPos = null;
+        if (Object.prototype.hasOwnProperty.call(state, 'healerNextSpawnPos')) {
+            if (state.healerNextSpawnPos) {
+                this.cards.healerNextSpawnPos = {
+                    x: state.healerNextSpawnPos.x,
+                    y: state.healerNextSpawnPos.y
+                };
+            } else {
+                this.cards.healerNextSpawnPos = null;
+            }
         }
 
         if (typeof state.healerTelegraphDuration === 'number') {
@@ -2930,6 +3611,12 @@ class Game {
             }
             if (this.cardsUI) {
                 try { this.cardsUI.update(this.roster.getAllFighters(), this.cards.activeMods); } catch (e) { console.warn('[Game] cardsUI.update failed', e); }
+            }
+            // Ensure setup control permissions are applied for joiners after state updates
+            try {
+                this._updateSetupControlPermissions();
+            } catch (e) {
+                console.warn('[Game] Failed to update setup control permissions after state update', e);
             }
         }
     }

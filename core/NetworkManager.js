@@ -41,7 +41,7 @@ class NetworkManager {
         this.onCardOffer = null;
     this.onCardApply = null;
     this.onCardSelect = null;
-    this.onCardHover = null;
+        this.onCardHover = null;
         this.onReadyState = null;
         this.onError = null;
         this.onRoundReset = null;
@@ -49,6 +49,8 @@ class NetworkManager {
     this.onCursorUpdateRequest = null;
         this.onRoundsUpdate = null;
         this.onStartCardSetting = null;
+        this.onSetupUpdate = null;
+        this.onSetupSyncRequest = null;
         
     // Client input throttling
     this.pendingInput = null;
@@ -197,6 +199,24 @@ class NetworkManager {
             type: 'relay',
             data
         });
+    }
+
+    broadcastSetupUpdate(payload = {}, targetJoinerIndex = null) {
+        if (this.role !== 'host' || !this.connected) return;
+
+        const message = {
+            type: 'relay',
+            data: {
+                type: 'setup-update',
+                payload: Object.assign({}, payload)
+            }
+        };
+
+        if (typeof targetJoinerIndex === 'number') {
+            message.data.targetJoinerIndex = targetJoinerIndex;
+        }
+
+        this._send(message);
     }
 
     // ==================== JOINER METHODS ====================
@@ -528,6 +548,19 @@ class NetworkManager {
             case 'start-card-setting':
                 if (this.onStartCardSetting) {
                     this.onStartCardSetting(data);
+                }
+                break;
+
+            case 'setup-update':
+                if (this.onSetupUpdate) {
+                    const targetJoinerIndex = (typeof data.targetJoinerIndex === 'number') ? data.targetJoinerIndex : null;
+                    this.onSetupUpdate(data.payload || {}, targetJoinerIndex);
+                }
+                break;
+
+            case 'setup-sync-request':
+                if (this.role === 'host' && this.onSetupSyncRequest) {
+                    this.onSetupSyncRequest(data);
                 }
                 break;
                 

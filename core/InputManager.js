@@ -4,7 +4,7 @@
 class InputManager {
     constructor(canvas) {
         this.canvas = canvas;
-        this.keys = {};
+        this.keys = Object.create(null);
         this.mouseX = 0;
         this.mouseY = 0;
         this.mouseDown = false;
@@ -50,6 +50,51 @@ class InputManager {
         return key;
     }
 
+    _setKeyState(event, isPressed) {
+        if (!event) return;
+
+        const rawKey = event.key;
+        if (typeof rawKey === 'string' && rawKey.length > 0) {
+            this.keys[rawKey] = isPressed;
+            if (rawKey.length === 1) {
+                this.keys[rawKey.toLowerCase()] = isPressed;
+                this.keys[rawKey.toUpperCase()] = isPressed;
+            }
+        }
+
+        const code = event.code;
+        if (typeof code === 'string' && code.length > 0) {
+            this.keys[code] = isPressed;
+            // Map common movement aliases for consumers that rely on letter keys
+            switch (code) {
+                case 'KeyW':
+                    this.keys['w'] = isPressed;
+                    this.keys['W'] = isPressed;
+                    break;
+                case 'KeyA':
+                    this.keys['a'] = isPressed;
+                    this.keys['A'] = isPressed;
+                    break;
+                case 'KeyS':
+                    this.keys['s'] = isPressed;
+                    this.keys['S'] = isPressed;
+                    break;
+                case 'KeyD':
+                    this.keys['d'] = isPressed;
+                    this.keys['D'] = isPressed;
+                    break;
+                case 'ArrowUp':
+                case 'ArrowDown':
+                case 'ArrowLeft':
+                case 'ArrowRight':
+                    this.keys[code] = isPressed;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
     getMouseButtonName(button) {
         switch (button) {
             case 0: return 'LMB';
@@ -61,8 +106,8 @@ class InputManager {
 
     setupListeners() {
         // Keyboard
-        document.addEventListener('keydown', (e) => {
-            this.keys[e.key] = true;
+        const handleKeyDown = (e) => {
+            this._setKeyState(e, true);
             
             // Check for dash keys
             const dashKey = this.normalizeKeyName(e.key);
@@ -77,11 +122,14 @@ class InputManager {
                 this.shootRequested = true;
                 e.preventDefault();
             }
-        });
+        };
 
-        document.addEventListener('keyup', (e) => {
-            this.keys[e.key] = false;
-        });
+        const handleKeyUp = (e) => {
+            this._setKeyState(e, false);
+        };
+
+        window.addEventListener('keydown', handleKeyDown, true);
+        window.addEventListener('keyup', handleKeyUp, true);
 
         // Mouse position
         this.canvas.addEventListener('mousemove', (e) => {
@@ -113,6 +161,29 @@ class InputManager {
         this.canvas.addEventListener('contextmenu', (e) => {
             e.preventDefault();
         });
+
+        // Guard against shoot/move inputs getting stuck when releasing off-canvas or losing focus.
+        document.addEventListener('mouseup', () => {
+            this.mouseDown = false;
+        });
+
+        window.addEventListener('blur', () => {
+            this.clearKeys();
+        });
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible') {
+                this.clearKeys();
+            }
+        });
+        document.addEventListener('mouseleave', () => {
+            this.clearKeys();
+        });
+
+        document.addEventListener('contextmenu', () => {
+            this.mouseDown = false;
+            this.shootRequested = false;
+        }, true);
     }
 
     update() {
@@ -169,7 +240,11 @@ class InputManager {
     }
 
     clearKeys() {
-        this.keys = {};
+        const keyList = Object.keys(this.keys);
+        for (let i = 0; i < keyList.length; i++) {
+            const key = keyList[i];
+            this.keys[key] = false;
+        }
         this.mouseDown = false;
         this.mouseJustPressed = false;
         this.dashRequested = false;
