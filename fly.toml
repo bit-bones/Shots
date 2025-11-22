@@ -7,10 +7,22 @@ app = 'shots'
 primary_region = 'iad'
 
 [build]
-  buildpacks = ["https://github.com/heroku/heroku-buildpack-static.git"]
+  dockerfile = "Dockerfile"
 
 [env]
   # No PORT needed for static
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 80
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
 
 [[vm]]
   size = 'shared-cpu-1x'

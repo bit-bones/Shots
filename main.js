@@ -60,7 +60,13 @@ function initGame() {
     console.log('All modules loaded successfully!');
     const canvas = document.getElementById('game');
     game = new Game(canvas);
-    cardManagementUI = new CardManagementUI(game.cards);
+    cardManagementUI = new CardManagementUI(game.cards, {
+        onSettingsChanged: () => game && typeof game.handleCardSettingsChanged === 'function' && game.handleCardSettingsChanged(),
+        interactionEnabled: game ? game.canModifySetupControls() : true
+    });
+    if (game && typeof game.setCardManagementUI === 'function') {
+        game.setCardManagementUI(cardManagementUI);
+    }
     multiplayerUI = new MultiplayerUI(game);
     optionsUI = new OptionsUI(game);
     setupUIHandlers();
@@ -77,16 +83,57 @@ function setupUIHandlers() {
     
     densitySlider.oninput = () => {
         document.getElementById('density-value').textContent = densitySlider.value;
+        if (!game || !game.canModifySetupControls()) {
+            if (game && game.setupOptions && Number.isFinite(game.setupOptions.obstacleDensity)) {
+                densitySlider.value = String(game.setupOptions.obstacleDensity);
+                document.getElementById('density-value').textContent = densitySlider.value;
+            }
+            return;
+        }
+        if (game && typeof game.handleLocalSetupOptionChange === 'function') {
+            const parsed = parseInt(densitySlider.value, 10);
+            if (Number.isFinite(parsed)) {
+                game.handleLocalSetupOptionChange('obstacleDensity', parsed);
+            }
+        }
     };
     
     sizeSlider.oninput = () => {
         document.getElementById('size-value').textContent = sizeSlider.value;
+        if (!game || !game.canModifySetupControls()) {
+            if (game && game.setupOptions && Number.isFinite(game.setupOptions.obstacleSize)) {
+                sizeSlider.value = String(game.setupOptions.obstacleSize);
+                document.getElementById('size-value').textContent = sizeSlider.value;
+            }
+            return;
+        }
+        if (game && typeof game.handleLocalSetupOptionChange === 'function') {
+            const parsed = parseInt(sizeSlider.value, 10);
+            if (Number.isFinite(parsed)) {
+                game.handleLocalSetupOptionChange('obstacleSize', parsed);
+            }
+        }
     };
     
     if (worldModIntervalSlider) {
         const updateWorldModLabel = () => {
             if (worldModIntervalValue) {
                 worldModIntervalValue.textContent = worldModIntervalSlider.value;
+            }
+            if (!game || !game.canModifySetupControls()) {
+                if (game && game.setupOptions && Number.isFinite(game.setupOptions.worldModInterval)) {
+                    worldModIntervalSlider.value = String(game.setupOptions.worldModInterval);
+                    if (worldModIntervalValue) {
+                        worldModIntervalValue.textContent = worldModIntervalSlider.value;
+                    }
+                }
+                return;
+            }
+            if (game && typeof game.handleLocalSetupOptionChange === 'function') {
+                const parsed = parseInt(worldModIntervalSlider.value, 10);
+                if (Number.isFinite(parsed)) {
+                    game.handleLocalSetupOptionChange('worldModInterval', parsed);
+                }
             }
         };
         updateWorldModLabel();
@@ -95,6 +142,17 @@ function setupUIHandlers() {
 
     if (mapBorderCheckbox) {
         mapBorderCheckbox.checked = true;
+        mapBorderCheckbox.addEventListener('change', () => {
+            if (!game || !game.canModifySetupControls()) {
+                if (game && game.setupOptions && Object.prototype.hasOwnProperty.call(game.setupOptions, 'mapBorder')) {
+                    mapBorderCheckbox.checked = !!game.setupOptions.mapBorder;
+                }
+                return;
+            }
+            if (game && typeof game.handleLocalSetupOptionChange === 'function') {
+                game.handleLocalSetupOptionChange('mapBorder', !!mapBorderCheckbox.checked);
+            }
+        });
     }
     
     // Initialize options UI

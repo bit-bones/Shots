@@ -259,6 +259,7 @@
         #setup-overlay h2 {
             color: #65c6ff;
             margin-bottom: 10px;
+            text-align: center;
         }
         #setup-overlay label {
             color: #fff;
@@ -278,19 +279,48 @@
             margin-left: 10px;
         }
         #setup-overlay button {
-            background: #65c6ff;
+            background: linear-gradient(135deg, #65c6ff 0%, #4a9eff 100%);
             color: #181c23;
             border: none;
-            border-radius: 8px;
-            padding: 10px 28px;
+            border-radius: 12px;
+            padding: 12px 28px;
             font-size: 1.1em;
             font-weight: bold;
             margin-top: 14px;
             cursor: pointer;
-            transition: background 0.12s;
+            transition: all 0.15s ease;
+            flex: 1;
+            height: 50px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         #setup-overlay button:hover {
-            background: #56ff7a;
+            background: linear-gradient(135deg, #56ff7a 0%, #4aff6a 100%);
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+        }
+        #setup-overlay select, #setup-overlay input[type="number"] {
+            background: linear-gradient(135deg, #1f232b 0%, #252a34 100%);
+            color: #e6f2ff;
+            border: 1px solid #3d4351;
+            border-radius: 8px;
+            padding: 8px 12px;
+            font-size: 1em;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+        #setup-overlay select:focus, #setup-overlay input[type="number"]:focus {
+            outline: none;
+            border-color: #65c6ff;
+            box-shadow: 0 2px 12px rgba(101, 198, 255, 0.3);
+        }
+        #setup-overlay select option {
+            background: #1f232b;
+            color: #e6f2ff;
+            padding: 8px;
         }
         #setup-overlay .desc {
             color: #b7b7b7;
@@ -720,7 +750,6 @@
         </div>
         <div id="setup-overlay">
             <h2>Game Setup</h2>
-        <div class="desc">Shots</div>
         <div class="setup-row">
             <label for="game-mode-select">Game Mode:</label>
             <select id="game-mode-select">
@@ -759,7 +788,7 @@
         </div>
 <!-- Enemy AI setting removed (roster system manages AI/bots) -->        <div style="display:flex; gap:10px; margin-bottom:10px;">
             <button id="manage-powerups-btn">PowerUp Cards</button>
-            <button id="manage-worldmods-btn">World Mod Cards</button>
+            <button id="manage-worldmods-btn">World Mods</button>
         </div>
         <div style="display:flex; gap:10px; margin-bottom:10px;">
             <button id="start-button">Start Game</button>
@@ -1002,6 +1031,10 @@
             }, true);
         }
     });
+    </script>
+    <script>
+        // Set server URL for deployed client
+        window.SERVER_URL = 'wss://shots-game.fly.dev';
     </script>
     <script src="public/config.js"></script>
     <script src="main.js"></script>

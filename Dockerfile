@@ -1,21 +1,8 @@
-# Dockerfile for Shots game server
-# Uses a small Node.js base image and runs the server with npm start
+FROM nginx:alpine
 
-FROM node:18-alpine
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY . /usr/share/nginx/html
 
-# Create app directory
-WORKDIR /app
+EXPOSE 80
 
-# Install deps based on package-lock.json
-COPY package*.json ./
-RUN npm ci --only=production
-
-# Copy rest of the app
-COPY . .
-
-# Set the PORT env (fly.toml expects 8080)
-ENV PORT=8080
-EXPOSE 8080
-
-# Start the server using the package.json start script
-CMD ["npm", "start"]
+CMD ["nginx", "-g", "daemon off;"]
