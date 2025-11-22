@@ -2,6 +2,9 @@
 const CANVAS_W = 1300;
 const CANVAS_H = 650;
 const FIGHTER_RADIUS = 19;
+const FIGHTER_RADIUS_SCALE_MIN = 0.65;
+const FIGHTER_RADIUS_SCALE_MAX = 1.45;
+const FIGHTER_RADIUS_SCALE_POWER = 0.5;
 const BULLET_RADIUS = 7;
 const BULLET_SPEED = 420;
 const SHOOT_INTERVAL = 1.2; // seconds
@@ -515,7 +518,7 @@ const RAW_POWERUPS = [
         ]
     },
     {
-        name: 'Shot Gun',
+        name: 'Shot-Gun',
         rarity: POWERUP_RARITIES.LEGENDARY,
         effects: [
             { type: 'modify', stat: 'spread', mode: 'add', value: 6, precision: 0 },
@@ -558,6 +561,9 @@ if (typeof window !== 'undefined') {
     window.CANVAS_W = CANVAS_W;
     window.CANVAS_H = CANVAS_H;
     window.FIGHTER_RADIUS = FIGHTER_RADIUS;
+    window.FIGHTER_RADIUS_SCALE_MIN = FIGHTER_RADIUS_SCALE_MIN;
+    window.FIGHTER_RADIUS_SCALE_MAX = FIGHTER_RADIUS_SCALE_MAX;
+    window.FIGHTER_RADIUS_SCALE_POWER = FIGHTER_RADIUS_SCALE_POWER;
     window.BULLET_RADIUS = BULLET_RADIUS;
     window.BULLET_SPEED = BULLET_SPEED;
     window.SHOOT_INTERVAL = SHOOT_INTERVAL;

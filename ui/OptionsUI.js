@@ -232,12 +232,21 @@ class OptionsUI {
 
                 // Handle network updates
                 if (this.game && this.game.network && this.game.network.connected) {
-                    const fighter = this.game.roster.getLocalFighter();
+                    const fighter = this.game.roster ? this.game.roster.getLocalFighter() : null;
                     if (fighter) {
+                        const payload = {
+                            cursorStyle: style,
+                            cursorColor: color,
+                            style,
+                            color,
+                            fighterId: fighter.id,
+                            slotIndex: typeof fighter.slotIndex === 'number' ? fighter.slotIndex : null
+                        };
                         if (this.game.network.role === 'joiner') {
-                            this.game.network.sendCursorUpdate(style, color, fighter.id, fighter.slotIndex);
+                            this.game.network.sendMessage('cursor-update', payload);
                         } else if (this.game.network.role === 'host') {
                             this.game._broadcastRosterUpdate();
+                            this.game._broadcastSetupState();
                         }
                     }
                 }
@@ -262,12 +271,21 @@ class OptionsUI {
 
                 // Handle network updates
                 if (this.game && this.game.network && this.game.network.connected) {
-                    const fighter = this.game.roster.getLocalFighter();
+                    const fighter = this.game.roster ? this.game.roster.getLocalFighter() : null;
                     if (fighter) {
+                        const payload = {
+                            cursorStyle: style,
+                            cursorColor: color,
+                            style,
+                            color,
+                            fighterId: fighter.id,
+                            slotIndex: typeof fighter.slotIndex === 'number' ? fighter.slotIndex : null
+                        };
                         if (this.game.network.role === 'joiner') {
-                            this.game.network.sendCursorUpdate(style, color, fighter.id, fighter.slotIndex);
+                            this.game.network.sendMessage('cursor-update', payload);
                         } else if (this.game.network.role === 'host') {
                             this.game._broadcastRosterUpdate();
+                            this.game._broadcastSetupState();
                         }
                     }
                 }
@@ -565,12 +583,21 @@ class OptionsUI {
 
         // Handle network updates
         if (this.game && this.game.network && this.game.network.connected) {
-            const fighter = this.game.roster.getLocalFighter();
+            const fighter = this.game.roster ? this.game.roster.getLocalFighter() : null;
             if (fighter) {
+                const payload = {
+                    cursorStyle: defaultCursorStyle,
+                    cursorColor: defaultCursorColor,
+                    style: defaultCursorStyle,
+                    color: defaultCursorColor,
+                    fighterId: fighter.id,
+                    slotIndex: typeof fighter.slotIndex === 'number' ? fighter.slotIndex : null
+                };
                 if (this.game.network.role === 'joiner') {
-                    this.game.network.sendCursorUpdate(defaultCursorStyle, defaultCursorColor, fighter.id, fighter.slotIndex);
+                    this.game.network.sendMessage('cursor-update', payload);
                 } else if (this.game.network.role === 'host') {
                     this.game._broadcastRosterUpdate();
+                    this.game._broadcastSetupState();
                 }
             }
         }

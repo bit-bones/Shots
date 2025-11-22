@@ -4,8 +4,10 @@
  */
 
 class CardManagementUI {
-    constructor(cardSystem) {
+    constructor(cardSystem, options = {}) {
         this.cards = cardSystem;
+        this.onSettingsChanged = typeof options.onSettingsChanged === 'function' ? options.onSettingsChanged : null;
+        this.interactionEnabled = options.interactionEnabled !== undefined ? !!options.interactionEnabled : true;
         
         // PowerUp modal elements
         this.powerupBtn = document.getElementById('manage-powerups-btn');
@@ -35,6 +37,7 @@ class CardManagementUI {
         this.loadSettings();
         this._ensureContextMenuStyles();
         this._bindGlobalContextMenuHandlers();
+        this.setInteractionEnabled(this.interactionEnabled);
     }
     
     setupHandlers() {
@@ -49,15 +52,19 @@ class CardManagementUI {
         };
         
         this.powerupEnableAll.onclick = () => {
+            if (!this.interactionEnabled) return;
             POWERUPS.forEach(card => this.cards.togglePowerup(card.name, true));
             this.saveSettings();
             this.renderPowerupList();
+            this._notifySettingsChanged();
         };
         
         this.powerupDisableAll.onclick = () => {
+            if (!this.interactionEnabled) return;
             POWERUPS.forEach(card => this.cards.togglePowerup(card.name, false));
             this.saveSettings();
             this.renderPowerupList();
+            this._notifySettingsChanged();
         };
         
         // World Modifier modal handlers
@@ -71,15 +78,19 @@ class CardManagementUI {
         };
         
         this.worldmodEnableAll.onclick = () => {
+            if (!this.interactionEnabled) return;
             WORLD_MODIFIERS.forEach(card => this.cards.toggleWorldMod(card.name, true));
             this.saveSettings();
             this.renderWorldModList();
+            this._notifySettingsChanged();
         };
         
         this.worldmodDisableAll.onclick = () => {
+            if (!this.interactionEnabled) return;
             WORLD_MODIFIERS.forEach(card => this.cards.toggleWorldMod(card.name, false));
             this.saveSettings();
             this.renderWorldModList();
+            this._notifySettingsChanged();
         };
     }
     
@@ -90,9 +101,11 @@ class CardManagementUI {
             this.powerupList,
             this.cards.enabledPowerups,
             (cardName, enabled) => {
+                if (!this.interactionEnabled) return;
                 this.cards.togglePowerup(cardName, enabled);
                 this.saveSettings();
                 this.renderPowerupList();
+                this._notifySettingsChanged();
             },
             '#5c7cff',
             'powerup'
@@ -106,9 +119,11 @@ class CardManagementUI {
             this.worldmodList,
             this.cards.enabledWorldMods,
             (cardName, enabled) => {
+                if (!this.interactionEnabled) return;
                 this.cards.toggleWorldMod(cardName, enabled);
                 this.saveSettings();
                 this.renderWorldModList();
+                this._notifySettingsChanged();
             },
             '#a06cc7',
             'world'
@@ -158,13 +173,21 @@ class CardManagementUI {
             cardBtn.style.color = style.text;
             cardBtn.style.opacity = style.opacity;
 
-            cardBtn.onclick = () => {
-                onToggle(card.name, !isEnabled);
-            };
-
-            cardBtn.addEventListener('contextmenu', (event) => {
-                this._handleCardContextMenu(event, card, type);
-            });
+            if (this.interactionEnabled) {
+                cardBtn.onclick = () => {
+                    onToggle(card.name, !isEnabled);
+                };
+                cardBtn.addEventListener('contextmenu', (event) => {
+                    this._handleCardContextMenu(event, card, type);
+                });
+                cardBtn.style.cursor = 'pointer';
+            } else {
+                cardBtn.onclick = null;
+                cardBtn.addEventListener('contextmenu', (event) => {
+                    event.preventDefault();
+                });
+                cardBtn.style.cursor = 'default';
+            }
 
             const startStacks = type === 'world'
                 ? this.cards.getStartWorldModStacks(card.name)
@@ -353,6 +376,7 @@ class CardManagementUI {
     }
 
     _handleCardContextMenu(event, card, type = 'powerup') {
+        if (!this.interactionEnabled) return;
         if (event) {
             if (typeof event.preventDefault === 'function') event.preventDefault();
             if (typeof event.stopPropagation === 'function') event.stopPropagation();
@@ -560,6 +584,44 @@ class CardManagementUI {
             this.cards.setStartPowerupStacks(cardName, stacks);
             this.saveSettings();
             this.renderPowerupList();
+        }
+        this._notifySettingsChanged();
+    }
+
+    setInteractionEnabled(enabled) {
+        this.interactionEnabled = !!enabled;
+        this._hideContextMenu();
+        this._applyInteractionState();
+        this.refreshAll();
+    }
+
+    _applyInteractionState() {
+        const disabled = !this.interactionEnabled;
+        if (this.powerupEnableAll) this.powerupEnableAll.disabled = disabled;
+        if (this.powerupDisableAll) this.powerupDisableAll.disabled = disabled;
+        if (this.worldmodEnableAll) this.worldmodEnableAll.disabled = disabled;
+        if (this.worldmodDisableAll) this.worldmodDisableAll.disabled = disabled;
+    }
+
+    refreshAll() {
+        this.updateCount('powerup', this.cards.enabledPowerups.size);
+        this.updateCount('worldmod', this.cards.enabledWorldMods.size);
+        const powerupVisible = this.powerupModal && this.powerupModal.style.display && this.powerupModal.style.display !== 'none';
+        if (powerupVisible) {
+            this.renderPowerupList();
+        }
+        const worldmodVisible = this.worldmodModal && this.worldmodModal.style.display && this.worldmodModal.style.display !== 'none';
+        if (worldmodVisible) {
+            this.renderWorldModList();
+        }
+    }
+
+    _notifySettingsChanged() {
+        if (typeof this.onSettingsChanged !== 'function') return;
+        try {
+            this.onSettingsChanged();
+        } catch (err) {
+            console.warn('[CardManagementUI] onSettingsChanged handler failed:', err);
         }
     }
 }

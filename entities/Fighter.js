@@ -148,6 +148,58 @@ class Fighter {
         this.downedSettings = null;
         this.downedHealthPercent = 0;
         
+        this._onHealthMaxChanged();
+    }
+
+    // Adjust fighter hitbox size based on max health so tankier builds feel beefier.
+    _updateRadiusFromHealth() {
+        const baseRadius = typeof FIGHTER_RADIUS === 'number' ? FIGHTER_RADIUS : 19;
+        const baseHealth = typeof HEALTH_MAX === 'number' ? Math.max(1, HEALTH_MAX) : 100;
+        const clampFn = typeof clamp === 'function'
+            ? clamp
+            : (value, min, max) => Math.max(min, Math.min(max, value));
+
+        const rawHealthMax = Number.isFinite(this.healthMax) ? this.healthMax : baseHealth;
+        const safeHealthMax = Math.max(1, rawHealthMax);
+        const ratio = safeHealthMax / baseHealth;
+
+        const power = typeof FIGHTER_RADIUS_SCALE_POWER === 'number' && Number.isFinite(FIGHTER_RADIUS_SCALE_POWER)
+            ? Math.max(0, FIGHTER_RADIUS_SCALE_POWER)
+            : 0.5;
+        const minScale = typeof FIGHTER_RADIUS_SCALE_MIN === 'number' && Number.isFinite(FIGHTER_RADIUS_SCALE_MIN) && FIGHTER_RADIUS_SCALE_MIN > 0
+            ? FIGHTER_RADIUS_SCALE_MIN
+            : 0.5;
+        const maxScale = typeof FIGHTER_RADIUS_SCALE_MAX === 'number' && Number.isFinite(FIGHTER_RADIUS_SCALE_MAX) && FIGHTER_RADIUS_SCALE_MAX > 0
+            ? FIGHTER_RADIUS_SCALE_MAX
+            : 1.5;
+
+        const exponent = power > 0 ? power : 0.5;
+        const unclampedScale = Math.pow(ratio, exponent);
+        const scale = clampFn(unclampedScale, Math.min(minScale, maxScale), Math.max(minScale, maxScale));
+        const newRadius = baseRadius * scale;
+
+        if (Number.isFinite(newRadius) && newRadius > 0) {
+            this.radius = newRadius;
+            const hasCanvasBounds = typeof CANVAS_W === 'number' && Number.isFinite(CANVAS_W)
+                && typeof CANVAS_H === 'number' && Number.isFinite(CANVAS_H);
+            if (hasCanvasBounds) {
+                this.x = clampFn(this.x, this.radius, CANVAS_W - this.radius);
+                this.y = clampFn(this.y, this.radius, CANVAS_H - this.radius);
+            }
+        }
+    }
+
+    _onHealthMaxChanged() {
+        if (!Number.isFinite(this.healthMax) || this.healthMax <= 0) {
+            this.healthMax = 1;
+        }
+        if (!Number.isFinite(this.health)) {
+            this.health = this.healthMax;
+        } else if (this.health > this.healthMax) {
+            this.health = this.healthMax;
+        }
+
+        this._updateRadiusFromHealth();
     }
 
     update(dt) {
@@ -847,6 +899,7 @@ class Fighter {
         }
 
         const ensureNumber = (value, fallback) => (typeof value === 'number' && Number.isFinite(value) ? value : fallback);
+        let healthMaxChanged = false;
 
         for (const effect of cardDef.effects) {
             if (!effect) continue;
@@ -869,6 +922,10 @@ class Fighter {
 
                     if (stat === 'pierceStacks' && this[stat] > 0) {
                         this.pierce = true;
+                    }
+
+                    if (stat === 'healthMax') {
+                        healthMaxChanged = true;
                     }
 
                     break;
@@ -927,11 +984,13 @@ class Fighter {
                             this.health = 1;
                             this.bulletDamage *= 3;
                             this.speed *= 1.5;
+                            healthMaxChanged = true;
                             break;
                         case 'increaseHealthMax': {
                             const amount = effect.amount || 0;
                             this.healthMax += amount;
                             this.health = Math.min(this.healthMax, this.health + amount);
+                            healthMaxChanged = true;
                             break;
                         }
                         case 'adjustHealth': {
@@ -939,6 +998,7 @@ class Fighter {
                             this.healthMax += amount;
                             if (this.healthMax < 1) this.healthMax = 1;
                             this.health = Math.min(this.healthMax, Math.max(1, this.health + amount));
+                            healthMaxChanged = true;
                             break;
                         }
                         default:
@@ -950,6 +1010,10 @@ class Fighter {
                 default:
                     break;
             }
+        }
+
+        if (healthMaxChanged) {
+            this._onHealthMaxChanged();
         }
 
         this._refreshDashStats();
@@ -1015,6 +1079,7 @@ class Fighter {
         if (this._pendingBurstBullets) this._pendingBurstBullets.length = 0;
         this._pendingGunshotBursts = 0;
 
+        this._onHealthMaxChanged();
         this._refreshDashStats();
     }
 

@@ -39,6 +39,7 @@ class SetupUI {
         this.modeSettingValues = {};
         this.activeModeKey = null;
         this._suppressModeSelectEvent = false;
+        this.settingsLocked = false;
     }
 
     bind() {
@@ -234,6 +235,11 @@ class SetupUI {
         this.updateStartButtonState();
     }
 
+    setSettingsLocked(locked) {
+        this.settingsLocked = !!locked;
+        this._applySettingsLock();
+    }
+
     setReadyState(slotIndex, ready) {
         this.readyStates[slotIndex] = !!ready;
         if (!this.rosterGrid) return;
@@ -315,6 +321,7 @@ class SetupUI {
             ? activeKey
             : this.modeOptions[0].key;
         this.setActiveModeKey(keyToUse || null);
+        this._applySettingsLock();
     }
 
     setActiveModeKey(key) {
@@ -345,6 +352,7 @@ class SetupUI {
         this.modeSettingDescriptors = descriptors;
         this.modeSettingValues = normalizedValues;
         this._renderModeSettingsUI();
+        this._applySettingsLock();
     }
 
     getModeSettingsValues() {
@@ -444,6 +452,7 @@ class SetupUI {
             this.modeSettingsContainer.appendChild(entry);
             this.modeSettingInputs.set(desc.id, { input, valueEl, descriptor: desc });
         }
+        this._applySettingsLock();
     }
 
     _handleModeSettingInput(desc, rawValue, valueEl) {
@@ -460,6 +469,21 @@ class SetupUI {
             valueEl.textContent = this._formatModeSettingValue(desc, resolved);
         }
         this._emitModeSettingsChange();
+    }
+
+    _applySettingsLock() {
+        const locked = !!this.settingsLocked;
+        if (this.modeSelect) {
+            this.modeSelect.disabled = locked;
+            this.modeSelect.classList.toggle('locked', locked);
+        }
+        if (this.modeSettingInputs && this.modeSettingInputs.size) {
+            this.modeSettingInputs.forEach(({ input }) => {
+                if (!input) return;
+                input.disabled = locked;
+                input.classList.toggle('locked', locked);
+            });
+        }
     }
 
     _formatModeSettingValue(desc, value) {
