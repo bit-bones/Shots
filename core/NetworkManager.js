@@ -77,6 +77,9 @@ class NetworkManager {
         // Joiners (host only)
         this.joiners = []; // Array of {index, name, connected}
         this.maxJoiners = 3; // Host + 3 joiners = 4 players max
+        // Config discovery state
+        this._wsConfigResolved = false;
+        this._wsConfigPromise = null;
         
         // Callbacks
         this.onHosted = null;
@@ -106,9 +109,43 @@ class NetworkManager {
         this.inputSendInterval = 1000 / 30; // 30hz input send rate
     }
 
+    _maybeResolveFromConfig() {
+        if (this._wsConfigResolved) return Promise.resolve();
+        if (this._wsConfigPromise) return this._wsConfigPromise;
+
+        const attempt = async () => {
+            this._wsConfigResolved = false;
+            try {
+                if (typeof window === 'undefined') return;
+
+                // Try known config paths
+                const candidates = ['/ws-config.json', '/.well-known/shots-ws.json'];
+                for (const path of candidates) {
+                    try {
+                        const resp = await fetch(path, { cache: 'no-store' });
+                        if (!resp || resp.status >= 400) continue;
+                        const json = await resp.json();
+                        if (json && json.ws && typeof json.ws === 'string' && json.ws.trim()) {
+                            this.serverUrl = json.ws.trim();
+                            break;
+                        }
+                    } catch (e) {
+                        // ignore individual fetch errors
+                    }
+                }
+            } finally {
+                this._wsConfigResolved = true;
+            }
+        };
+
+        this._wsConfigPromise = attempt();
+        return this._wsConfigPromise;
+    }
+
     // ==================== HOST METHODS ====================
     
-    hostLobby(hostName = 'Player 1', requestedCode = null) {
+    async hostLobby(hostName = 'Player 1', requestedCode = null) {
+        await this._maybeResolveFromConfig();
         return new Promise((resolve, reject) => {
             try {
                 this.ws = new WebSocket(this.serverUrl);
@@ -269,7 +306,8 @@ class NetworkManager {
 
     // ==================== JOINER METHODS ====================
     
-    joinLobby(sessionCode, playerName = 'Player 2') {
+    async joinLobby(sessionCode, playerName = 'Player 2') {
+        await this._maybeResolveFromConfig();
         return new Promise((resolve, reject) => {
             try {
                 this.ws = new WebSocket(this.serverUrl);
