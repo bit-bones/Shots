@@ -13,15 +13,63 @@ class NetworkManager {
         this.ws = null;
         // Determine server URL in this order:
         // 1. `window.SERVER_URL` if explicitly provided by the page (recommended for deployments)
-        // 2. Construct from `window.location` (useful when server is co-hosted with frontend)
-        // 3. Fallback to localhost for local development
-        if (typeof window !== 'undefined' && window.SERVER_URL) {
-            this.serverUrl = window.SERVER_URL;
-        } else if (typeof window !== 'undefined' && window.location) {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const host = window.location.hostname || 'localhost';
-            const port = window.location.port ? (':' + window.location.port) : '';
-            this.serverUrl = `${protocol}//${host}${port}`;
+        //    but ignore unreplaced placeholders like "{{SERVER_URL}}"
+        // 2. `?ws=` query parameter (convenient per-deploy override)
+        // 3. Construct from `window.location` (useful when server is co-hosted with frontend)
+        // 4. Fallback to localhost for local development
+        if (typeof window !== 'undefined') {
+            let resolved = null;
+
+            // Candidate from the injected config file
+            try {
+                const candidate = (typeof window.SERVER_URL === 'string') ? window.SERVER_URL.trim() : '';
+                const isPlaceholder = !!candidate && /\{\{\s*SERVER_URL\s*\}\}/.test(candidate);
+                if (candidate && !isPlaceholder) {
+                    resolved = candidate;
+                }
+            } catch (e) {
+                // ignore
+            }
+
+            // If not resolved yet, try query param 'ws'
+            if (!resolved) {
+                try {
+                    const params = new URLSearchParams(window.location.search || '');
+                    const wsParam = params.get('ws') || params.get('SERVER_URL') || '';
+                    if (wsParam && wsParam.trim()) {
+                        resolved = wsParam.trim();
+                    }
+                } catch (e) {
+                    // ignore
+                }
+            }
+
+            // If still not resolved, derive from location
+            if (!resolved && window.location) {
+                const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const host = window.location.hostname || 'localhost';
+                const port = window.location.port ? (':' + window.location.port) : '';
+                resolved = `${proto}//${host}${port}`;
+            }
+
+            // Normalize resolved value: if it lacks ws scheme, try to prepend same-origin scheme
+            if (typeof resolved === 'string' && resolved.length > 0) {
+                const lower = resolved.toLowerCase();
+                if (lower.startsWith('ws://') || lower.startsWith('wss://')) {
+                    this.serverUrl = resolved;
+                } else if (lower.startsWith('//')) {
+                    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    this.serverUrl = proto + resolved;
+                } else if (/^[a-z0-9.-]+(:[0-9]+)?/i.test(resolved)) {
+                    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    this.serverUrl = `${proto}//${resolved}`;
+                } else {
+                    // Last resort: use as-is (may be relative, browser will resolve)
+                    this.serverUrl = resolved;
+                }
+            } else {
+                this.serverUrl = 'ws://localhost:3001';
+            }
         } else {
             this.serverUrl = 'ws://localhost:3001';
         }
