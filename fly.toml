@@ -10,7 +10,7 @@ primary_region = 'iad'
   dockerfile = "Dockerfile"
 
 [env]
-  # No PORT needed for static
+  SERVER_URL = "wss://shots.fly.dev"
 
 [[services]]
   protocol = "tcp"
