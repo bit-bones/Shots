@@ -62,7 +62,7 @@ function initGame() {
     game = new Game(canvas);
     cardManagementUI = new CardManagementUI(game.cards, {
         onSettingsChanged: () => game && typeof game.handleCardSettingsChanged === 'function' && game.handleCardSettingsChanged(),
-        interactionEnabled: game ? (typeof game.canModifySetupControls === 'function' ? game.canModifySetupControls() : true) : true
+        interactionEnabled: game ? game.canModifySetupControls() : true
     });
     if (game && typeof game.setCardManagementUI === 'function') {
         game.setCardManagementUI(cardManagementUI);
@@ -83,7 +83,7 @@ function setupUIHandlers() {
     
     densitySlider.oninput = () => {
         document.getElementById('density-value').textContent = densitySlider.value;
-        if (!game || (typeof game.canModifySetupControls === 'function' && !game.canModifySetupControls())) {
+        if (!game || !game.canModifySetupControls()) {
             if (game && game.setupOptions && Number.isFinite(game.setupOptions.obstacleDensity)) {
                 densitySlider.value = String(game.setupOptions.obstacleDensity);
                 document.getElementById('density-value').textContent = densitySlider.value;
@@ -100,7 +100,7 @@ function setupUIHandlers() {
     
     sizeSlider.oninput = () => {
         document.getElementById('size-value').textContent = sizeSlider.value;
-        if (!game || (typeof game.canModifySetupControls === 'function' && !game.canModifySetupControls())) {
+        if (!game || !game.canModifySetupControls()) {
             if (game && game.setupOptions && Number.isFinite(game.setupOptions.obstacleSize)) {
                 sizeSlider.value = String(game.setupOptions.obstacleSize);
                 document.getElementById('size-value').textContent = sizeSlider.value;
@@ -120,7 +120,7 @@ function setupUIHandlers() {
             if (worldModIntervalValue) {
                 worldModIntervalValue.textContent = worldModIntervalSlider.value;
             }
-            if (!game || (typeof game.canModifySetupControls === 'function' && !game.canModifySetupControls())) {
+            if (!game || !game.canModifySetupControls()) {
                 if (game && game.setupOptions && Number.isFinite(game.setupOptions.worldModInterval)) {
                     worldModIntervalSlider.value = String(game.setupOptions.worldModInterval);
                     if (worldModIntervalValue) {
@@ -143,7 +143,7 @@ function setupUIHandlers() {
     if (mapBorderCheckbox) {
         mapBorderCheckbox.checked = true;
         mapBorderCheckbox.addEventListener('change', () => {
-            if (!game || (typeof game.canModifySetupControls === 'function' && !game.canModifySetupControls())) {
+            if (!game || !game.canModifySetupControls()) {
                 if (game && game.setupOptions && Object.prototype.hasOwnProperty.call(game.setupOptions, 'mapBorder')) {
                     mapBorderCheckbox.checked = !!game.setupOptions.mapBorder;
                 }

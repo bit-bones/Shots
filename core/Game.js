@@ -393,15 +393,7 @@ class Game {
 
             try {
                 if (this.network && this.network.connected && this.network.role === 'joiner') {
-                    setTimeout(() => {
-                        try {
-                            if (this.network && this.network.connected && this.network.role === 'joiner') {
-                                this.network.sendMessage('setup-sync-request', { reason: 'initial' });
-                            }
-                        } catch (syncErr) {
-                            console.warn('[Game] Failed to send setup-sync-request', syncErr);
-                        }
-                    }, 500);
+                    this.network.sendMessage('setup-sync-request', { reason: 'initial' });
                     setTimeout(() => {
                         try {
                             if (this.network && this.network.connected && this.network.role === 'joiner') {
@@ -410,7 +402,7 @@ class Game {
                         } catch (retryErr) {
                             console.warn('[Game] Failed to resend setup-sync-request', retryErr);
                         }
-                    }, 1500);
+                    }, 400);
                 }
             } catch (syncErr) {
                 console.warn('[Game] Failed to send setup-sync-request', syncErr);
@@ -2933,12 +2925,6 @@ class Game {
             } catch (e) {
                 console.warn('[Game] setupUI.render failed during setup update apply', e);
             }
-            // Ensure control permissions reflect current role/state (joiner vs host)
-            try {
-                this._updateSetupControlPermissions();
-            } catch (e) {
-                console.warn('[Game] Failed to update setup control permissions after applying setup update', e);
-            }
         }
     }
 
@@ -3611,12 +3597,6 @@ class Game {
             }
             if (this.cardsUI) {
                 try { this.cardsUI.update(this.roster.getAllFighters(), this.cards.activeMods); } catch (e) { console.warn('[Game] cardsUI.update failed', e); }
-            }
-            // Ensure setup control permissions are applied for joiners after state updates
-            try {
-                this._updateSetupControlPermissions();
-            } catch (e) {
-                console.warn('[Game] Failed to update setup control permissions after state update', e);
             }
         }
     }
