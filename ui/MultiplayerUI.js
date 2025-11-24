@@ -107,6 +107,8 @@ class MultiplayerUI {
             } catch (err) {
                 console.error('Failed to join:', err);
                 alert('Failed to join lobby: ' + err.message);
+            } finally {
+                // Always reset the button state
                 this.joinConfirmBtn.disabled = false;
                 this.joinConfirmBtn.textContent = 'Join';
             }
