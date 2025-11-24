@@ -22,6 +22,11 @@
 			window.SERVER_URL = 'wss://shots-4d19.onrender.com';
 			return;
 		}
+		// For local development, assume server is on localhost:3001
+		if (host === '127.0.0.1' || host === 'localhost') {
+			window.SERVER_URL = 'ws://localhost:3001';
+			return;
+		}
 	} catch (e) {}
 
 	// Leave blank for NetworkManager to try query param, same-origin or localhost.
